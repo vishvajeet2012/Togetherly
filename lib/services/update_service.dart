@@ -4,10 +4,19 @@ import 'dart:io' show Platform;
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import '../utils/safe_launch.dart';
 import 'locale_service.dart';
+
+void _openUpdateFromNotification(NotificationResponse response) {
+  final url = response.payload;
+  if (url == null || url.isEmpty) return;
+  safeLaunchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+}
 
 /// Куда идти за обновлением — и идти ли вообще.
 enum UpdatePath {
@@ -33,7 +42,7 @@ enum UpdatePath {
 /// Сборки из Google Play подписаны ключом Google, и поверх них файл с GitHub
 /// не встаёт.
 const String kOurSigningCertSha256 =
-    '1e944f00fef117d50003560344fcbe4f9f69bffa4cf35ba89f26d032c33a4e13';
+    '6d964b19008cd2ed28522eabf68a81f3c338436f4423eb461adccc9c1acdfcb4';
 
 /// Подписана ли установленная сборка нашим ключом. [buildSignature] —
 /// `PackageInfo.buildSignature`: SHA-256 сертификата, заглавными буквами.
@@ -263,6 +272,45 @@ class UpdateService {
       debugPrint('UpdateService.checkForUpdate failed: $e');
       return null;
     }
+  }
+
+  /// Android notification when a newer GitHub build exists. Tapping it
+  /// opens the APK so the system installer can update the app.
+  static Future<void> notifyAvailable(GithubUpdate upd) async {
+    if (!Platform.isAndroid) return;
+    final plugin = FlutterLocalNotificationsPlugin();
+    const channel = AndroidNotificationChannel(
+      'app_updates',
+      'App updates',
+      description: 'Tells you when a new version of Togetherly is ready',
+      importance: Importance.high,
+    );
+    final androidPlugin = plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    await androidPlugin?.createNotificationChannel(channel);
+    await plugin.initialize(
+      settings: const InitializationSettings(
+        android: AndroidInitializationSettings('@drawable/ic_notification'),
+      ),
+      onDidReceiveNotificationResponse: _openUpdateFromNotification,
+    );
+    final version = upd.versionName.isEmpty ? '' : ' ${upd.versionName}';
+    await plugin.show(
+      id: 91001,
+      title: 'Update available',
+      body: 'Togetherly$version is ready. Tap to install.',
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          'app_updates',
+          'App updates',
+          channelDescription: 'Tells you when a new version of Togetherly is ready',
+          importance: Importance.high,
+          priority: Priority.high,
+          icon: '@drawable/ic_notification',
+        ),
+      ),
+      payload: upd.apkUrl,
+    );
   }
 
   /// Выбирает имя APK под архитектуру устройства.

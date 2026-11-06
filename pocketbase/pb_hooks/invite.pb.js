@@ -73,7 +73,7 @@ routerAdd("POST", "/api/invite/accept", (e) => {
     return e.json(status, { success: false, message: message });
   };
 
-  if (!code) return deny(400, "Код не указан", "пустой код");
+  if (!code) return deny(400, "Enter a code", "пустой код");
 
   // ── хелперы ────────────────────────────────────────────────────────────────
   const membersOf = (g) => {
@@ -146,14 +146,14 @@ routerAdd("POST", "/api/invite/accept", (e) => {
     // дожидаясь обновления приложения.
     return deny(
       404,
-      "Код не найден. Пусть партнёр нажмёт «Новый код» и продиктует заново",
+      "Code not found. Ask your partner to create a new code and send it again.",
       "кода нет ни в invite_codes, ни в claim_token"
     );
   }
   const ownerUid = String(codeRec.getString("owner_uid") || "");
-  if (!ownerUid) return deny(400, "Код повреждён", "у кода пустой owner_uid");
+  if (!ownerUid) return deny(400, "This code is damaged", "у кода пустой owner_uid");
   if (ownerUid === myUid) {
-    return deny(400, "Это ваш собственный код!", "свой же код");
+    return deny(400, "This is your own code", "свой же код");
   }
   const codeGroupId = String(codeRec.getString("group_id") || "");
 
@@ -186,6 +186,7 @@ routerAdd("POST", "/api/invite/accept", (e) => {
   // запросом с блокировкой строки самой пары. PocketBase в этом пути больше
   // не пишет ничего — за ним остались только коды приглашений.
   let res = null;
+  let hotpathDown = false;
   try {
     const hp = $http.send({
       url: "http://127.0.0.1:8120/internal/pair-accept",
@@ -200,15 +201,90 @@ routerAdd("POST", "/api/invite/accept", (e) => {
         my_name: me.name,
         my_avatar: me.avatar,
       }),
-      timeout: 15,
+      timeout: 8,
     });
     res = (hp && hp.json) || null;
   } catch (err) {
-    return deny(500, "Не удалось принять код", "hotpath недоступен: " + String(err));
+    hotpathDown = true;
+  }
+
+  // This server has no Postgres hotpath. Pair the two accounts in PocketBase.
+  if (hotpathDown) {
+    const names = {};
+    const avatars = {};
+    names[ownerUid] = owner.name || "Partner";
+    names[myUid] = me.name || "";
+    avatars[ownerUid] = owner.avatar || "";
+    avatars[myUid] = me.avatar || "";
+    const joinGroup = (g) => {
+      if (!g) return null;
+      let members = membersOf(g);
+      const disbanded = g.getBool("disbanded") === true;
+      if (members.indexOf(myUid) !== -1) {
+        if (disbanded) {
+          g.set("disbanded", false);
+          g.set("disbanded_at", "");
+          g.set("waiting_mode", false);
+          $app.save(g);
+          return { success: true, message: "Reconnected!", pairId: g.id, restored: true };
+        }
+        return { success: true, message: "Connected!", pairId: g.id };
+      }
+      const limit = Number(g.get("max_members") || 2) || 2;
+      if (members.length >= limit) {
+        if (disbanded) return null;
+        return { success: false, message: "This couple is already full" };
+      }
+      members = members.concat([myUid]);
+      const memberNames = mapOf(g, "member_names");
+      const memberAvatars = mapOf(g, "member_avatars");
+      memberNames[myUid] = names[myUid];
+      memberAvatars[myUid] = avatars[myUid];
+      g.set("members", members);
+      g.set("member_names", memberNames);
+      g.set("member_avatars", memberAvatars);
+      g.set("disbanded", false);
+      g.set("waiting_mode", false);
+      $app.save(g);
+      return { success: true, message: "Joined!", pairId: g.id };
+    };
+    try {
+      let local = null;
+      if (codeGroupId) {
+        try { local = joinGroup($app.findRecordById("groups", codeGroupId)); }
+        catch (_) { local = null; }
+      }
+      if (!local) {
+        const live = liveGroupOf(ownerUid);
+        local = joinGroup(live);
+      }
+      if (!local) {
+        const rec = new Record(groupsCol);
+        rec.set("members", [ownerUid, myUid]);
+        rec.set("member_names", names);
+        rec.set("member_avatars", avatars);
+        rec.set("max_members", 2);
+        rec.set("relationship_type", "couple");
+        rec.set("custom_relationship_types", []);
+        rec.set("memories_count", 0);
+        rec.set("drawings_count", 0);
+        rec.set("disbanded", false);
+        rec.set("created_at", nowIso);
+        rec.set("start_date", nowIso);
+        $app.save(rec);
+        local = { success: true, message: "Connected!", pairId: rec.id };
+      }
+      if (!local.success) {
+        return deny(400, local.message || "Could not accept the code", local.message || "local refusal");
+      }
+      res = local;
+    } catch (err) {
+      return deny(500, "Could not accept the code", "local pair failed: " + String(err));
+    }
   }
 
   if (!res || res.success !== true) {
-    return deny(400, (res && res.message) || "Не удалось принять код",
+    return deny(400, (res && res.message) || "Could not accept the code",
       (res && res.message) || "hotpath вернул отказ");
   }
   // Код привязываем к получившейся паре ПОСЛЕ успеха — повтор того же кода

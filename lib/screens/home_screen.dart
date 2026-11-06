@@ -4210,6 +4210,8 @@ class _HomeScreenState extends State<HomeScreen> {
       case UpdatePath.sideload:
         final upd = await UpdateService.checkForUpdate();
         if (!mounted || upd == null) return;
+        await UpdateService.notifyAvailable(upd);
+        if (!mounted) return;
         _showGithubUpdateSheet(upd);
 
       // Установка из Play без докачиваемых частей. Позвать отсюда Play Core —
