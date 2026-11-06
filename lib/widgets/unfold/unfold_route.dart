@@ -854,6 +854,7 @@ class _UnfoldTransitionState extends State<_UnfoldTransition>
   Offset _dragDelta = Offset.zero;
   bool _dragFromRight = false;
   Offset? _backStart;
+  bool _buttonBack = false;
 
   _UnfoldSession get _route => widget.session;
 
@@ -1099,13 +1100,20 @@ class _UnfoldTransitionState extends State<_UnfoldTransition>
 
   @override
   bool handleStartBackGesture(PredictiveBackEvent backEvent) {
-    if (backEvent.isButtonEvent) return false;
+    // The nav-bar back button is not a swipe. With predictive back enabled,
+    // ignoring it leaves the screen stuck, so close the route instead.
+    if (backEvent.isButtonEvent) {
+      _buttonBack = _route.route.isCurrent;
+      return _buttonBack;
+    }
+    _buttonBack = false;
     _backStart = backEvent.touchOffset;
     return _beginDrag(fromRight: backEvent.swipeEdge == SwipeEdge.right);
   }
 
   @override
   void handleUpdateBackGestureProgress(PredictiveBackEvent backEvent) {
+    if (_buttonBack) return;
     // Ход берём из доли жеста, которую считает сама система, а не из
     // координат: расстояние до срабатывания у прошивок своё.
     final pull = backEvent.progress * UnfoldTiming.dragTravel;
@@ -1118,10 +1126,23 @@ class _UnfoldTransitionState extends State<_UnfoldTransition>
   }
 
   @override
-  void handleCommitBackGesture() => _endDrag(commit: true);
+  void handleCommitBackGesture() {
+    if (_buttonBack) {
+      _buttonBack = false;
+      if (_route.route.isCurrent) _route.route.navigator?.maybePop();
+      return;
+    }
+    _endDrag(commit: true);
+  }
 
   @override
-  void handleCancelBackGesture() => _endDrag(commit: false);
+  void handleCancelBackGesture() {
+    if (_buttonBack) {
+      _buttonBack = false;
+      return;
+    }
+    _endDrag(commit: false);
+  }
 
   /// На iPhone системного жеста нет — ведём сами полосой у левого края.
   bool get _ownsEdgeSwipe => defaultTargetPlatform != TargetPlatform.android;
