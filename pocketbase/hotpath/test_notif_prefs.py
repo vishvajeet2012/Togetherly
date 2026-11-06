@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Выключатели уведомлений в приложении обязаны работать.
+
+Жалоба 16.08.2026: «выключение уведомлений в приложении не помогает, они не
+выключаются». Так и было: переключатели сохранялись и в prefs, и на сервер
+(`users.notif_miss_you`, `notif_chat`, `notif_mood`, `notif_new_memory`), но
+ни hotpath, ни хук `apns_push.js` эти поля не читали — пуши уходили всем
+подряд. На 16 августа выключенным «Скучаю» стоял у 16 507 человек, и все они
+продолжали получать уведомления.
+
+Здесь проверяется правило: какому виду уведомления какой выключатель
+соответствует и что делать с незаполненным полем.
+
+Запуск: python3 pocketbase/hotpath/test_notif_prefs.py
+"""
+import importlib.util
+import unittest
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location(
+    "hotpath_src", Path(__file__).parent / "hotpath.py")
+источник = spec.loader.get_source("hotpath_src")
+
+# Карта выключателей объявлена рядом с функцией — берём её тем же куском.
+пространство: dict = {}
+начало = источник.index("ВЫКЛЮЧАТЕЛИ = {")
+# Кусок кончается там, где начинается следующая функция ПОСЛЕ нашей.
+конец = источник.index("\ndef _miss_you_push_text(")
+exec(compile(источник[начало:конец], "hotpath.py", "exec"), пространство)
+_разрешено = пространство["_уведомление_разрешено"]
+
+
+class Выключатели(unittest.TestCase):
+    # Человек, чей телефон присылал настройки: у него нули — это выбор.
+    ОТМЕТКА = "2026-09-06 10:00:00.000Z"
+
+    def test_выключенное_не_шлём(self):
+        человек = {"notif_miss_you": 0, "notif_chat": 1,
+                   "notif_mood": 1, "notif_new_memory": 1,
+                   "notif_synced_at": self.ОТМЕТКА}
+        self.assertFalse(_разрешено("miss", человек))
+        self.assertFalse(_разрешено("miss", человек))
+        self.assertTrue(_разрешено("chat", человек))
+
+    def test_каждый_вид_смотрит_на_свой_флаг(self):
+        выкл = {"notif_miss_you": 1, "notif_chat": 0,
+                "notif_mood": 0, "notif_new_memory": 0,
+                "notif_synced_at": self.ОТМЕТКА}
+        self.assertTrue(_разрешено("miss", выкл))
+        self.assertFalse(_разрешено("chat", выкл))
+        self.assertFalse(_разрешено("mood", выкл))
+        self.assertFalse(_разрешено("memory", выкл))
+
+    def test_поле_не_заполнено_значит_включено(self):
+        # Старые аккаунты полей не имеют вовсе: молчать им нельзя.
+        self.assertTrue(_разрешено("miss", {}))
+        self.assertTrue(_разрешено("chat", {"notif_chat": None}))
+
+    def test_настройки_не_приезжали_значит_всё_включено(self):
+        """Нули у человека, который ни разу не открывал профиль, — не выбор.
+
+        Колонки булевы, у нового аккаунта в них ноль, а отправлял их до
+        06.09.2026 только экран профиля. Кто туда не заходил, не получал ничего:
+        ни чата, ни настроения, ни «Скучаю» — при включённых на вид тумблерах.
+        Таких аккаунтов 18 481, у 7 421 живой токен устройства. Отличаем по
+        метке `notif_synced_at`: её ставит телефон вместе с настройками.
+        """
+        новичок = {"notif_chat": 0, "notif_mood": 0,
+                   "notif_new_memory": 0, "notif_miss_you": 0}
+        self.assertTrue(_разрешено("chat", новичок))
+        self.assertTrue(_разрешено("miss", новичок))
+
+    def test_после_отметки_выключатели_снова_главные(self):
+        выключил = {"notif_chat": 0, "notif_mood": 0, "notif_new_memory": 0,
+                    "notif_miss_you": 0, "notif_synced_at": "2026-09-06 10:00:00.000Z"}
+        self.assertFalse(_разрешено("chat", выключил))
+        self.assertFalse(_разрешено("miss", выключил))
+
+    def test_единица_без_отметки_тоже_считается_ответом(self):
+        """Метку шлют только свежие сборки, а выключатели ехали и раньше.
+
+        Булево поле PocketBase заводит нулём, поэтому единица где угодно
+        означает, что настройки от телефона приезжали — и остальные нули там
+        уже выбор человека. Иначе на время раскатки замолчали бы выключатели
+        у всех сразу, включая 16 507 человек с отключённым «Скучаю».
+        """
+        выключил_скучаю = {"notif_miss_you": 0, "notif_chat": 1,
+                           "notif_mood": 1, "notif_new_memory": 1}
+        self.assertFalse(_разрешено("miss", выключил_скучаю))
+        self.assertTrue(_разрешено("chat", выключил_скучаю))
+
+    def test_пустая_отметка_не_считается(self):
+        пусто = {"notif_chat": 0, "notif_mood": 0,
+                 "notif_new_memory": 0, "notif_miss_you": 0}
+        self.assertTrue(_разрешено("chat", {**пусто, "notif_synced_at": ""}))
+        self.assertTrue(_разрешено("chat", {**пусто, "notif_synced_at": None}))
+
+    def test_незнакомый_вид_проходит(self):
+        # Тихое пробуждение виджетов и всё новое не должно молча пропадать
+        # из-за отсутствия выключателя.
+        человек = {"notif_chat": 0, "notif_synced_at": self.ОТМЕТКА}
+        self.assertTrue(_разрешено("widgets", человек))
+        self.assertTrue(_разрешено("", человек))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,378 @@
+/// Приём оплат lava.top напрямую в PocketBase.
+///
+/// Главный путь — без кода и без бота: если почта покупки совпала с почтой
+/// аккаунта, монеты падают на баланс сами, человек просто открывает приложение.
+///
+/// Запасной путь — код: платили с другой почты (рабочая, семейная, вход через
+/// Google с иным адресом) или аккаунта ещё нет. Тогда создаётся запись в
+/// `redeem_codes`, и код выдаёт бот @SnTAppsBot.
+///
+/// Защита: секрет в заголовке `X-Api-Key` (или `?key=`), он же вписан в
+/// lava.top. Без него роут молчит — иначе монеты мог бы начислить кто угодно.
+/// Секрет живёт в переменной окружения LAVA_WEBHOOK_KEY процесса PocketBase.
+///
+/// !!! ГРАБЛИ PB JSVM (см. coins.pb.js:5-19): обработчик исполняется в
+/// ИЗОЛИРОВАННОМ пуле и НЕ видит функции уровня файла — всё инлайнится.
+
+routerAdd("POST", "/api/lava/webhook", (e) => {
+  // Товары lava.top → монеты. Зеркало bot/coins.py (PRODUCTS).
+  const PRODUCTS = {
+    "4d8ff539-fd74-47ab-85e4-35906be3a5b4": 600,
+    "64e68f3f-7281-4593-aa00-0b438522750b": 1400,
+    "cd2e08ec-e826-495d-bb55-842a3e3742dc": 4000,
+  };
+  // Togetherly+ — разовая покупка: платные темы, календарь цикла, каталог
+  // виджетов, совместная лента, свой рисунок в раскрасках и свои категории
+  // в «Хочу с тобой».
+  // Идентификатор товара публичный (он же в ссылке на
+  // покупку), поэтому лежит прямо здесь; переменной окружения можно
+  // переопределить, если товар пересоздадут.
+  const PLUS_SKU = ($os.getenv("LAVA_PLUS_SKU") ||
+    "ec861b44-a4b7-49e3-aa0e-e4608abdb0f0").trim().toLowerCase();
+  // У товара в lava.top есть ещё и оффер со СВОИМ идентификатором, и в
+  // уведомлении может приехать он, а не товар (`/api/v2/products` показывает
+  // оба). Держим список: совпадение с любым из них считаем покупкой Плюса.
+  const PLUS_OFFER = ($os.getenv("LAVA_PLUS_OFFER") ||
+    "40364f0a-b0c5-44e8-8380-55d9cf492bb6").trim().toLowerCase();
+  // Элементы каталога, купленные деньгами: покупка открывает тот же ключ
+  // владения `вид:id`, что и покупка за монеты, поэтому клиент правок не
+  // требует. Новый пак или маскот добавляется сюда ДВУМЯ строками — товар и
+  // его оффер: в уведомлении lava.top приезжает любой из двух идентификаторов
+  // (на этом уже спотыкались с Togetherly+).
+  const FEATURE_SKUS = {
+    "a3752660-488e-495e-a67b-ed1e4f6ad877": "mood_pack:moti",
+    "1d908a4e-9751-41f7-98e9-8499c0c835aa": "mood_pack:moti",
+  };
+  const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+  // Форма вебхука в кабинете lava.top спрашивает логин и пароль, то есть шлёт
+  // обычный Basic. Заголовка X-Api-Key она не умеет вовсе, и первая покупка
+  // (31 июля, 797 ₽) потерялась молча: интеграции там не было, а когда её
+  // завели, оказалось, что ключ вписать некуда. Держим оба способа: Basic для
+  // lava.top, X-Api-Key и ?key= для тестов curl'ом и на случай смены формата.
+  //
+  // Base64 в этой сборке JSVM нет (`atob` не определён), поэтому сравниваем
+  // заголовок целиком с заранее посчитанной строкой из окружения:
+  // LAVA_BASIC = base64("логин:пароль").
+  const secret = $os.getenv("LAVA_WEBHOOK_KEY") || "";
+  const basic = ($os.getenv("LAVA_BASIC") || "").trim();
+  const given = e.request.header.get("X-Api-Key") ||
+    e.request.url.query().get("key") || "";
+  const auth = (e.request.header.get("Authorization") || "").trim();
+  const okKey = secret !== "" && given === secret;
+  const okBasic = basic !== "" && auth === "Basic " + basic;
+  if (!okKey && !okBasic) {
+    return e.json(401, { ok: false, error: "bad_key" });
+  }
+
+  let payload = {};
+  try {
+    payload = e.requestInfo().body || {};
+  } catch (_) {
+    payload = {};
+  }
+
+  // lava.top присылает разные обёртки в зависимости от типа события, поэтому
+  // ищем поля по всему дереву, а не по фиксированному пути (так же в bot/lava.py).
+  const flat = {};
+  const walk = (node, path) => {
+    if (node === null || node === undefined) return;
+    if (typeof node !== "object") {
+      flat[path.toLowerCase()] = String(node);
+      return;
+    }
+    for (const key in node) {
+      walk(node[key], path ? path + "." + key : key);
+    }
+  };
+  walk(payload, "");
+
+  const pick = (names) => {
+    for (const key in flat) {
+      const tail = key.split(".").pop();
+      for (let i = 0; i < names.length; i++) {
+        if (tail === names[i] || key === names[i]) return flat[key];
+      }
+    }
+    return "";
+  };
+
+  // --- Fern: другое приложение, другие аккаунты, другая обработка ---
+  // Подписка Fern живёт в `fern_users`, и событий у неё больше, чем у разовой
+  // покупки: продление, отмена, возврат. Разбирать их здесь значит смешать два
+  // приложения в одном файле, поэтому уведомление уходит целиком в
+  // `fern.pb.js` и Togetherly к нему больше не возвращается.
+  const FERN_IDS = [$os.getenv("FERN_OFFER_MONTH"), $os.getenv("FERN_OFFER_YEAR"),
+                    $os.getenv("FERN_SKU")]
+    .map((s) => String(s || "").trim().toLowerCase())
+    .filter((s) => s !== "");
+  let ферн = false;
+  for (const key in flat) {
+    if (FERN_IDS.indexOf(String(flat[key]).trim().toLowerCase()) !== -1) {
+      ферн = true;
+      break;
+    }
+  }
+  if (ферн) {
+    try {
+      const r = $http.send({
+        url: "http://127.0.0.1:8090/api/fern/lava",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": secret,
+          "Authorization": auth,
+        },
+        body: JSON.stringify(payload),
+        timeout: 20,
+      });
+      return e.json(200, { ok: true, forwarded: "fern", code: r.statusCode });
+    } catch (err) {
+      // Ронять ответ нельзя: lava повторяет доставку, но человек уже заплатил.
+      // Пусть сбой будет виден в журнале, а не в пустом ответе.
+      console.log("[lava] переслать в Fern не вышло: " + err);
+      return e.json(500, { ok: false, error: "fern_unreachable" });
+    }
+  }
+
+  const status = (pick(["status", "eventtype", "event", "state", "type"]) || "")
+    .toLowerCase();
+  const paid = status.indexOf("success") !== -1 ||
+    status.indexOf("paid") !== -1 ||
+    status.indexOf("completed") !== -1 ||
+    status.indexOf("subscription.recurring.payment.success") !== -1;
+  if (!paid) {
+    // Не оплата (отказ, тестовый пинг, возврат) — повторы делу не помогут.
+    return e.json(200, { ok: true, skipped: status || "no_status" });
+  }
+
+  const email = (pick(["email", "buyeremail", "clientemail", "contactemail"]) || "")
+    .trim().toLowerCase();
+  const orderId = (pick(["contractid", "orderid", "invoiceid", "paymentid"]) || "").trim();
+
+  // Товар ищем НЕ по имени поля, а по значению: собираем из уведомления все
+  // uuid подряд и смотрим, нет ли среди них знакомого. Прежний `pick` брал
+  // первое поле, чей хвост совпал с «id», а им запросто оказывался
+  // идентификатор покупателя или платежа, и покупка уходила в «not_ours».
+  // Чужие uuid ни с чем не совпадут, поэтому ложных начислений не будет.
+  const isUuid = (s) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s);
+  let productId = "", amount = 0, isPlus = false, feature = "";
+  for (const key in flat) {
+    const v = String(flat[key]).trim().toLowerCase();
+    if (!isUuid(v)) continue;
+    if (v === PLUS_SKU || v === PLUS_OFFER) { productId = v; isPlus = true; break; }
+    if (FEATURE_SKUS[v]) { productId = v; feature = FEATURE_SKUS[v]; break; }
+    if (PRODUCTS[v]) { productId = v; amount = PRODUCTS[v]; break; }
+  }
+  if (!productId) {
+    productId = (pick(["productid", "offerid", "parentid", "uuid", "id"]) || "")
+      .trim().toLowerCase();
+  }
+
+  // Каждый входящий вебхук оставляет след. `logger().warn` кладёт запись в
+  // `_logs` (info туда не попадает), и теперь любую пропажу видно без
+  // кабинета lava.top: кто платил, за что, чем закончилось. Первую живую
+  // покупку разбирали вслепую именно потому, что следов не было никаких.
+  const trace = (verdict) => {
+    try {
+      $app.logger().warn("lava/webhook: " + verdict,
+        "email", email || "-", "product", productId || "-",
+        "order", orderId || "-", "status", status || "-");
+    } catch (_) {}
+  };
+
+  if (!amount && !isPlus && !feature) {
+    // Товар другого приложения — этим занимается бот, не мы.
+    trace("not_ours");
+    return e.json(200, { ok: true, skipped: "not_ours", product: productId });
+  }
+  if (!email) {
+    trace("no_email");
+    return e.json(400, { ok: false, error: "no_email" });
+  }
+
+  let out = { s: 500, b: { ok: false, error: "internal" } };
+  // Кому открылся Плюс этой оплатой. Нужно ПОСЛЕ транзакции: подарок стоит
+  // сообщить получателю пушем, а ходить в релей изнутри транзакции нельзя —
+  // на этом уже стоял весь сервер (разбор ночи 14 августа).
+  let plusGrantedTo = "";
+  try {
+    $app.runInTransaction((txApp) => {
+      // Идемпотентность: один заказ — одно начисление. Ключом служит номер
+      // заказа, а при его отсутствии — почта с товаром (lava.top иногда шлёт
+      // событие дважды).
+      const key = ("LAVA" + (orderId || email + productId))
+        .toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 30);
+
+      // Ключ заказа живёт в отдельном поле: код у записи свой, и раньше
+      // повторный вебхук по покупке без аккаунта заводил вторую запись.
+      let existing = null;
+      try {
+        existing = txApp.findFirstRecordByFilter(
+          "redeem_codes", "order_key = {:k}", { k: key });
+      } catch (_) {
+        existing = null;
+      }
+      if (existing) {
+        out = { s: 200, b: { ok: true, repeated: true } };
+        return;
+      }
+
+      // Ищем аккаунт с той же почтой: нашёлся — начисляем сразу.
+      let user = null;
+      try {
+        user = txApp.findFirstRecordByFilter(
+          "users", "email = {:e}", { e: email });
+      } catch (_) {
+        user = null;
+      }
+
+      const col = txApp.findCollectionByNameOrId("redeem_codes");
+      const rec = new Record(col);
+      // У Togetherly+ монет нет: код открывает возможности, а не пополняет
+      // баланс. Флаг едет вместе с кодом, чтобы погашение знало, что делать.
+      rec.set("coins", (isPlus || feature) ? 0 : amount);
+      rec.set("plus", isPlus);
+      // Что открывает код, если аккаунта с почтой покупки ещё нет: ключ
+      // владения едет вместе с кодом, погашение только кладёт его человеку.
+      rec.set("feature", feature);
+      rec.set("sku", productId);
+      rec.set("buyer_email", email);
+      rec.set("order_key", key);
+
+      if (user) {
+        rec.set("code", key);
+        rec.set("used_by", user.id);
+        rec.set("used_at", Date.now());
+        txApp.save(rec);
+
+        if (isPlus) {
+          user.set("plus", true);
+          // Откуда покупка: на iOS витрины Togetherly+ нет вовсе, и по этому
+          // полю потом видно, почему у человека всё открыто без неё.
+          user.set("plus_platform", "lava");
+          txApp.save(user);
+          plusGrantedTo = user.id;
+          out = { s: 200, b: { ok: true, plus: true, direct: true } };
+          return;
+        }
+
+        if (feature) {
+          // Ключ владения ложится и покупателю, и его парам: элементы каталога
+          // общие на двоих (маскот живёт на главной у обоих, пак настроений
+          // видно в календаре партнёра), поэтому второй раз за него не платят.
+          // Тот же приём в `coins.pb.js` — shareToGroups.
+          const parse = (s, fb) => {
+            try { return JSON.parse(s || JSON.stringify(fb)) || fb; } catch (_) { return fb; }
+          };
+          const owned = parse(user.getString("owned_features"), []);
+          if (owned.indexOf(feature) === -1) {
+            user.set("owned_features", JSON.stringify(owned.concat([feature])));
+          }
+          txApp.save(user);
+
+          // `group_ids` — relation, а не json: строкой не читается (грабля
+          // раздачи купленного, разобранная 1 августа).
+          let groupIds = [];
+          try { groupIds = user.getStringSlice("group_ids") || []; } catch (_) { groupIds = []; }
+          if (!groupIds.length) groupIds = parse(user.getString("pair_ids"), []);
+          // Купленное открыто обоим, а запись пары живёт в Postgres: ключ
+          // владения добавляет hotpath одним идемпотентным запросом.
+          for (let i = 0; i < groupIds.length; i++) {
+            try {
+              $http.send({
+                url: "http://127.0.0.1:8120/internal/group-write",
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  group_id: String(groupIds[i]),
+                  arr_add: { owned_features: [feature] },
+                }),
+                timeout: 10,
+              });
+            } catch (err) {
+              $app.logger().warn("владение не доехало до пары",
+                "group", String(groupIds[i]), "feature", String(feature),
+                "err", String(err));
+            }
+          }
+          out = { s: 200, b: { ok: true, feature: feature, direct: true } };
+          return;
+        }
+
+        user.set("coins", (user.getInt("coins") || 0) + amount);
+        txApp.save(user);
+        out = { s: 200, b: { ok: true, credited: amount, direct: true } };
+        return;
+      }
+
+      // Аккаунта с такой почтой нет — заводим код для бота.
+      let code = "";
+      for (let i = 0; i < 8; i++) {
+        code += ALPHABET.charAt(Math.floor(Math.random() * ALPHABET.length));
+      }
+      rec.set("code", "TG" + code);
+      txApp.save(rec);
+      out = { s: 200, b: { ok: true, credited: 0, direct: false } };
+    });
+    trace(out.b && out.b.repeated ? "repeated"
+      : out.b && out.b.direct
+        ? (isPlus ? "plus_granted" : feature ? "feature_granted" : "coins_credited")
+        : "code_issued");
+
+    // Подарок партнёру: доступ уже открыт, осталось сказать об этом человеку.
+    // Он ничего не покупал и на витрину не заходил — без уведомления Плюс
+    // просто появится у него однажды, и он решит, что это сбой.
+    if (plusGrantedTo && orderId) {
+      try {
+        const inv = $app.findFirstRecordByFilter(
+          "lava_invoices", "contract_id = {:c}", { c: orderId });
+        const giftedBy = inv ? String(inv.getString("gifted_by") || "") : "";
+        if (giftedBy) {
+          let from = "";
+          try {
+            from = String($app.findRecordById("users", giftedBy)
+              .getString("display_name") || "");
+          } catch (_) {}
+          const push = require(`${__hooks}/apns_push.js`);
+          push.sendTo(
+            plusGrantedTo,
+            "Togetherly+ — подарок 💜",
+            from ? from + " подарил(а) вам полный доступ" : "Вам подарили полный доступ",
+            "plusgift");
+          try { inv.set("granted", true); $app.save(inv); } catch (_) {}
+          $app.logger().warn("lava/webhook: подарок вручён",
+            "to", plusGrantedTo, "from", giftedBy, "order", orderId);
+        }
+      } catch (err) {
+        $app.logger().warn("lava/webhook: уведомление о подарке не ушло",
+          "order", orderId, "err", String(err));
+      }
+    }
+  } catch (err) {
+    try {
+      $http.send({
+        url: "http://127.0.0.1:8000/api/1/store/",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Sentry-Auth":
+            "Sentry sentry_version=7, sentry_key=05953bce75c54cdb9fe149861d159da5",
+        },
+        body: JSON.stringify({
+          message: "lava/webhook: " + String(err),
+          level: "error",
+          logger: "pb_hooks.lava",
+          tags: { feature: "redeem", route: "lava_webhook", error_code: "server" },
+        }),
+        timeout: 5,
+      });
+    } catch (_) {}
+    try {
+      $app.logger().error("lava/webhook: " + String(err));
+    } catch (_) {}
+    out = { s: 500, b: { ok: false, error: "internal" } };
+  }
+  return e.json(out.s, out.b);
+});

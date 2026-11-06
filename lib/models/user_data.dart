@@ -1,0 +1,1522 @@
+import 'dart:async';
+import '../utils/date_only.dart';
+import 'dart:convert';
+import 'dart:ui';
+import 'package:flutter/foundation.dart';
+import 'mood_entry.dart' show MoodGenders;
+import 'package:shared_preferences/shared_preferences.dart';
+import '../services/pb_coins_service.dart';
+import '../services/plus_access.dart';
+import '../services/home_widget_service.dart';
+import '../services/pb_data_service.dart';
+import '../services/pocketbase_service.dart';
+import '../services/push_background_service.dart';
+import '../services/widget_background_refresh_service.dart';
+import '../services/offline/offline_reset.dart';
+import 'ad_grants.dart';
+import '../theme/app_theme.dart';
+import '../services/plus_service.dart';
+import '../theme/app_palettes.dart';
+import '../utils/safe_text.dart';
+import 'level.dart';
+import 'custom_theme.dart';
+import 'mascot_sleep.dart';
+import 'profile_icon.dart';
+import 'avatar_frame.dart';
+import 'pair_book.dart' show kPairBookAdultKey;
+import '../services/avatar_frames.dart';
+import '../services/home_layout_service.dart';
+
+enum Gender { male, female, unspecified }
+
+class UserData extends ChangeNotifier {
+  /// Пол доезжает до подписей настроений при каждом изменении профиля:
+  /// «Устал» парню, «Устала» девушке (жалоба 13.09.2026).
+  @override
+  void notifyListeners() {
+    MoodGenders.mine = genderToStorage();
+    super.notifyListeners();
+  }
+
+  String _displayName = '';
+  String _email = '';
+  String _avatarUrl = '';
+  String _bannerUrl = '';
+  Gender? _gender;
+  /// Произвольный пол для «Свой пол» (когда [_gender] == unspecified).
+  String? _customGender;
+  bool _isRegistered = false;
+  bool _hasSeenWelcome = false;
+  String _uid = '';
+  String? _badge;
+  // Надетая рамка аватарки (ключ каталога). Пишет её сам человек, как badge.
+  String? _frame;
+
+  // ── Дата рождения (только день+месяц важны для поздравлений) ──
+  DateTime? _birthDate;
+
+  // ── Сон маскотов: у каждого персонажа своё окно ночной сцены ──
+  // Живёт на аккаунте (`users.mascot_sleep`), поэтому переезжает вместе с ним
+  // на любое устройство. Кого тут нет — спит по прежним 23:00–07:00.
+  Map<String, SleepWindow> _mascotSleep = const {};
+
+  // ── Коины и премиум-контент ──
+  // Локальные значения — только КЭШ. Источник правды — Firestore,
+  // изменения идут исключительно через серверные Cloud Functions.
+  int _coins = 0;
+  final Set<int> _ownedThemes = <int>{};
+
+  /// Временные награды за просмотр рекламы. Пишет их только сервер, клиент
+  /// читает: подделанная проба открывала бы платное даром.
+  AdGrants _adGrants = AdGrants.empty;
+  // Купленные профильные иконки (КЭШ; источник правды — Firestore/сервер).
+  final Set<String> _ownedIcons = <String>{};
+  // Разблокированные одноразовые фичи (КЭШ; источник правды — Firestore/сервер).
+  final Set<String> _ownedFeatures = <String>{};
+  // Иконки-награды, выданные вручную (Sponsor/Helper).
+  final Set<String> _grantedBadges = <String>{};
+  bool _devCoinsGranted = false;
+  // В этой сессии уже обращались за dev-грантом (любой исход) — не долбим на
+  // каждом lifecycle-событии (load/silent-sign-in/регистрация).
+  bool _devCoinsAttempted = false;
+  // Сервер дал ОКОНЧАТЕЛЬНЫЙ ответ (выдано или «ты не дев» 403/400) — persistent,
+  // чтобы не-разработчики больше НИКОГДА не дёргали dev-coins (раньше это были
+  // сотни `dev-coins 403` в Bugsink). Сбрасывается только на logout.
+  bool _devCoinsChecked = false;
+  int _adRewardsToday = 0;
+  String _adRewardsDate = ''; // YYYY-MM-DD UTC; '' = ещё не получал
+
+  /// Максимум rewarded-просмотров в сутки (зеркало AD_REWARDS_PER_DAY на сервере)
+  static const int adRewardsDailyLimit = 3;
+
+  /// Монет за один просмотр рекламы (зеркало AD_REWARD_AMOUNT на сервере)
+  static const int adRewardAmount = 3;
+
+  /// Кулдаун ежедневного бонуса и награды за воспоминание (зеркало COOLDOWN в
+  /// coins.pb.js: 20ч). В пределах окна задание считается «выполненным».
+  static const int _coinCooldownMs = 20 * 60 * 60 * 1000;
+
+  // ── Getters ──
+  String get displayName => _displayName;
+  String get email => _email;
+  String get avatarUrl => _avatarUrl;
+  String get bannerUrl => _bannerUrl;
+  Gender? get gender => _gender;
+  String? get customGender => _customGender;
+
+  /// Строка хранения пола: male/female/unspecified или произвольный текст
+  /// («Свой пол»). Иллюстрации пары, ждущие male/female, для остального
+  /// падают в дефолт — никаких падений.
+  String genderToStorage() {
+    switch (_gender) {
+      case Gender.male:
+        return 'male';
+      case Gender.female:
+        return 'female';
+      case Gender.unspecified:
+        final c = _customGender?.trim();
+        return (c != null && c.isNotEmpty) ? c : 'unspecified';
+      case null:
+        return '';
+    }
+  }
+
+  void _applyGenderString(String? g) {
+    if (g == null || g.isEmpty) return;
+    if (g == 'male') {
+      _gender = Gender.male;
+      _customGender = null;
+    } else if (g == 'female') {
+      _gender = Gender.female;
+      _customGender = null;
+    } else {
+      _gender = Gender.unspecified;
+      _customGender = (g == 'unspecified') ? null : g;
+    }
+  }
+  bool get isRegistered => _isRegistered;
+  bool get hasSeenWelcome => _hasSeenWelcome;
+
+  /// Расписание ночных сцен: `id маскота → окно`.
+  Map<String, SleepWindow> get mascotSleep => Map.unmodifiable(_mascotSleep);
+
+  /// Когда этот персонаж уходит в ночную сцену.
+  SleepWindow sleepOf(String mascotId) =>
+      MascotSleep.of(_mascotSleep, mascotId);
+
+  /// Задать персонажу своё окно сна.
+  ///
+  /// Пишем сразу и локально, и на сервер: человек сдвинул стрелки и хочет
+  /// увидеть это на главной немедленно, а не после следующей синхронизации.
+  /// Ответ сервера не ждём по той же причине — поле не экономическое, терять
+  /// тут нечего.
+  Future<void> setMascotSleep(String mascotId, SleepWindow window) async {
+    if (mascotId.isEmpty) return;
+    final next = Map<String, SleepWindow>.from(_mascotSleep);
+    if (window == SleepWindow.standard) {
+      next.remove(mascotId);
+    } else {
+      next[mascotId] = window;
+    }
+    if (mapEquals(next, _mascotSleep)) return;
+
+    _mascotSleep = next;
+    notifyListeners();
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+        'mascotSleep', jsonEncode(MascotSleep.encode(_mascotSleep)));
+
+    final uid = PocketBaseService().userId ?? '';
+    if (uid.isEmpty) return;
+    await PbDataService().updateUserProfile(
+      uid,
+      {'mascotSleep': MascotSleep.encode(_mascotSleep)},
+    );
+  }
+  String get uid => _uid;
+  String? get badge => _badge;
+
+  set badge(String? value) {
+    _badge = value;
+    notifyListeners();
+  }
+
+  bool get isMale => _gender == Gender.male;
+  bool get isFemale => _gender == Gender.female;
+
+  DateTime? get birthDate => _birthDate;
+
+  // ── Тема оформления ──────────────────────────────────────────────────────
+  int _themeId = -1; // -1 → используется тема по умолчанию (pink)
+  int? _previewThemeId; // временный оверрайд без сохранения (предпросмотр)
+  bool _blobAnimationEnabled = true;
+
+  // Режим (свет/тьма/система), вариант («сочно»/«точь-в-точь»/мягкий) и AMOLED —
+  // девайсовые настройки, хранятся локально и на сервер не синкаются.
+  /// Светлый по умолчанию, а не системный: приложение задумано светлым и
+  /// розовым, а системная ночная тема встречала половину новых людей тёмным
+  /// экраном. Свой выбор человека это не трогает — он лежит в prefs.
+  AppThemeMode _themeMode = AppThemeMode.light;
+  SchemeFlavor _themeFlavor = SchemeFlavor.soft;
+  bool _amoled = false;
+
+  /// Свои темы Togetherly+: цвет из фотографии или из пикера, до пяти штук.
+  /// Живут на аккаунте (`users.custom_themes`) и переезжают вместе с ним.
+  List<CustomTheme> _customThemes = const [];
+
+  List<CustomTheme> get customThemes => List.unmodifiable(_customThemes);
+
+  /// Часы для правил сезонных тем; тесты подменяют их своими.
+  @visibleForTesting
+  static DateTime Function() clock = DateTime.now;
+
+  /// Когда заведён аккаунт (`users.created`). От неё зависят сезонные темы:
+  /// «Хэллоуин» остаётся у тех, кто пришёл до конца сезона. Пока профиль не
+  /// приехал, берём дату из записи сессии; не нашлось и там — пусто, и
+  /// правило сезона тему не отнимает.
+  DateTime? _registeredAt;
+
+  DateTime? get registeredAt => _registeredAt ?? _sessionCreated();
+
+  static DateTime? _sessionCreated() =>
+      parseRegisteredAt(PocketBaseService().currentUser?.data['created']);
+
+  /// Разбор `created` PocketBase: строка вида `2026-08-14 12:34:56.789Z`.
+  @visibleForTesting
+  static DateTime? parseRegisteredAt(Object? raw) {
+    if (raw is! String || raw.isEmpty) return null;
+    return DateTime.tryParse(raw)?.toUtc();
+  }
+
+  int get themeId {
+    if (_themeId >= 0 &&
+        _themeId < kPalettes.length &&
+        paletteOpen(kPalettes[_themeId],
+            registeredAt: registeredAt, now: clock())) {
+      return _themeId;
+    }
+    if (isCustomPaletteIndex(_themeId) &&
+        customPaletteSlot(_themeId) < _customThemes.length) {
+      return _themeId;
+    }
+    return 0; // default = pink
+  }
+
+  AppTheme? _themeCache;
+  Object? _themeCacheSig;
+
+  /// Полный объект активной темы: палитра (акцент) × режим × вариант × AMOLED.
+  /// Для режима «система» яркость берётся из текущей темы ОС. Мемоизировано —
+  /// `fromSeed` пересчитывается только при смене подписи, а не на каждый
+  /// notifyListeners (монеты, присутствие и т.п.).
+  AppTheme get theme {
+    final b = _themeMode.resolve();
+    final idx = _previewThemeId ?? themeId;
+    final palette = paletteFor(idx, _customThemes);
+    // Свой цвет правится прямо в том же слоте, поэтому в подпись идёт он сам,
+    // а не только индекс: иначе после правки на экране остаётся прежняя тема.
+    final sig = Object.hash(idx, palette.accent, b, _themeFlavor, _amoled);
+    if (_themeCache == null || _themeCacheSig != sig) {
+      _themeCacheSig = sig;
+      _themeCache =
+          buildAppTheme(palette, b, flavor: _themeFlavor, amoled: _amoled);
+    }
+    return _themeCache!;
+  }
+
+  AppThemeMode get themeMode => _themeMode;
+  SchemeFlavor get themeFlavor => _themeFlavor;
+  bool get amoled => _amoled;
+
+  Future<void> setThemeMode(AppThemeMode m) async {
+    if (m == _themeMode) return;
+    _themeMode = m;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('themeMode', m.index);
+    unawaited(_syncAppearance());
+  }
+
+  /// Отдаёт серверу выбранное оформление — палитру и режим.
+  ///
+  /// Нужно только статистике: сам выбор живёт в SharedPreferences и с сервера
+  /// не читается, поэтому неудачная отправка ничего не ломает и не повторяется.
+  Future<void> _syncAppearance() async {
+    final uid = PocketBaseService().userId ?? '';
+    if (uid.isEmpty || !PocketBaseService().isLoggedIn) return;
+    final mode = _themeMode.name;
+    final id = _themeId < 0 ? 0 : _themeId;
+    final ok = await PbDataService().updateUserProfile(uid, {
+      'themeMode': mode,
+      'themeId': id,
+    });
+    if (!ok) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('appearanceSynced', '$mode/$id');
+  }
+
+  /// То же, но молча пропускает отправку, если сервер уже знает этот выбор.
+  Future<void> _syncAppearanceIfChanged() async {
+    final prefs = await SharedPreferences.getInstance();
+    final id = _themeId < 0 ? 0 : _themeId;
+    if (prefs.getString('appearanceSynced') == '${_themeMode.name}/$id') return;
+    await _syncAppearance();
+  }
+
+  Future<void> setThemeFlavor(SchemeFlavor f) async {
+    if (f == _themeFlavor) return;
+    _themeFlavor = f;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('themeFlavor', f.index);
+  }
+
+  Future<void> setAmoled(bool v) async {
+    if (v == _amoled) return;
+    _amoled = v;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('amoled', v);
+  }
+
+  bool get isPreviewingTheme => _previewThemeId != null;
+  int? get previewThemeId => _previewThemeId;
+
+  /// Сколько живёт просмотр платной темы. Без срока «Посмотреть» красило темой
+  /// всё приложение до перезапуска, и платная тема выходила бесплатной
+  /// (обращение 464, 24.10.2026).
+  static const themePreviewDuration = Duration(minutes: 1);
+
+  DateTime? _previewEndsAt;
+  Timer? _previewTimer;
+
+  /// Когда просмотр погаснет сам; null — просмотра нет.
+  DateTime? get previewEndsAt => _previewEndsAt;
+
+  /// Снимает просмотр без перерисовки: её делает тот, кто зовёт.
+  void _clearPreview() {
+    _previewTimer?.cancel();
+    _previewTimer = null;
+    _previewThemeId = null;
+    _previewEndsAt = null;
+  }
+
+  /// Временно применить тему без сохранения. Передай null чтобы сбросить.
+  void setPreviewTheme(int? id) {
+    // Прежний срок снимаем: иначе он погасил бы следующий просмотр раньше.
+    _clearPreview();
+    _previewThemeId = id;
+    if (id != null) {
+      _previewEndsAt = DateTime.now().add(themePreviewDuration);
+      _previewTimer = Timer(themePreviewDuration, () => setPreviewTheme(null));
+    }
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _previewTimer?.cancel();
+    super.dispose();
+  }
+
+  // Алиасы для удобства (используются в экранах)
+  bool get isPurpleTheme => themeId == 1;
+  Color get themeAccent => theme.primary;
+  Color get themeAccentLight => theme.primaryLight;
+  String get themeName => theme.name;
+
+  // ── Коины ─────────────────────────────────────────────────────────────────
+  int get coins => _coins;
+
+  bool _dailyBonusClaimedThisSession = false;
+  bool get dailyBonusClaimedThisSession => _dailyBonusClaimedThisSession;
+
+  bool _memoryRewardClaimedThisSession = false;
+  bool _memoryRewardClaimInProgress = false;
+  bool get memoryRewardClaimedThisSession => _memoryRewardClaimedThisSession;
+
+  /// Восстанавливает статус «выполнено» для ежедневного бонуса/воспоминания из
+  /// серверных таймстампов кулдауна (epoch-ms). Без этого ✓ держится только на
+  /// сессионном флаге, который ставится лишь при успешном начислении В ЭТОМ
+  /// запуске → при повторном входе (или когда коин за период уже получен)
+  /// задание ошибочно показывается невыполненным. В пределах кулдауна (20ч)
+  /// считаем выполненным. Не сбрасываем уже выставленный флаг (на случай гонки
+  /// между авто-начислением на старте и синком профиля).
+  void _seedClaimFlagsFromServer(dynamic lastDailyMs, dynamic lastMemoryMs) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (lastDailyMs is num && lastDailyMs > 0 &&
+        now - lastDailyMs.toInt() < _coinCooldownMs) {
+      _dailyBonusClaimedThisSession = true;
+    }
+    if (lastMemoryMs is num && lastMemoryMs > 0 &&
+        now - lastMemoryMs.toInt() < _coinCooldownMs) {
+      _memoryRewardClaimedThisSession = true;
+    }
+  }
+
+  /// Сколько rewarded-просмотров пользователь сделал сегодня (UTC).
+  /// Если последняя дата начисления — не сегодня, возвращает 0.
+  int get adRewardsToday {
+    final today = DateTime.now().toUtc().toIso8601String().substring(0, 10);
+    return _adRewardsDate == today ? _adRewardsToday : 0;
+  }
+
+  /// Сколько ещё просмотров доступно сегодня.
+  int get adRewardsRemaining =>
+      (adRewardsDailyLimit - adRewardsToday).clamp(0, adRewardsDailyLimit);
+
+  /// Список ID разблокированных премиум-тем
+  Set<int> get ownedThemes => Set.unmodifiable(_ownedThemes);
+
+  /// Временные награды за рекламу: проба темы, фоны, лишний слот фото.
+  AdGrants get adGrants => _adGrants;
+
+  /// Доступна ли тема: бесплатная, купленная за монеты или открытая
+  /// покупкой Togetherly+ — она открывает все платные темы разом. Сезонную
+  /// тему, которую человек не застал, не открывает ничего.
+  bool hasTheme(int id) {
+    if (id >= 0 &&
+        id < kPalettes.length &&
+        !paletteOpen(kPalettes[id], registeredAt: registeredAt, now: clock())) {
+      return false;
+    }
+    final t = AppThemes.byIndex(id);
+    if (!t.isPremium) return true;
+    if (PlusService.instance.active) return true;
+    if (_ownedThemes.contains(id)) return true;
+    // Проба за рекламу живёт семь дней и владением не становится: кончилась —
+    // тема снова под замком, и человек решает, покупать ли её.
+    return _adGrants.themeTrialId(DateTime.now()) == id;
+  }
+
+  // ── Профильные иконки ───────────────────────────────────────────────────────
+  /// Купленные иконки (id из [ProfileIcon.all]).
+  Set<String> get ownedIcons => Set.unmodifiable(_ownedIcons);
+
+  /// Иконки-награды, выданные вручную (Sponsor/Helper).
+  Set<String> get grantedBadges => Set.unmodifiable(_grantedBadges);
+
+  /// Закреплённая рядом с именем иконка. null — не выбрана.
+  String? get equippedIcon =>
+      (_badge != null && _badge!.isNotEmpty) ? _badge : null;
+
+  // ── Рамки аватарки ─────────────────────────────────────────────────────────
+  /// Надетая рамка. null — без рамки.
+  String? get equippedFrame =>
+      (_frame != null && _frame!.isNotEmpty) ? _frame : null;
+
+  /// Получена ли рамка. Выдаёт её только сундук: ключ `frame:frame_<ключ>`
+  /// в `owned_features` пишет сервер.
+  bool ownsFrame(String key) =>
+      _ownedFeatures.contains(AvatarFrame.featureKeyOf(key));
+
+  /// Значки из ответа сундука: выпавший жилец уже лежит в списке.
+  void applyOwnedIcons(List<String> icons) {
+    _ownedIcons
+      ..clear()
+      ..addAll(icons);
+    unawaited(_saveLocal());
+    notifyListeners();
+  }
+
+  /// Покупки из ответа сундука: выпавшая рамка уже лежит в списке.
+  void applyOwnedFeatures(List<String> features) {
+    _ownedFeatures
+      ..clear()
+      ..addAll(features);
+    unawaited(_saveLocal());
+    notifyListeners();
+  }
+
+  /// Рамка ушла партнёру: покупки без неё и надетая рамка из ответа сервера
+  /// (отданную он уже снял).
+  void applyFrameGiven(List<String> features, String? frame) {
+    _ownedFeatures
+      ..clear()
+      ..addAll(features);
+    _frame = (frame == null || frame.isEmpty) ? null : frame;
+    AvatarFrames.instance.setMine(_frame);
+    unawaited(_saveLocal());
+    notifyListeners();
+  }
+
+  /// Надевает рамку (или снимает, если [key] пустой). Надеть можно только
+  /// полученную. Поле косметическое и пишется напрямую, как значок.
+  Future<void> setFrame(String? key) async {
+    final clear = key == null || key.isEmpty;
+    if (!clear && !ownsFrame(key)) return;
+    _frame = clear ? null : key;
+    await _saveLocal();
+    notifyListeners();
+    await PbDataService().updateUserProfile(
+        PocketBaseService().userId ?? "", {'frame': _frame ?? ''});
+  }
+
+  /// Доступна ли иконка: куплена, выдана наградой или открыта Togetherly+.
+  /// Наградные значки покупка не открывает — см. [PlusAccess.ownsIcon].
+  bool ownsIcon(String id) => PlusAccess.ownsIcon(
+        id: id,
+        plus: PlusService.instance.active,
+        owned: _ownedIcons,
+        granted: _grantedBadges,
+      );
+
+  /// Все доступные пользователю иконки, без дублей. С Togetherly+ сюда входит
+  /// весь платный набор, кроме наградных.
+  Set<String> get availableIcons => {
+        ..._ownedIcons,
+        ..._grantedBadges,
+        if (PlusService.instance.active)
+          ...ProfileIcon.purchasable.map((i) => i.id),
+      };
+
+  // ── Одноразовые фичи ─────────────────────────────────────────────────────
+  /// ID фичи: свои фото пары на виджете «Дни вместе» (зеркало FEATURE_PRICES).
+  static const String featureDaysWidgetPhotos = 'days_widget_photos';
+
+  /// Разблокированные одноразовые фичи.
+  Set<String> get ownedFeatures => Set.unmodifiable(_ownedFeatures);
+
+  /// Разблокирована ли фича пользователем.
+  bool ownsFeature(String id) {
+    if (_ownedFeatures.contains(id)) return true;
+    // Фото в виджете дней даётся ещё и пробой за рекламу — на неделю.
+    if (id == featureDaysWidgetPhotos) {
+      return _adGrants.activeFor(AdGrantKind.widgetPhoto, DateTime.now()) !=
+          null;
+    }
+    return false;
+  }
+
+  /// Применяет результат, пришедший с сервера (callable function).
+  /// Используется как единственный путь обновления баланса/owned.
+  void _applyServerResult(Map<String, dynamic> result) {
+    final coins = result['coins'];
+    if (coins is num) _coins = coins.toInt();
+    final owned = result['ownedThemes'];
+    if (owned is List) {
+      _ownedThemes
+        ..clear()
+        ..addAll(owned.whereType<num>().map((e) => e.toInt()));
+    }
+    final ownedI = result['ownedIcons'];
+    if (ownedI is List) {
+      _ownedIcons
+        ..clear()
+        ..addAll(ownedI.whereType<String>());
+    }
+    final ownedF = result['ownedFeatures'];
+    if (ownedF is List) {
+      _ownedFeatures
+        ..clear()
+        ..addAll(ownedF.whereType<String>());
+    }
+    unawaited(_saveLocal());
+    notifyListeners();
+  }
+
+  /// Ставит баланс, пришедший от роута, который живёт ВНЕ `/api/coins/*`.
+  ///
+  /// Подарки списывают монеты своим роутом и возвращают новый баланс в ответе,
+  /// а `_applyServerResult` до них не дотягивается — он закрыт внутри
+  /// [PbCoinsService]. Пока баланс оставался внутри экрана магазина, профиль
+  /// показывал прежнее число: человек видел 60, сервер знал 10, и следующая
+  /// покупка отвечала «не хватает монет» при полном на вид кошельке
+  /// (жалоба 22.08.2026). Выравнивалось только следующим
+  /// [refreshCoinsFromServer], то есть через пару минут.
+  void applyServerCoins(int coins) {
+    if (coins < 0 || coins == _coins) return;
+    _coins = coins;
+    unawaited(_saveLocal());
+    notifyListeners();
+  }
+
+  /// Гарантирует, что баланс не упадёт ниже [floor].
+  /// Вызывается после оптимистичного начисления, пока SSV ещё не подтвердил.
+  void ensureCoinsAtLeast(int floor) {
+    if (_coins < floor) {
+      _coins = floor;
+      notifyListeners();
+    }
+  }
+
+  /// Оптимистичное начисление награды за рекламу — до подтверждения сервером.
+  /// Даёт мгновенный отклик UI; сервер потом подтвердит через SSV (AdMob-путь).
+  void applyOptimisticAdReward(int amount) {
+    _coins += amount;
+    final today = DateTime.now().toUtc().toIso8601String().substring(0, 10);
+    if (_adRewardsDate != today) {
+      _adRewardsDate = today;
+      _adRewardsToday = 0;
+    }
+    _adRewardsToday += 1;
+    _saveLocal();
+    notifyListeners();
+  }
+
+  /// Применяет АВТОРИТЕТНЫЙ результат начисления за рекламу (Яндекс-callable
+  /// `grantAdReward` синхронно возвращает реальный баланс). В отличие от
+  /// [applyOptimisticAdReward] не угадывает сумму — ставит точный серверный
+  /// баланс. Счётчик увеличивается только если сервер РЕАЛЬНО начислил
+  /// ([granted]); при дневном лимите счётчик выставляется в максимум, чтобы
+  /// кнопка корректно заблокировалась.
+  void applyServerAdReward({required int coins, required bool granted}) {
+    _coins = coins;
+    final today = DateTime.now().toUtc().toIso8601String().substring(0, 10);
+    if (_adRewardsDate != today) {
+      _adRewardsDate = today;
+      _adRewardsToday = 0;
+    }
+    _adRewardsToday =
+        granted ? _adRewardsToday + 1 : adRewardsDailyLimit;
+    _saveLocal();
+    notifyListeners();
+  }
+
+  /// Перезагружает coins/ownedThemes с сервера.
+  Future<void> refreshCoinsFromServer() async {
+    try {
+      final data = await PbDataService().loadUserProfileMap(PocketBaseService().userId ?? "");
+      if (data == null) return;
+      final cloudCoins = data['coins'];
+      if (cloudCoins is num) _coins = cloudCoins.toInt();
+      final cloudOwned = data['ownedThemes'];
+      if (cloudOwned is List) {
+        _ownedThemes
+          ..clear()
+          ..addAll(cloudOwned.whereType<num>().map((e) => e.toInt()));
+      }
+      final cloudOwnedIcons = data['ownedIcons'];
+      if (cloudOwnedIcons is List) {
+        _ownedIcons
+          ..clear()
+          ..addAll(cloudOwnedIcons.whereType<String>());
+      }
+      final cloudOwnedFeatures = data['ownedFeatures'];
+      if (cloudOwnedFeatures is List) {
+        _ownedFeatures
+          ..clear()
+          ..addAll(cloudOwnedFeatures.whereType<String>());
+      }
+      // Счётчик просмотров рекламы за день. Без этого после серверного
+      // начисления (Яндекс grantAdReward / AdMob SSV) клиентский «X/3» не
+      // догоняет правду сервера, счётчик «застывает» и задание не отмечается
+      // выполненным даже когда лимит исчерпан.
+      final cloudAdCount = data['adRewardsToday'];
+      if (cloudAdCount is num) _adRewardsToday = cloudAdCount.toInt();
+      final cloudAdDate = data['adRewardsDate'];
+      if (cloudAdDate is String) _adRewardsDate = cloudAdDate;
+      final cloudGrants = data['adGrants'];
+      if (cloudGrants is String) _adGrants = AdGrants.parse(cloudGrants);
+      _seedClaimFlagsFromServer(data['lastDailyBonusMs'], data['lastMemoryRewardMs']);
+      await _saveLocal();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('refreshCoinsFromServer failed: $e');
+    }
+  }
+
+  /// Ежедневный бонус. Возвращает true при успешном начислении (false если cooldown).
+  Future<bool> claimDailyBonus() async {
+    final r = await PbCoinsService().dailyBonus();
+    if (r == null) return false;
+    _applyServerResult(r);
+    final awarded = r['ok'] == true;
+    if (awarded) {
+      _dailyBonusClaimedThisSession = true;
+      notifyListeners();
+    }
+    return awarded;
+  }
+
+  /// Награда за добавление воспоминания (1 🪙/день).
+  /// Возвращает кол-во начисленных монет, или 0 если cooldown/ошибка.
+  Future<int> claimMemoryReward() async {
+    if (_memoryRewardClaimedThisSession || _memoryRewardClaimInProgress) return 0;
+    _memoryRewardClaimInProgress = true;
+    try {
+      final r = await PbCoinsService().memoryReward();
+      if (r == null) return 0;
+      _applyServerResult(r);
+      final amount = (r['ok'] == true) ? (r['awarded'] as num?)?.toInt() ?? 0 : 0;
+      if (amount > 0) {
+        _memoryRewardClaimedThisSession = true;
+        notifyListeners();
+      }
+      return amount;
+    } finally {
+      _memoryRewardClaimInProgress = false;
+    }
+  }
+
+  /// Награда за подключение партнёра (50 🪙). Выдаётся по одному разу на каждую
+  /// УНИКАЛЬНУЮ пару людей (дедуп на сервере по email/uid партнёра), обоим
+  /// участникам независимо. [partnerUid] — uid второго участника пары.
+  /// Возвращает кол-во начисленных монет, или 0 если уже выдано/нет партнёра.
+  Future<int> claimPartnerInviteReward(String partnerUid) async {
+    if (partnerUid.isEmpty) return 0;
+    final r = await PbCoinsService().partnerInvite(partnerUid);
+    if (r == null) return 0;
+    _applyServerResult(r);
+    return (r['ok'] == true) ? (r['awarded'] as num?)?.toInt() ?? 0 : 0;
+  }
+
+  /// Награда за 7-дневный стрик настроения обоих (10 🪙 раз в 7 дней).
+  /// Возвращает кол-во начисленных монет, или 0 если cooldown.
+  Future<int> claimMoodStreakReward(String groupId) async {
+    final r = await PbCoinsService().moodStreak(groupId);
+    if (r == null) return 0;
+    _applyServerResult(r);
+    return (r['ok'] == true) ? (r['awarded'] as num?)?.toInt() ?? 0 : 0;
+  }
+
+  /// Пытается купить тему на сервере. Возвращает true при успехе.
+  Future<bool> purchaseTheme(int themeId) async {
+    final t = AppThemes.byIndex(themeId);
+    if (!t.isPremium) return true; // free
+    if (_ownedThemes.contains(themeId)) return true;
+    final r = await PbCoinsService().purchaseTheme(themeId);
+    if (r == null) return false;
+    _applyServerResult(r);
+    return _ownedThemes.contains(themeId);
+  }
+
+  /// Просит у сервера временную награду за просмотренную рекламу.
+  ///
+  /// Сроки, кулдаун и потолок держит сервер: клиент только показывает ответ.
+  Future<AdGrantResult> takeAdGrant(AdGrantKind kind, String id) async {
+    final r = await PbCoinsService().adGrant(adGrantKey(kind), id);
+    if (r == null) return AdGrantResult.failed;
+    if (r['ok'] == true) {
+      final grants = r['grants'];
+      if (grants != null) _adGrants = AdGrants.parse(jsonEncode(grants));
+      notifyListeners();
+      return AdGrantResult.ok;
+    }
+    if (r['cooldown'] == true) {
+      final next = (r['nextAt'] as num?)?.toInt() ?? 0;
+      final days = next <= 0
+          ? 0
+          : DateTime.fromMillisecondsSinceEpoch(next)
+                  .difference(DateTime.now())
+                  .inDays +
+              1;
+      return AdGrantResult.cooldown(days);
+    }
+    return AdGrantResult.rateLimited;
+  }
+
+  /// Покупает профильную иконку на сервере. Возвращает true при успехе.
+  /// Списание монет и запись в ownedIcons делает Cloud Function `purchaseIcon`
+  /// (защищено от обхода цены/двойного списания).
+  Future<bool> purchaseIcon(ProfileIcon icon) async {
+    if (icon.grantOnly) return false; // награды не продаются
+    if (_ownedIcons.contains(icon.id)) return true; // уже куплена
+    final r = await PbCoinsService().purchaseIcon(icon.id);
+    if (r == null) return false;
+    _applyServerResult(r);
+    return _ownedIcons.contains(icon.id);
+  }
+
+  /// Покупает одноразовую разблокировку фичи за коины. Возвращает true при успехе.
+  /// Списание монет и запись в ownedFeatures делает Cloud Function `purchaseFeature`
+  /// (защищено от обхода цены/двойного списания).
+  /// Гасит код пополнения. Возвращает начисленные монеты, либо null при
+  /// ошибке (неверный код, уже погашен, нет связи).
+  Future<int?> redeemCode(String code) async {
+    final r = await PbCoinsService().redeem(code);
+    if (r == null || r['ok'] != true) return null;
+    _applyServerResult(r);
+    final awarded = (r['awarded'] as num?)?.toInt() ?? 0;
+    return awarded;
+  }
+
+  Future<bool> purchaseFeature(String featureId) async {
+    if (_ownedFeatures.contains(featureId)) return true; // уже куплена
+    final r = await PbCoinsService().purchaseFeature(featureId);
+    if (r == null) return false;
+    _applyServerResult(r);
+    return _ownedFeatures.contains(featureId);
+  }
+
+  /// Куплен ли этот элемент каталога.
+  ///
+  /// Владение всех платных элементов лежит в общем `owned_features` под ключом
+  /// `вид:id` — так новый вид платного не требует ни нового поля на сервере,
+  /// ни новой сборки.
+  bool ownsCatalogItem(String kind, String id) =>
+      _ownedFeatures.contains(Unlock.featureKey(kind, id));
+
+  /// Открыт ли элемент каталога прямо сейчас: бесплатный, дорос уровнем,
+  /// куплен (мной или партнёром) или включён в действующий Togetherly+.
+  ///
+  /// [boughtByPair] — покупка лежит на самой группе. Маскот общий, и платить
+  /// за него дважды паре не приходится.
+  bool unlocksCatalogItem(
+    Unlock unlock,
+    String kind,
+    String id,
+    int level, {
+    bool boughtByPair = false,
+  }) =>
+      unlock.isUnlocked(
+        level: level,
+        owned: boughtByPair || ownsCatalogItem(kind, id),
+        plus: PlusService.instance.active,
+      );
+
+  /// Купить элемент каталога за монеты. Цену считает сервер по записи в
+  /// каталоге — клиентскому числу он не верит.
+  Future<bool> purchaseCatalogItem(String kind, String id) =>
+      purchaseFeature(Unlock.featureKey(kind, id));
+
+  /// Списывает коины за расходуемое действие (напр. смена фона чата).
+  /// Списывает КАЖДЫЙ раз. Цена и проверка баланса — на сервере.
+  /// Возвращает true при успешном списании.
+  Future<bool> spendCoins(String actionId) async {
+    final r = await PbCoinsService().spend(actionId);
+    if (r == null) return false;
+    _applyServerResult(r);
+    return r['ok'] == true;
+  }
+
+  /// Закрепляет иконку рядом с именем (или снимает, если [id] == null/'').
+  /// badge не влияет на экономику — пишется напрямую (как и раньше).
+  /// Закрепить можно только доступную (купленную/выданную) иконку.
+  Future<void> setBadgeIcon(String? id) async {
+    final clear = id == null || id.isEmpty;
+    if (!clear && !ownsIcon(id)) return; // нельзя закрепить чужую иконку
+    _badge = clear ? null : id;
+    await _saveLocal();
+    await PbDataService().updateUserProfile(PocketBaseService().userId ?? "", {'badge': _badge ?? ''});
+    notifyListeners();
+  }
+
+  /// Выдаёт иконку-награду (Sponsor/Helper). Идемпотентно.
+  /// Если у пользователя ещё нет закреплённой иконки — закрепляет автоматически.
+  /// Грант определяется по e-mail в [main] (та же модель доверия, что и раньше).
+  ///
+  /// Возвращает true, только если бейдж выдан ВПЕРВЫЕ (его не было в наборе) —
+  /// чтобы вызывающий код мог разово уведомить пользователя, а не на каждом
+  /// запуске.
+  ///
+  /// **`granted_badges` пишет только сервер.** Поле в списке защищённых
+  /// (`users_guard.pb.js`), клиентский PATCH его молча не сохраняет. Раньше это
+  /// давало вечное поздравление: локально значок добавлялся, уведомление
+  /// показывалось, на сервер список не уезжал, а следующий синк затирал
+  /// локальный набор серверным пустым — и круг повторялся при каждом запуске
+  /// (жалоба про значок «Рыбка», 31 июля). Поэтому поздравляем только тогда,
+  /// когда значка нет ни в наборе, ни на человеке: надетый значок и есть
+  /// доказательство, что его уже вручали.
+  Future<bool> grantSpecialBadge(String id) async {
+    final alreadyWorn = _badge == id;
+    final added = _grantedBadges.add(id);
+    final autoEquip = _badge == null || _badge!.isEmpty;
+    if (!added && !autoEquip) return false; // ничего не изменилось — без записи
+    if (autoEquip) _badge = id;
+    await _saveLocal();
+    await PbDataService().updateUserProfile(PocketBaseService().userId ?? "", {
+      'grantedBadges': _grantedBadges.toList(),
+      'badge': _badge ?? '',
+    });
+    notifyListeners();
+    return added && !alreadyWorn;
+  }
+
+  /// Начисляет монеты после успешной IAP-покупки.
+  ///
+  /// Вызывается из [IapService] после того, как магазин подтвердил транзакцию.
+  /// Передаёт [productId] и [purchaseToken] на PB-хук; сервер валидирует
+  /// idempotency и начисляет монеты.
+  ///
+  /// Возвращает новый баланс или null при сетевой / серверной ошибке.
+  Future<int?> purchaseCoins({
+    required String productId,
+    required String purchaseToken,
+  }) async {
+    final r = await PbCoinsService().iapPurchase(
+      productId: productId,
+      purchaseToken: purchaseToken,
+    );
+    if (r == null) return null;
+    _applyServerResult(r);
+    return _coins;
+  }
+
+  /// Единоразовая серверная выдача монет разработчику (проверка email
+  /// делается на сервере по auth-токену, обойти невозможно).
+  Future<void> _maybeGrantDevCoins() async {
+    if (_devCoinsGranted || _devCoinsChecked) return; // уже выдано/отвечено
+    if (_devCoinsAttempted) return; // в этой сессии уже пробовали — не долбим
+    _devCoinsAttempted = true;
+    final r = await PbCoinsService().devCoinsGrant();
+    if (r.result == DevCoinsResult.retry) return; // сеть/сессия — позже
+    // Сервер ответил окончательно (выдано или отказано) — больше не спрашиваем.
+    _devCoinsChecked = true;
+    final data = r.data;
+    if (r.result == DevCoinsResult.ok && data != null) {
+      _applyServerResult(data);
+      if (data['ok'] == true) _devCoinsGranted = true;
+    }
+    await _saveLocal();
+  }
+
+  /// Whether the timer card shows a morphing blob shape (true by default)
+  bool get blobAnimationEnabled => _blobAnimationEnabled;
+
+  String get initials {
+    final name = _displayName.trim();
+    if (name.isEmpty) return '?';
+    // По графемам, иначе имя с ведущим эмодзи рвёт суррогатную пару (см. SafeText).
+    final parts = name.split(' ').where((p) => p.isNotEmpty).toList();
+    if (parts.length >= 2) {
+      return '${parts[0].firstGraphemeUpper('')}${parts[1].firstGraphemeUpper('')}';
+    }
+    return name.firstGraphemeUpper();
+  }
+
+  // ── Persistence (локальный кэш + Firestore) ──
+  Future<void> loadFromPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _hasSeenWelcome = prefs.getBool('hasSeenWelcome') ?? false;
+      _isRegistered = prefs.getBool('isRegistered') ?? false;
+      _displayName = prefs.getString('displayName') ?? '';
+      _email = prefs.getString('email') ?? '';
+      _avatarUrl = prefs.getString('avatarUrl') ?? '';
+      _bannerUrl = prefs.getString('bannerUrl') ?? '';
+      _uid = prefs.getString('uid') ?? '';
+      _applyGenderString(prefs.getString('gender'));
+      _themeId = prefs.getInt('themeId') ?? -1;
+      _customThemes = parseCustomThemes(prefs.getString('customThemes'));
+      final hadThemeMode = prefs.containsKey('themeMode');
+      _themeMode = AppThemeMode.values[
+          (prefs.getInt('themeMode') ?? AppThemeMode.light.index)
+              .clamp(0, AppThemeMode.values.length - 1)];
+      // Миграция на модель «акцент × режим»: старые ТЁМНЫЕ темы (индексы 20–24)
+      // теперь просто акценты. Кто на них сидел и ещё не выбирал режим — остаётся
+      // в тёмном, иначе внезапно уехал бы в системный (часто светлый).
+      if (!hadThemeMode && _themeId >= 20 && _themeId <= 24) {
+        _themeMode = AppThemeMode.dark;
+        await prefs.setInt('themeMode', AppThemeMode.dark.index);
+      }
+      _themeFlavor = SchemeFlavor.values[
+          (prefs.getInt('themeFlavor') ?? SchemeFlavor.soft.index)
+              .clamp(0, SchemeFlavor.values.length - 1)];
+      _amoled = prefs.getBool('amoled') ?? false;
+      _blobAnimationEnabled = prefs.getBool('blobAnimationEnabled') ?? true;
+      _badge = prefs.getString('badge');
+      _frame = prefs.getString('avatarFrame');
+      AvatarFrames.instance.setMine(_frame);
+      _coins = prefs.getInt('coins') ?? 0;
+      _devCoinsGranted = prefs.getBool('devCoinsGranted') ?? false;
+      _devCoinsChecked = prefs.getBool('devCoinsChecked') ?? false;
+      _adRewardsToday = prefs.getInt('adRewardsToday') ?? 0;
+      _adRewardsDate = prefs.getString('adRewardsDate') ?? '';
+      _mascotSleep = MascotSleep.parse(prefs.getString('mascotSleep'));
+      final bdMs = prefs.getInt('birthDate');
+      _birthDate = bdMs != null
+          ? DateTime.fromMillisecondsSinceEpoch(bdMs)
+          : null;
+      final regMs = prefs.getInt('registeredAt');
+      _registeredAt = regMs != null
+          ? DateTime.fromMillisecondsSinceEpoch(regMs, isUtc: true)
+          : null;
+      _ownedThemes
+        ..clear()
+        ..addAll(
+          (prefs.getStringList('ownedThemes') ?? const <String>[])
+              .map(int.tryParse)
+              .whereType<int>(),
+        );
+      _ownedIcons
+        ..clear()
+        ..addAll(prefs.getStringList('ownedIcons') ?? const <String>[]);
+      _ownedFeatures
+        ..clear()
+        ..addAll(prefs.getStringList('ownedFeatures') ?? const <String>[]);
+      _grantedBadges
+        ..clear()
+        ..addAll(prefs.getStringList('grantedBadges') ?? const <String>[]);
+
+      // Если авторизован → подтягиваем из облака. В фоне: всё нужное для
+      // показа уже прочитано с телефона, и заставка сети не ждёт. Пока здесь
+      // стоял `await`, на рвущейся связи розовая заставка висела до десяти
+      // секунд при полном кэше (жалоба 15.10.2026).
+      if (PocketBaseService().isLoggedIn && _isRegistered) {
+        _uid = PocketBaseService().userId ?? _uid;
+        unawaited(syncFromServer());
+      }
+    } catch (e) {
+      debugPrint('SharedPreferences load failed: $e');
+    }
+    notifyListeners();
+  }
+
+  /// Публичная ре-синхронизация с сервером после восстановления сессии
+  /// (`signInSilently`). [loadFromPrefs] синкается только если на момент его
+  /// вызова уже была активная сессия; при тихом входе сессия поднимается позже,
+  /// поэтому без этого вызова приложение весь сеанс показывало бы устаревший
+  /// локальный баланс/темы, а серверные начисления молча применялись бы поверх
+  /// неактуального состояния.
+  Future<void> syncFromServer() async {
+    if (!PocketBaseService().isLoggedIn) return;
+    try {
+      await _syncFromFirestore();
+      await _maybeGrantDevCoins();
+    } catch (e) {
+      debugPrint('UserData.syncFromServer failed: $e');
+    }
+    // Экран уже показан с данными телефона — свежие с сервера дорисовываем.
+    notifyListeners();
+  }
+
+  Future<void> _syncFromFirestore() async {
+    try {
+      final data = await PbDataService().loadUserProfileMap(PocketBaseService().userId ?? "");
+      if (data != null) {
+        _displayName = data['displayName'] ?? _displayName;
+        _email = data['email'] ?? _email;
+        // Only overwrite local avatar if Firestore has a real non-empty value.
+        // An empty string in Firestore means the field was accidentally cleared —
+        // preserve whatever the user set locally in that case.
+        final firestoreAvatar = data['avatarUrl'] as String? ?? '';
+        if (firestoreAvatar.isNotEmpty) _avatarUrl = firestoreAvatar;
+        final serverBanner = data['bannerUrl'] as String? ?? '';
+        if (serverBanner.isNotEmpty) _bannerUrl = serverBanner;
+        _applyGenderString(data['gender'] as String?);
+        _badge = data['badge'] as String?;
+        // Старый сервер поля не отдаёт — тогда держим то, что надето локально.
+        if (data.containsKey('frame')) _frame = data['frame'] as String?;
+
+        final cloudCoins = data['coins'];
+        if (cloudCoins is int) _coins = cloudCoins;
+        final cloudOwned = data['ownedThemes'];
+        if (cloudOwned is List) {
+          _ownedThemes
+            ..clear()
+            ..addAll(cloudOwned.whereType<int>());
+        }
+        final cloudOwnedIcons = data['ownedIcons'];
+        if (cloudOwnedIcons is List) {
+          _ownedIcons
+            ..clear()
+            ..addAll(cloudOwnedIcons.whereType<String>());
+        }
+        final cloudOwnedFeatures = data['ownedFeatures'];
+        if (cloudOwnedFeatures is List) {
+          _ownedFeatures
+            ..clear()
+            ..addAll(cloudOwnedFeatures.whereType<String>());
+        }
+        final cloudGrantedBadges = data['grantedBadges'];
+        if (cloudGrantedBadges is List) {
+          _grantedBadges
+            ..clear()
+            ..addAll(cloudGrantedBadges.whereType<String>());
+        }
+        final cloudGranted = data['devCoinsGranted'];
+        if (cloudGranted is bool) _devCoinsGranted = cloudGranted;
+
+        final cloudAdCount = data['adRewardsToday'];
+        if (cloudAdCount is num) _adRewardsToday = cloudAdCount.toInt();
+        final cloudAdDate = data['adRewardsDate'];
+        if (cloudAdDate is String) _adRewardsDate = cloudAdDate;
+        _seedClaimFlagsFromServer(
+            data['lastDailyBonusMs'], data['lastMemoryRewardMs']);
+
+        final created = parseRegisteredAt(data['created']);
+        if (created != null) _registeredAt = created;
+
+        final bdRaw = data['birthDate'];
+        // Календарным днём: у старых записей внутри лежит минута сохранения, и
+        // на другом устройстве дата уезжала на сутки.
+        if (bdRaw is String && bdRaw.isNotEmpty) {
+          _birthDate = DateOnly.parse(bdRaw);
+        } else if (bdRaw is int) {
+          _birthDate = DateTime.fromMillisecondsSinceEpoch(bdRaw);
+        }
+
+        _mascotSleep = MascotSleep.parse(data['mascotSleep']);
+        // Свои темы приезжают с аккаунтом: переустановил приложение —
+        // собранные цвета на месте. Пустой ответ прежних сборок ничего не
+        // затирает, иначе тема, заведённая офлайн, пропала бы на входе.
+        final serverThemes = parseCustomThemes(data['customThemes']);
+        if (serverThemes.isNotEmpty) _customThemes = serverThemes;
+
+        await _saveLocal();
+
+        // Propagate name/avatar to all group documents on every login so
+        // partners always see the real name even if the user never explicitly
+        // edited their profile after connecting (fixes 'Partner' fallback).
+        final myUid = PocketBaseService().userId ?? '';
+        if (_displayName.isNotEmpty) {
+          unawaited(PbDataService()
+              .updateMemberFieldInGroups(myUid, 'member_names', _displayName));
+        }
+        if (_avatarUrl.isNotEmpty) {
+          unawaited(PbDataService()
+              .updateMemberFieldInGroups(myUid, 'member_avatars', _avatarUrl));
+        }
+        // Оформление уходит на сервер при входе, иначе статистика знала бы
+        // только тех, кто менял тему после обновления. Отправляем лишь при
+        // расхождении с прошлым разом — лишний PATCH на каждый старт у
+        // тридцати тысяч человек не нужен.
+        unawaited(_syncAppearanceIfChanged());
+      }
+    } catch (e) {
+      debugPrint('Firestore sync failed: $e');
+    }
+  }
+
+  Future<void> _saveLocal() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('hasSeenWelcome', _hasSeenWelcome);
+      await prefs.setBool('isRegistered', _isRegistered);
+      await prefs.setString('displayName', _displayName);
+      await prefs.setString('email', _email);
+      await prefs.setString('avatarUrl', _avatarUrl);
+      await prefs.setString('bannerUrl', _bannerUrl);
+      await prefs.setString('uid', _uid);
+      await prefs.setString('gender', genderToStorage());
+      await prefs.setInt('themeId', _themeId);
+      await prefs.setString('customThemes', encodeCustomThemes(_customThemes));
+      await prefs.setBool('blobAnimationEnabled', _blobAnimationEnabled);
+      if (_birthDate != null) {
+        await prefs.setInt('birthDate', _birthDate!.millisecondsSinceEpoch);
+      } else {
+        await prefs.remove('birthDate');
+      }
+      if (_registeredAt != null) {
+        await prefs.setInt(
+            'registeredAt', _registeredAt!.millisecondsSinceEpoch);
+      }
+      if (_badge != null) {
+        await prefs.setString('badge', _badge!);
+      } else {
+        await prefs.remove('badge');
+      }
+      AvatarFrames.instance.setMine(_frame);
+      if (_frame != null) {
+        await prefs.setString('avatarFrame', _frame!);
+      } else {
+        await prefs.remove('avatarFrame');
+      }
+      await prefs.setInt('coins', _coins);
+      await prefs.setBool('devCoinsGranted', _devCoinsGranted);
+      await prefs.setBool('devCoinsChecked', _devCoinsChecked);
+      await prefs.setInt('adRewardsToday', _adRewardsToday);
+      await prefs.setString('adRewardsDate', _adRewardsDate);
+      await prefs.setString(
+          'mascotSleep', jsonEncode(MascotSleep.encode(_mascotSleep)));
+      await prefs.setStringList(
+        'ownedThemes',
+        _ownedThemes.map((e) => e.toString()).toList(),
+      );
+      await prefs.setStringList('ownedIcons', _ownedIcons.toList());
+      await prefs.setStringList('ownedFeatures', _ownedFeatures.toList());
+      await prefs.setStringList('grantedBadges', _grantedBadges.toList());
+    } catch (e) {
+      debugPrint('SharedPreferences save failed: $e');
+    }
+  }
+
+  // ── Actions ──
+  Future<void> markWelcomeSeen() async {
+    _hasSeenWelcome = true;
+    await _saveLocal();
+    notifyListeners();
+  }
+
+  Future<void> register({
+    required String displayName,
+    required String email,
+    required Gender gender,
+    String? customGender,
+    String avatarUrl = '',
+    bool isReturningUser = false, // For login - don't clear data
+  }) async {
+    // Clear old connection data when registering new user
+    final prefs = await SharedPreferences.getInstance();
+    final storedUid = prefs.getString('uid') ?? '';
+    final currentUid = PocketBaseService().userId ?? '';
+
+    // isNewUser = UID changed AND this is NOT a returning user (login)
+    final isNewUser =
+        storedUid != currentUid && currentUid.isNotEmpty && !isReturningUser;
+
+    // If UID changed and this is fresh registration, clear ALL old data
+    if (isNewUser) {
+      await prefs.remove('connections');
+      await prefs.remove('activeConnectionIndex');
+      await prefs.remove('user_timers');
+      await prefs.remove('timer_selected_time_unit');
+      debugPrint(
+        'Cleared old connections & timers for new user: $storedUid -> $currentUid',
+      );
+    }
+
+    _displayName = displayName;
+    _email = email;
+    _gender = gender;
+    _customGender = customGender;
+    _avatarUrl = avatarUrl;
+    _isRegistered = true;
+    _uid = PocketBaseService().userId ?? '';
+
+    await _saveLocal();
+    notifyListeners();
+
+    // Сетевое обогащение профиля (запись имени/пола, синк коинов/тем из облака,
+    // dev-коины) — БЕСТ-ЭФФОРТ и НЕ должно блокировать завершение входа. Раньше
+    // эти три вызова await'ились ЗДЕСЬ и БЕЗ ТАЙМАУТА → если любой повисал
+    // (наблюдалось на iOS: «бесконечная загрузка после кнопки Вход/Регистрация»),
+    // register() не возвращался, экран входа не навигировал на главный, спиннер
+    // крутился вечно. Локальное состояние «вошёл» уже сохранено выше, поэтому
+    // уводим обогащение в фон с таймаутами; оно обновит UI через notifyListeners.
+    final uid = PocketBaseService().userId ?? '';
+    if (PocketBaseService().isLoggedIn && uid.isNotEmpty) {
+      unawaited(_enrichAfterLogin(
+        uid: uid,
+        displayName: displayName,
+        gender: gender,
+        avatarUrl: avatarUrl,
+        isNewUser: isNewUser,
+      ));
+    }
+  }
+
+  /// Фоновое обогащение профиля после входа: запись профиля + синк облака +
+  /// dev-коины. Best-effort, каждый шаг с таймаутом — НЕ блокирует вход.
+  Future<void> _enrichAfterLogin({
+    required String uid,
+    required String displayName,
+    required Gender gender,
+    required String avatarUrl,
+    required bool isNewUser,
+  }) async {
+    const t = Duration(seconds: 12);
+    try {
+      await PbDataService().updateUserProfile(uid, {
+        'displayName': displayName,
+        'gender': genderToStorage(),
+        'avatarUrl': avatarUrl,
+        // Сброс пары для нового юзера (email/пароль — поля auth, не трогаем тут).
+        if (isNewUser) 'pairId': '',
+        if (isNewUser) 'pairIds': <String>[],
+      }).timeout(t);
+    } catch (e) {
+      debugPrint('UserData._enrichAfterLogin updateProfile failed: $e');
+    }
+    // Синхронизируем монеты/темы с сервера — важно после переустановки, когда
+    // SharedPreferences очищены, но облако хранит реальный баланс.
+    try {
+      await _syncFromFirestore().timeout(t);
+    } catch (e) {
+      debugPrint('UserData._enrichAfterLogin sync failed: $e');
+    }
+    try {
+      await _maybeGrantDevCoins().timeout(t);
+    } catch (e) {
+      debugPrint('UserData._enrichAfterLogin devCoins failed: $e');
+    }
+    notifyListeners();
+  }
+
+  /// Почту уже сменил сервер (смена по коду, email_change_service.dart), здесь
+  /// только запоминаем новую. updateProfile для этого не годится: он заодно
+  /// гоняет на сервер имя, пол и аватар.
+  Future<void> setEmail(String email) async {
+    _email = email;
+    await _saveLocal();
+    notifyListeners();
+  }
+
+  Future<void> updateProfile({
+    String? displayName,
+    String? email,
+    String? avatarUrl,
+    String? bannerUrl,
+    Gender? gender,
+  }) async {
+    if (displayName != null) _displayName = displayName;
+    if (email != null) _email = email;
+    if (avatarUrl != null) _avatarUrl = avatarUrl;
+    if (bannerUrl != null) _bannerUrl = bannerUrl;
+    if (gender != null) {
+      _gender = gender;
+      _customGender = null;
+    }
+    await _saveLocal();
+
+    final uid = PocketBaseService().userId ?? '';
+    if (PocketBaseService().isLoggedIn && uid.isNotEmpty) {
+      final update = <String, dynamic>{
+        'displayName': _displayName,
+        'gender': genderToStorage(),
+        'avatarUrl': _avatarUrl,
+      };
+      if (bannerUrl != null) update['bannerUrl'] = _bannerUrl;
+      await PbDataService().updateUserProfile(uid, update);
+      // Propagate name/avatar changes to all groups so partners receive
+      // the update via the group real-time listener.
+      if (displayName != null) {
+        await PbDataService().updateMemberFieldInGroups(
+            uid, 'member_names', _displayName);
+      }
+      if (avatarUrl != null) {
+        await PbDataService().updateMemberFieldInGroups(
+            uid, 'member_avatars', _avatarUrl);
+      }
+    }
+    notifyListeners();
+  }
+
+  Future<void> setThemeId(int id) async {
+    final ownCustom =
+        isCustomPaletteIndex(id) && customPaletteSlot(id) < _customThemes.length;
+    if (!ownCustom && (id < 0 || id >= AppThemes.all.length)) return;
+    _themeId = id;
+    // Выбор рукой главнее просмотра: иначе выбранная тема сохранялась, а экран
+    // оставался в просматриваемой (обращение 464).
+    _clearPreview();
+    await _saveLocal();
+    notifyListeners();
+    unawaited(_syncAppearance());
+  }
+
+  /// Завести свою тему из выбранного цвета и сразу её включить.
+  ///
+  /// Возвращает false, когда набор полон: пять кружков в ленте — потолок, о
+  /// котором интерфейс обязан сказать заранее, а не молча проглотить выбор.
+  Future<bool> addCustomThemeColor(Color seed, {String name = ''}) async {
+    if (_customThemes.length >= kMaxCustomThemes) return false;
+    final next = addCustomTheme(_customThemes, CustomTheme(seed: seed, name: name));
+    _customThemes = next;
+    _themeId = customPaletteIndex(next.length - 1);
+    _clearPreview();
+    await _saveCustomThemes();
+    return true;
+  }
+
+  Future<void> updateCustomThemeAt(int slot, Color seed, {String? name}) async {
+    if (slot < 0 || slot >= _customThemes.length) return;
+    final was = _customThemes[slot];
+    _customThemes = replaceCustomTheme(_customThemes, slot,
+        CustomTheme(seed: seed, name: name ?? was.name));
+    await _saveCustomThemes();
+  }
+
+  Future<void> removeCustomThemeAt(int slot) async {
+    if (slot < 0 || slot >= _customThemes.length) return;
+    _customThemes = removeCustomTheme(_customThemes, slot);
+    _themeId = themeIdAfterRemoval(_themeId, slot);
+    await _saveCustomThemes();
+  }
+
+  Future<void> _saveCustomThemes() async {
+    _themeCacheSig = null;
+    notifyListeners();
+    await _saveLocal();
+    final uid = PocketBaseService().userId ?? '';
+    if (uid.isEmpty) return;
+    await PbDataService().updateUserProfile(
+      uid,
+      {'customThemes': _customThemes.map((t) => t.toJson()).toList()},
+    );
+  }
+
+  Future<void> setBlobAnimationEnabled(bool value) async {
+    _blobAnimationEnabled = value;
+    await _saveLocal();
+    notifyListeners();
+  }
+
+  Future<void> updateBirthDate(DateTime? date) async {
+    // Только календарный день: час пришёл бы из старого значения в prefs и
+    // разошёлся бы с тем, что лежит на сервере.
+    _birthDate = date == null ? null : DateTime(date.year, date.month, date.day);
+    await _saveLocal();
+    await PbDataService()
+        .updateUserProfile(PocketBaseService().userId ?? "", {'birthDate': _birthDate});
+    notifyListeners();
+  }
+
+  /// Меняет пол уже после регистрации.
+  ///
+  /// [customGender] осмыслен только при [Gender.unspecified]: пустой текст
+  /// означает «не хочу указывать». Пол виден партнёру и решает, показывать ли
+  /// календарь цикла, поэтому уезжает на сервер тем же полем, что при входе.
+  Future<void> updateGender(Gender gender, {String? customGender}) async {
+    _gender = gender;
+    final custom = customGender?.trim();
+    _customGender = (gender == Gender.unspecified && custom != null && custom.isNotEmpty)
+        ? custom
+        : null;
+    await _saveLocal();
+    final uid = PocketBaseService().userId ?? '';
+    if (uid.isNotEmpty) {
+      await PbDataService()
+          .updateUserProfile(uid, {'gender': genderToStorage()});
+    }
+    notifyListeners();
+  }
+
+  Future<void> logout() async {
+    final prefs = await SharedPreferences.getInstance();
+    PocketBaseService().signOut();
+    // Виджеты рабочего стола живут в хранилище УСТРОЙСТВА и выход бы пережили:
+    // на столе осталась бы прошлая пара, а на iPhone обновить её некому
+    // (жалоба 18.08.2026). Подписка на сессию сделает то же самое, но здесь
+    // очистка гарантирована, даже если её никто не завёл.
+    await HomeWidgetService.instance.applyOwnerEvent('');
+    // Офлайн-кэш предыдущего юзера не должен пережить выход (иначе следующий
+    // увидит чужие данные). Чистим локальную копию данных.
+    await resetOfflineState();
+    // Гасим фоновый пуш-сервис (§5): иначе его постоянное уведомление и
+    // SSE-подписка с уже невалидной сессией остались бы висеть после выхода.
+    await PushBackgroundService().stop();
+    await WidgetBackgroundRefreshService.instance.cancel();
+    _isRegistered = false;
+    _displayName = '';
+    _email = '';
+    _avatarUrl = '';
+    _bannerUrl = '';
+    _gender = null;
+    _uid = '';
+    // Дата регистрации прежнего аккаунта не должна открыть следующему
+    // человеку сезонную тему, которую тот не застал.
+    _registeredAt = null;
+    await prefs.remove('registeredAt');
+    await prefs.setBool('isRegistered', false);
+    await prefs.remove('displayName');
+    await prefs.remove('email');
+    await prefs.remove('avatarUrl');
+    await prefs.remove('gender');
+    await prefs.remove('uid');
+    // Clear connection data as well
+    await prefs.remove('connections');
+    await prefs.remove('activeConnectionIndex');
+    await prefs.remove('preferredPartnerUid');
+    // Clear timer data so new user doesn't see old timers
+    await prefs.remove('user_timers');
+    await prefs.remove('timer_selected_time_unit');
+    _coins = 0;
+    _devCoinsGranted = false;
+    _devCoinsChecked = false;
+    _devCoinsAttempted = false;
+    _ownedThemes.clear();
+    _ownedIcons.clear();
+    _ownedFeatures.clear();
+    _grantedBadges.clear();
+    _badge = null;
+    _frame = null;
+    unawaited(AvatarFrames.instance.clear());
+    unawaited(HomeLayoutService.instance.clear());
+    // Следующий человек на телефоне не наследует «18+ в книге пары».
+    await prefs.remove(kPairBookAdultKey);
+    _adRewardsToday = 0;
+    _adRewardsDate = '';
+    _mascotSleep = const {};
+    await prefs.remove('coins');
+    await prefs.remove('devCoinsGranted');
+    await prefs.remove('devCoinsChecked');
+    await prefs.remove('ownedThemes');
+    await prefs.remove('ownedIcons');
+    await prefs.remove('ownedFeatures');
+    await prefs.remove('grantedBadges');
+    await prefs.remove('badge');
+    await prefs.remove('avatarFrame');
+    await prefs.remove('adRewardsToday');
+    await prefs.remove('adRewardsDate');
+    await prefs.remove('mascotSleep');
+    notifyListeners();
+  }
+
+  /// Полное удаление аккаунта (требование App Store 5.1.1(v)).
+  ///
+  /// Порядок важен — удаление auth-записи должно идти, пока сессия ещё валидна:
+  ///   1) Распускаем/покидаем все активные пары (soft-disband: данные
+  ///      восстановимы партнёром, но удаляемому аккаунту они больше недоступны).
+  ///   1) Помечаем запись к удалению через `/api/account/schedule-delete`.
+  ///      Семь дней она жива вместе с парами, и обычный вход возвращает всё;
+  ///      после срока ночная задача сервера распускает пары и стирает запись.
+  ///   3) Локальный [logout] — чистит офлайн-кэш, сессию и фоновые сервисы.
+  ///
+  /// Шаг 1 — best-effort (его сбой не блокирует удаление). Если шаг 2 бросает
+  /// исключение, оно пробрасывается наверх — UI показывает ошибку и НЕ выходит.
+  Future<void> deleteAccount() async {
+    final pb = PocketBaseService();
+    final uid = pb.userId ?? _uid;
+    if (uid.isEmpty) {
+      // Нет активной сессии — просто чистим локальное состояние.
+      await logout();
+      return;
+    }
+
+    // Пары НЕ распускаются здесь. Всю неделю отсрочки они живы, и вернувшийся
+    // входом получает их назад вместе с воспоминаниями и чатом. Распустит их
+    // ночная задача сервера в тот день, когда аккаунт действительно сотрут.
+    //
+    // Раньше роспуск шёл первым, и отменить его было нечем даже при удачном
+    // возврате записи.
+
+    // Помечаем запись к удалению — НЕ стираем.
+    //
+    // 13.09.2026 учётная запись владельца пропала вместе с парой, и вернуть её
+    // удалось только ночной копией: удаление в PocketBase окончательное, а
+    // кнопка здесь — одно нажатие и одно подтверждение, без пароля. Кто нажал,
+    // выяснить не удалось, и это значит, что защита обязана работать
+    // независимо от того, кто нажал.
+    //
+    // Теперь запись живёт семь дней. Обычный вход в этот срок снимает пометку
+    // и возвращает человеку всё: пару, воспоминания, чат. По истечении срока
+    // её стирает ночная задача сервера (`pb_hooks/account_delete_grace.pb.js`).
+    await pb.pb.send('/api/account/schedule-delete', method: 'POST', body: {});
+
+    // 3. Локальный выход: кэш, сессия, фоновые сервисы.
+    await logout();
+  }
+}

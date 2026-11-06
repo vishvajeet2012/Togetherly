@@ -1,0 +1,343 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:in_app_purchase/in_app_purchase.dart';
+
+import '../models/apple_account_token.dart';
+import 'coin_store.dart';
+import 'pb_auth_service.dart';
+import 'pb_data_service.dart';
+import 'plus_service.dart';
+
+/// Реализация [CoinStore] для Google Play и App Store (через `in_app_purchase`).
+///
+/// Отвечает за:
+///  - загрузку ProductDetails из магазина
+///  - инициацию покупки
+///  - получение обновлений покупок через [InAppPurchase.purchaseStream]
+///  - вызов сервера через [GrantCoinsCallback] для начисления монет
+///  - подтверждение (complete) транзакции перед сторами
+class IapService extends CoinStore {
+  IapService();
+
+  // ── Состояние ─────────────────────────────────────────────────────────────
+
+  bool _available = false;
+  bool _loading = false;
+
+  final Map<String, ProductDetails> _products = {};
+
+  /// true если магазин доступен на этом устройстве.
+  @override
+  bool get isAvailable => _available;
+
+  /// true если идёт загрузка продуктов или обработка покупки.
+  @override
+  bool get isLoading => _loading;
+
+  /// Готовый ценник продукта (с валютой), либо null если ещё не загружен.
+  @override
+  String? priceLabel(String productId) => _products[productId]?.price;
+
+  @override
+  double? priceValue(String productId) => _products[productId]?.rawPrice;
+
+  // ── Внутренние поля ───────────────────────────────────────────────────────
+
+  final InAppPurchase _iap = InAppPurchase.instance;
+  StreamSubscription<List<PurchaseDetails>>? _purchaseSub;
+  GrantCoinsCallback? _onGrantCoins;
+
+  // Completer, который завершается когда обработка текущей покупки окончена.
+  Completer<IapResult>? _currentCompleter;
+
+  // ── Инициализация ─────────────────────────────────────────────────────────
+
+  /// Инициализирует сервис. Вызывать один раз (обычно в main.dart или при
+  /// открытии магазина монет).
+  ///
+  /// [onGrantCoins] — коллбек, который вызывается при успешном платеже
+  /// для начисления монет через сервер.
+  @override
+  Future<void> init({required GrantCoinsCallback onGrantCoins}) async {
+    _onGrantCoins = onGrantCoins;
+    _available = await _iap.isAvailable();
+    if (!_available) {
+      debugPrint('IapService: store not available');
+      return;
+    }
+
+    // Подписка на стрим покупок. Один раз за жизнь сервиса.
+    _purchaseSub ??= _iap.purchaseStream.listen(
+      _onPurchaseUpdates,
+      onError: (Object e) {
+        debugPrint('IapService: purchaseStream error: $e');
+        _completeWith(IapResult(IapStatus.error, error: e.toString()));
+      },
+    );
+
+    await _loadProducts();
+
+    // Восстанавливаем незавершённые покупки (если пользователь переустановил
+    // приложение, не завершив предыдущую транзакцию). Поток purchaseStream
+    // доставит их, и _verifyAndGrant() начислит монеты.
+    await _iap.restorePurchases();
+  }
+
+  /// Загружает ProductDetails для всех продуктов [kCoinPacks].
+  Future<void> _loadProducts() async {
+    _loading = true;
+    notifyListeners();
+    try {
+      // Вместе с паками монет спрашиваем и Togetherly+: цена показывается на
+      // экране Plus, а без загруженного ProductDetails покупку не начать.
+      // Пустой id спрашивать нельзя: стор ответит «нет такого товара», а в
+      // журнале это выглядит как поломка. На iPhone в наборе остаётся один
+      // Togetherly+ — паков монет в App Store нет (kCoinPacks там пуст).
+      final ids = <String>{
+        ...kCoinPacks.map((p) => p.productId),
+        if (kPlusProductId.isNotEmpty) kPlusProductId,
+      };
+      if (ids.isEmpty) return;
+      final response = await _iap.queryProductDetails(ids);
+      if (response.error != null) {
+        debugPrint('IapService: queryProductDetails error: ${response.error}');
+      }
+      for (final pd in response.productDetails) {
+        _products[pd.id] = pd;
+      }
+      if (response.notFoundIDs.isNotEmpty) {
+        debugPrint(
+            'IapService: products not found in store: ${response.notFoundIDs}');
+      }
+    } catch (e) {
+      debugPrint('IapService: _loadProducts failed: $e');
+    } finally {
+      _loading = false;
+      notifyListeners();
+    }
+  }
+
+  /// Догрузить товар каталога (пак, маскот) — его id приходит с сервера уже
+  /// после запуска, поэтому в постоянный список продуктов он не попадает.
+  @override
+  Future<bool> ensureProduct(String productId) async {
+    if (productId.isEmpty) return false;
+    if (_products.containsKey(productId)) return true;
+    try {
+      final response = await _iap.queryProductDetails({productId});
+      for (final pd in response.productDetails) {
+        _products[pd.id] = pd;
+      }
+      if (response.notFoundIDs.contains(productId)) {
+        debugPrint('IapService: товара "$productId" нет в магазине');
+        return false;
+      }
+      notifyListeners();
+      return _products.containsKey(productId);
+    } catch (e) {
+      debugPrint('IapService: ensureProduct failed: $e');
+      return false;
+    }
+  }
+
+  // ── Покупка ───────────────────────────────────────────────────────────────
+
+  /// Инициирует покупку продукта с [productId].
+  ///
+  /// Возвращает [IapResult] после того, как транзакция завершена (успех,
+  /// отмена или ошибка). Вызов блокируется через Completer до завершения.
+  @override
+  Future<IapResult> buy(String productId) async {
+    if (_currentCompleter != null && !_currentCompleter!.isCompleted) {
+      return const IapResult(
+        IapStatus.error,
+        error: 'Another purchase is in progress',
+      );
+    }
+
+    final pd = _products[productId];
+    if (pd == null) {
+      return IapResult(
+        IapStatus.error,
+        error: 'Product "$productId" not loaded',
+      );
+    }
+
+    _currentCompleter = Completer<IapResult>();
+
+    // Метка аккаунта уходит в покупку и возвращается к нам в уведомлении
+    // App Store — по ней сервер узнаёт, кому открывать доступ, даже если
+    // приложение не донесло чек. На Android поле не используется вовсе.
+    final appleToken = defaultTargetPlatform == TargetPlatform.iOS
+        ? appleAccountTokenFor(PbAuthService().currentUid ?? '')
+        : '';
+    if (appleToken.isNotEmpty) await _rememberAppleToken(appleToken);
+    final param = PurchaseParam(
+      productDetails: pd,
+      applicationUserName: appleToken.isEmpty ? null : appleToken,
+    );
+    try {
+      if (productId != kGiftProductId &&
+          (productId == kPlusProductId || productId.contains('.'))) {
+        // Togetherly+ и элементы каталога покупаются один раз навсегда. Через
+        // buyConsumable Play разрешил бы купить их повторно, а деньги ушли бы
+        // впустую. Товары каталога отличаются точкой в идентификаторе
+        // (`mood_pack.moti`), у монет её нет.
+        await _iap.buyNonConsumable(purchaseParam: param);
+      } else {
+        // Расходуемые: монеты и подарок партнёру. Подарок обязан быть таким —
+        // иначе второй раз его не купить, и владелец Плюса не смог бы подарить
+        // доступ вовсе.
+        await _iap.buyConsumable(purchaseParam: param);
+      }
+    } catch (e) {
+      debugPrint('IapService: buy failed: $e');
+      _completeWith(IapResult(IapStatus.error, error: e.toString()));
+    }
+
+    return _currentCompleter!.future;
+  }
+
+  /// Кладёт метку аккаунта в профиль ДО оплаты.
+  ///
+  /// Порядок важен: уведомление Apple приходит на сервер само и приносит
+  /// только метку. Запиши мы её после успешной покупки — и случай, ради
+  /// которого всё затевалось (чек до сервера не доехал), остался бы
+  /// незакрытым. Отказ записи покупку не срывает: чек по-прежнему доедет
+  /// обычным путём.
+  Future<void> _rememberAppleToken(String token) async {
+    if (_appleTokenSaved == token) return;
+    final uid = PbAuthService().currentUid ?? '';
+    if (uid.isEmpty) return;
+    try {
+      final ok = await PbDataService()
+          .updateUserProfile(uid, {'appleAccountToken': token});
+      if (ok) _appleTokenSaved = token;
+    } catch (e) {
+      debugPrint('IapService: метка аккаунта не сохранена: $e');
+    }
+  }
+
+  String? _appleTokenSaved;
+
+  // ── Обработка обновлений покупки ─────────────────────────────────────────
+
+  Future<void> _onPurchaseUpdates(List<PurchaseDetails> purchases) async {
+    for (final purchase in purchases) {
+      await _handlePurchase(purchase);
+    }
+  }
+
+  Future<void> _handlePurchase(PurchaseDetails purchase) async {
+    switch (purchase.status) {
+      case PurchaseStatus.pending:
+        _completeWith(const IapResult(IapStatus.pending));
+        break;
+
+      case PurchaseStatus.canceled:
+        _completeWith(const IapResult(IapStatus.cancelled));
+        if (purchase.pendingCompletePurchase) {
+          await _iap.completePurchase(purchase);
+        }
+        break;
+
+      case PurchaseStatus.error:
+        final msg = purchase.error?.message ?? 'Unknown IAP error';
+        debugPrint('IapService: purchase error: $msg');
+        _completeWith(IapResult(IapStatus.error, error: msg));
+        if (purchase.pendingCompletePurchase) {
+          await _iap.completePurchase(purchase);
+        }
+        break;
+
+      case PurchaseStatus.purchased:
+      case PurchaseStatus.restored:
+        await _verifyAndGrant(purchase);
+        break;
+    }
+  }
+
+  Future<void> _verifyAndGrant(PurchaseDetails purchase) async {
+    final token =
+        purchase.verificationData.serverVerificationData;
+    final productId = purchase.productID;
+
+    // Подтверждаем покупку в Play ТОЛЬКО когда сервер её принял. Подтверждённую
+    // покупку Google больше не доставляет, и прежний `finally` закрывал её даже
+    // после отказа сервера: нет сети, протухла сессия (роут отвечает 401) — и
+    // деньги списаны, а доступа нет навсегда. Так 30 июля пропала оплата
+    // Togetherly+ на 9,99 €. Неподтверждённая покупка вернётся в поток при
+    // следующем запуске и доедет сама; если сервер так и не примет её за три
+    // дня, Play вернёт человеку деньги — это честнее молчаливой пропажи.
+    var granted = false;
+    try {
+      final newBalance = await _onGrantCoins?.call(
+        productId: productId,
+        purchaseToken: token,
+      );
+
+      if (newBalance != null) {
+        granted = true;
+        if (productId.contains('.')) {
+          // Пак или маскот: ключ владения кладёт сервер, приложению остаётся
+          // перечитать свой профиль — на нём завязаны все проверки доступа.
+          _completeWith(const IapResult(IapStatus.success));
+          return;
+        }
+        if (productId == kPlusProductId) {
+          // Флаг ставит сервер, приложение его перечитывает: экран Plus и все
+          // проверки доступа завязаны на PlusService, а не на ответ магазина.
+          await PlusService.instance.refresh();
+          _completeWith(const IapResult(IapStatus.success));
+          return;
+        }
+        if (productId == kGiftProductId) {
+          // Подарок: доступ ушёл партнёру, у плательщика не изменилось ничего.
+          // Перечитывать свой флаг незачем — и монет тут тоже нет.
+          _completeWith(const IapResult(IapStatus.success));
+          return;
+        }
+        final pack = kCoinPacks.firstWhere(
+          (p) => p.productId == productId,
+          orElse: () => const CoinPack(productId: '', coins: 0),
+        );
+        _completeWith(IapResult(IapStatus.success, coins: pack.coins));
+      } else {
+        _completeWith(const IapResult(
+          IapStatus.error,
+          error: 'Server failed to grant coins',
+        ));
+      }
+    } catch (e) {
+      debugPrint('IapService: _verifyAndGrant failed: $e');
+      _completeWith(IapResult(IapStatus.error, error: e.toString()));
+    } finally {
+      if (granted && purchase.pendingCompletePurchase) {
+        await _iap.completePurchase(purchase);
+      }
+    }
+  }
+
+  /// Ручное восстановление покупок. Вызывается из UI по кнопке "Restore".
+  @override
+  Future<void> restorePurchases() async {
+    if (!_available) return;
+    await _iap.restorePurchases();
+  }
+
+  // ── Хелперы ───────────────────────────────────────────────────────────────
+
+  void _completeWith(IapResult result) {
+    if (_currentCompleter != null && !_currentCompleter!.isCompleted) {
+      _currentCompleter!.complete(result);
+    }
+  }
+
+  // ── Dispose ───────────────────────────────────────────────────────────────
+
+  @override
+  void dispose() {
+    _purchaseSub?.cancel();
+    super.dispose();
+  }
+}

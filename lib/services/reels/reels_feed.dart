@@ -1,0 +1,344 @@
+import 'dart:async';
+import 'dart:collection';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/painting.dart' show Size;
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+
+import '../../models/reel_queue.dart';
+import '../../models/reels_source.dart';
+import 'reels_telemetry.dart';
+
+/// Лента площадки этого телефона — в скрытом браузере.
+///
+/// Человек как будто сам листает ленту площадки: куки браузера живут между
+/// запусками, поэтому рекомендации у каждого свои и учатся на том, что он
+/// смотрит. Страница ничего не показывает и звука не даёт — она только
+/// приносит номера роликов, а смотрят оба в комнате официальным плеером.
+///
+/// Номера ловит скрипт в начале документа: перехват `fetch` и
+/// `XMLHttpRequest`, ответ ленты разбирается правилом своей площадки
+/// ([script]). ВК и Дзен кладут первые ролики прямо в разметку — их скрипт
+/// берёт и оттуда.
+class ReelsFeed {
+  ReelsFeed(this.source, {this.onIds, this.onThumbs, this.watch});
+
+  final ReelsSource source;
+
+  /// Куда записывать, как грузится скрытая страница: если ролики так и не
+  /// придут, комната отправит это отчётом.
+  final ReelsWatch? watch;
+
+  /// Пришли новые номера — комната получает их сразу, не дожидаясь вопроса.
+  final void Function(List<String> ids)? onIds;
+
+  /// Обложки роликов («площадка:номер» → адрес картинки), если площадка их
+  /// отдаёт в ответе ленты (TikTok). Комната ставит их, пока плеер грузится.
+  final void Function(Map<String, String> thumbs)? onThumbs;
+
+  static const String _desktopUa =
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36';
+
+  final ReelQueue _queue = ReelQueue();
+  HeadlessInAppWebView? _view;
+  Completer<void>? _arrived;
+  DateTime _lastNav = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _disposed = false;
+
+  /// Скрипт страницы: перехват ответов ленты, тишина, согласие на куки.
+  /// Правила площадок повторяет разведка (`reels_source.dart`).
+  static String script(ReelsSource source) => '''
+(function(){
+  if (window.__tgReels) return; window.__tgReels = 1;
+  var SRC = '${source.key}';
+  var tell = function(ids){ if (ids.length) try { window.flutter_inappwebview.callHandler('reelIds', ids); } catch (e) {} };
+  var uniq = function(a){ var s = {}, o = []; a.forEach(function(x){ if (x && !s[x]) { s[x] = 1; o.push(x); } }); return o; };
+  var all = function(text, re, map){ var out = [], m; while ((m = re.exec(text))) out.push(map ? map(m) : m[1]); return out; };
+  var RULES = {
+    shorts: { url: /youtubei\\/v1\\/reel\\/reel_watch_sequence/, pick: function(t){ return all(t, /"videoId":"([A-Za-z0-9_-]{11})"/g); } },
+    tiktok: { url: /api\\/(recommend|preload)\\/item_list/, pick: function(t){ try { return (JSON.parse(t).itemList || []).map(function(i){ return String(i.id); }); } catch (e) { return []; } },
+      thumbs: function(t){ var o = {}; try { (JSON.parse(t).itemList || []).forEach(function(i){ var v = i.video || {}; var c = v.cover || v.originCover; if (i.id && c) o[String(i.id)] = c; }); } catch (e) {} return o; } },
+    rutube: { url: /shorts\\/lenta/, pick: function(t){ return all(t, /"id":"([0-9a-f]{32})"/g); } },
+    vk: { url: /shortVideo\\.getRecom/, pick: function(t){ return all(t, /video_ext\\.php\\?oid=(-?\\d+)&(?:amp;)?id=(\\d+)&(?:amp;)?hash=([0-9a-f]+)/g, function(m){ return m[1] + '_' + m[2] + '_' + m[3]; }); } },
+    dzen: { url: /video-recommend/, pick: function(t){ return all(t, /"videoContentId":"([A-Za-z0-9_-]{6,})"/g); } }
+  };
+  var R = RULES[SRC];
+  var heard = function(u, t){
+    try {
+      if (!R.url.test(String(u || ''))) return;
+      tell(uniq(R.pick(t)));
+      // Обложки — чтобы в комнате вместо чёрного экрана сразу была картинка.
+      if (R.thumbs) { var th = R.thumbs(t); if (Object.keys(th).length) window.flutter_inappwebview.callHandler('reelThumbs', th); }
+    } catch (e) {}
+  };
+  // Видео скрытой странице не нужно: она только приносит номера. Ролики,
+  // которые лента TikTok качала заранее, отнимали канал у плеера в комнате:
+  // 8 МБ видео за первые полминуты против мегабайта у самого ролика (замер
+  // 05.10.2026), и на мобильном интернете ролик в комнате грузился минутами.
+  // Номера ленты от этого не пропадают.
+  var VIDEO = /\\/video\\/tos\\/|\\/aweme\\/v1\\/play|videoplayback|\\.(mp4|m4s|webm)(\\?|\$)/;
+  var f = window.fetch;
+  if (f) window.fetch = function(input){
+    var u = typeof input === 'string' ? input : (input && input.url) || '';
+    if (VIDEO.test(String(u))) return Promise.reject(new TypeError('Failed to fetch'));
+    return f.apply(this, arguments).then(function(r){
+      try { if (R.url.test(u)) r.clone().text().then(function(t){ heard(u, t); }, function(){}); } catch (e) {}
+      return r;
+    });
+  };
+  var open = XMLHttpRequest.prototype.open, send = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(m, u){ this.__tgU = u; this.__tgNo = VIDEO.test(String(u || '')); return open.apply(this, arguments); };
+  XMLHttpRequest.prototype.send = function(){
+    var x = this;
+    if (x.__tgNo) {
+      setTimeout(function(){ try { x.dispatchEvent(new ProgressEvent('error')); x.dispatchEvent(new ProgressEvent('loadend')); } catch (e) {} }, 0);
+      return;
+    }
+    x.addEventListener('load', function(){ try { heard(x.__tgU, x.responseText); } catch (e) {} });
+    return send.apply(this, arguments);
+  };
+  // ВК и Дзен первые ролики кладут прямо в разметку.
+  if (SRC === 'vk' || SRC === 'dzen') document.addEventListener('DOMContentLoaded', function(){
+    try { tell(uniq(R.pick(document.documentElement.innerHTML))); } catch (e) {}
+  });
+  // Ни звука: видео сюда не доходит (см. VIDEO выше), а если площадка
+  // всё же что-то включит, слушают ролик в комнате.
+  // Прямая ссылка на ролик в самом элементе (плеер страницы ролика) — тоже мимо.
+  var srcd = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+  if (srcd && srcd.set) Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+    configurable: true, enumerable: srcd.enumerable, get: srcd.get,
+    set: function(v){ if (VIDEO.test(String(v || ''))) return; srcd.set.call(this, v); }
+  });
+  var setAttr = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(n, v){
+    if ((this instanceof HTMLMediaElement || this instanceof HTMLSourceElement) && String(n).toLowerCase() === 'src' && VIDEO.test(String(v || ''))) return;
+    return setAttr.apply(this, arguments);
+  };
+  var hush = function(v){ try { v.muted = true; v.volume = 0; if (window.__tgStop) v.pause(); } catch (e) {} };
+  var play = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function(){ hush(this); return play.apply(this, arguments); };
+  setInterval(function(){ document.querySelectorAll('video,audio').forEach(hush); }, 400);
+  // Просмотр засчитан — дальше ролик не крутим: бесконечный повтор в
+  // скрытом браузере грел телефон и тормозил ленту в комнате.
+  setTimeout(function(){ window.__tgStop = 1; }, 12000);
+  // Плашка куки TikTok (в Европе и Молдове) — отказ от необязательных.
+  // Согласие ложится в общие куки браузеров приложения, и плашка уходит
+  // и из плеера в комнате.
+  if (SRC === 'tiktok') setInterval(function(){
+    try {
+      var host = document.querySelector('tiktok-cookie-banner');
+      var root = host && host.shadowRoot;
+      var btns = root ? root.querySelectorAll('button') : [];
+      if (btns.length) btns[0].click();
+    } catch (e) {}
+  }, 2000);
+  // Экран согласия на куки (часть стран Европы) — отказываемся от лишнего.
+  if (/^consent\\./.test(location.hostname)) setTimeout(function(){
+    var b = Array.prototype.slice.call(document.querySelectorAll('button')).find(function(x){
+      return /reject|отклон|refuz|ablehnen|rechazar|refuser|rifiuta/i.test((x.textContent || '') + (x.getAttribute('aria-label') || ''));
+    });
+    if (b) b.click();
+  }, 1500);
+})();
+''';
+
+  /// Поднять скрытую страницу. Повторный вызов ничего не делает.
+  Future<void> start() async {
+    if (_view != null || _disposed) return;
+    final view = HeadlessInAppWebView(
+      initialUrlRequest: URLRequest(url: WebUri(source.home)),
+      initialSize: source.desktop ? const Size(1280, 900) : const Size(390, 844),
+      initialUserScripts: UnmodifiableListView([
+        UserScript(source: script(source), injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START),
+      ]),
+      initialSettings: InAppWebViewSettings(
+        javaScriptEnabled: true,
+        mediaPlaybackRequiresUserGesture: false,
+        allowsInlineMediaPlayback: true,
+        userAgent: source.desktop ? _desktopUa : null,
+        preferredContentMode: source.desktop ? UserPreferredContentMode.DESKTOP : UserPreferredContentMode.RECOMMENDED,
+        // Движок браузеров на Android один на все окна приложения. Без флага
+        // его гибель уносит приложение целиком (обращение 297).
+        useOnRenderProcessGone: true,
+      ),
+      onRenderProcessGone: (_, _) => unawaited(_revive()),
+      onLoadStop: (c, url) async {
+        final w = watch;
+        if (w == null) return;
+        w.pages++;
+        w.lastHost = url?.host;
+        try {
+          w.lastTitle = _short(await c.getTitle());
+        } catch (_) {}
+      },
+      // Отказ самой страницы, а не её картинок: посредник не ответил,
+      // площадка вернула 403 или капчу.
+      onReceivedError: (c, request, error) {
+        if (request.isForMainFrame == false) return;
+        watch?.lastError = _short('${error.type}: ${error.description}');
+      },
+      onReceivedHttpError: (c, request, response) {
+        if (request.isForMainFrame == false) return;
+        watch?.lastError = 'http ${response.statusCode}';
+      },
+      onWebViewCreated: (c) {
+        c.addJavaScriptHandler(
+          handlerName: 'reelIds',
+          callback: (args) {
+            final ids = args.isNotEmpty && args.first is List ? (args.first as List) : const [];
+            _accept(ids);
+            return null;
+          },
+        );
+        c.addJavaScriptHandler(
+          handlerName: 'reelThumbs',
+          callback: (args) {
+            final raw = args.isNotEmpty && args.first is Map ? (args.first as Map) : const {};
+            final out = <String, String>{};
+            raw.forEach((k, v) {
+              final id = '$k';
+              final url = '$v';
+              if (ReelQueue.isId(id) && url.startsWith('https://') && url.length < 2000) out['${source.key}:$id'] = url;
+            });
+            if (out.isNotEmpty) onThumbs?.call(out);
+            return null;
+          },
+        );
+      },
+      onConsoleMessage: (_, m) {
+        if (kDebugMode) debugPrint('ReelsFeed(${source.key}): ${m.message}');
+      },
+    );
+    _view = view;
+    _lastNav = DateTime.now();
+    try {
+      await view.run();
+    } catch (e) {
+      debugPrint('ReelsFeed: скрытая страница не поднялась: $e');
+    }
+  }
+
+  /// Движок браузеров упал или его убила система: скрытая страница мертва.
+  /// Поднимаем её заново, запас номеров остаётся.
+  Future<void> _revive() async {
+    final dead = _view;
+    _view = null;
+    try {
+      await dead?.dispose();
+    } catch (_) {}
+    if (_disposed) return;
+    await Future<void>.delayed(const Duration(seconds: 2));
+    await start();
+  }
+
+  /// Строка для отчёта: заголовки и ошибки бывают длинными.
+  static String? _short(String? text) =>
+      text == null || text.length <= 120 ? text : text.substring(0, 120);
+
+  void _accept(List<Object?> ids) {
+    final before = _queue.length;
+    final added = _queue.add(ids);
+    watch?.heard += ids.length;
+    watch?.ids += added;
+    if (added == 0) return;
+    debugPrint('ReelsFeed(${source.key}): +$added (в запасе ${_queue.length})');
+    _arrived?.complete();
+    _arrived = null;
+    // Комнату будим, только если запас был пуст: иначе она сама спросит.
+    if (before == 0 && onIds != null) onIds!(_queue.take(added.clamp(0, 6)));
+  }
+
+  /// До [n] номеров. Пусто — ждём ленту до [wait], пока страница раскачается.
+  Future<List<String>> take(int n, {Duration wait = const Duration(seconds: 14)}) async {
+    if (_queue.length == 0) {
+      _refill();
+      final arrived = _arrived ??= Completer<void>();
+      await arrived.future.timeout(wait, onTimeout: () {});
+    }
+    final out = _queue.take(n);
+    if (_queue.length < 4) _refill();
+    return out;
+  }
+
+  /// Ролик играет в комнате: скрытая страница открывает его тоже, без звука.
+  /// Площадка засчитывает просмотр и отвечает похожими — так рекомендации
+  /// идут за тем, что пара правда смотрит.
+  ///
+  /// Не на каждый свайп: у браузеров приложения один процесс на всех, и
+  /// полная загрузка m.youtube.com на каждый ролик тормозила саму ленту.
+  /// Открываем, только если ролик смотрят хотя бы [watchAfter] и прошлый
+  /// раз был не ближе [watchEvery].
+  Future<void> watching(String id) async {
+    if (!ReelQueue.isId(id)) return;
+    _queue.markShown(id);
+    final url = source.watchUrl(id);
+    if (url.isEmpty) return;
+    _watchTimer?.cancel();
+    _watchTimer = Timer(watchAfter, () {
+      if (_disposed || DateTime.now().difference(_lastNav) < watchEvery) return;
+      unawaited(_go(url));
+    });
+  }
+
+  static const Duration watchAfter = Duration(seconds: 4);
+  static const Duration watchEvery = Duration(seconds: 25);
+  Timer? _watchTimer;
+
+  /// «Обновить рекомендации»: запас в сторону, лента открывается заново.
+  Future<void> refresh() async {
+    _queue.dropPending();
+    await _go(source.home);
+  }
+
+  /// Запас кончается: Shorts листаем дальше от последнего номера, остальные
+  /// открываем заново — каждая загрузка ленты приносит свежую подборку.
+  void _refill() {
+    // Страница только что открыта и ещё отвечает — не дёргаем её.
+    if (DateTime.now().difference(_lastNav) < const Duration(seconds: 6)) return;
+    final last = _queue.last;
+    final url = source == ReelsSource.shorts && last != null ? source.watchUrl(last) : source.home;
+    unawaited(_go(url));
+  }
+
+  Future<void> _go(String url) async {
+    final c = _view?.webViewController;
+    if (c == null || _disposed) return;
+    _lastNav = DateTime.now();
+    try {
+      await c.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+    } catch (e) {
+      debugPrint('ReelsFeed: переход не удался: $e');
+    }
+  }
+
+  /// Приложение свернули: скрытая страница засыпает и не крутит ролик.
+  Future<void> sleep() async {
+    final c = _view?.webViewController;
+    if (c == null) return;
+    try {
+      await c.evaluateJavascript(source: "window.__tgStop=1;document.querySelectorAll('video').forEach(function(v){try{v.pause()}catch(e){}});");
+      if (defaultTargetPlatform == TargetPlatform.android) await c.pause();
+    } catch (_) {}
+  }
+
+  /// Вернулись — страница снова слушает ленту (ролик не включаем).
+  Future<void> wake() async {
+    final c = _view?.webViewController;
+    if (c == null) return;
+    try {
+      if (defaultTargetPlatform == TargetPlatform.android) await c.resume();
+    } catch (_) {}
+  }
+
+  Future<void> dispose() async {
+    _disposed = true;
+    _watchTimer?.cancel();
+    _arrived?.complete();
+    _arrived = null;
+    final v = _view;
+    _view = null;
+    try {
+      await v?.dispose();
+    } catch (_) {}
+  }
+}

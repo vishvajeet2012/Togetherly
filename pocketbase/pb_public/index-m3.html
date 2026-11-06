@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Togetherly — романтичное пространство для двоих</title>
+  <meta name="description" content="Togetherly — стильное и приватное пространство для пары: воспоминания, таймеры, карта мест, настроение и совместные моменты.">
+  <meta name="theme-color" content="#FFF8F7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#191113" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="/logo.jpg">
+
+  <style>
+    @font-face {
+      font-family: 'Unbounded';
+      src: url('/fonts/unbounded.woff2') format('woff2');
+      font-weight: 200 900;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: 'Onest';
+      src: url('/fonts/onest.woff2') format('woff2');
+      font-weight: 100 900;
+      font-display: swap;
+    }
+
+    /* ── Material 3, схема от розового оттенка приложения ── */
+    :root {
+      color-scheme: light dark;
+
+      --primary: #8F4A57;
+      --on-primary: #FFFFFF;
+      --primary-container: #FFD9DE;
+      --on-primary-container: #3B0713;
+      --secondary-container: #FFDADF;
+      --on-secondary-container: #2C151A;
+      --tertiary-container: #FFDDB6;
+      --on-tertiary-container: #2C1700;
+      --surface: #FFF8F7;
+      --on-surface: #22191A;
+      --on-surface-variant: #524345;
+      --surface-container-lowest: #FFFFFF;
+      --surface-container-low: #FFF0F1;
+      --surface-container: #FBEAEB;
+      --surface-container-high: #F5E4E5;
+      --outline: #857376;
+      --outline-variant: #D7C1C3;
+
+      --shape-m: 16px;
+      --shape-l: 24px;
+      --shape-xl: 28px;
+      --shape-xxl: 36px;
+      --shape-huge: 48px;
+
+      --easing: cubic-bezier(0.2, 0, 0, 1);
+      --max: 1180px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --primary: #FFB2BC;
+        --on-primary: #561D28;
+        --primary-container: #72333E;
+        --on-primary-container: #FFD9DE;
+        --secondary-container: #5C3F44;
+        --on-secondary-container: #FFDADF;
+        --tertiary-container: #5E4108;
+        --on-tertiary-container: #FFDDB6;
+        --surface: #191113;
+        --on-surface: #EFDFE0;
+        --on-surface-variant: #D7C1C3;
+        --surface-container-lowest: #140C0E;
+        --surface-container-low: #22191A;
+        --surface-container: #261D1F;
+        --surface-container-high: #312829;
+        --outline: #9F8C8E;
+        --outline-variant: #524345;
+      }
+    }
+
+    * { box-sizing: border-box; min-width: 0; }
+
+    body {
+      margin: 0;
+      background: var(--surface);
+      color: var(--on-surface);
+      font-family: 'Onest', system-ui, -apple-system, sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container { width: min(100% - 40px, var(--max)); margin-inline: auto; }
+
+    h1, h2, h3, .display { font-family: 'Unbounded', sans-serif; letter-spacing: -0.03em; }
+
+    a { color: inherit; }
+
+    /* язык */
+    .lang-en { display: none; }
+    body.en .lang-ru { display: none; }
+    body.en .lang-en { display: inline; }
+    body.en p.lang-en, body.en h1.lang-en, body.en h2.lang-en,
+    body.en h3.lang-en, body.en div.lang-en { display: block; }
+
+    /* ── возврат после входа ── */
+    .auth-view { display: none; }
+    body.auth-mode .page { display: none; }
+    body.auth-mode .auth-view {
+      display: grid;
+      place-items: center;
+      min-height: 100dvh;
+      padding: 24px;
+    }
+    .auth-card {
+      background: var(--surface-container);
+      border-radius: var(--shape-huge);
+      padding: 48px 40px;
+      text-align: center;
+      max-width: 460px;
+    }
+    .auth-card img { width: 72px; height: 72px; border-radius: 24px; object-fit: cover; }
+    .auth-card h1 { font-size: 28px; margin: 20px 0 8px; }
+    .auth-card p { margin: 0; color: var(--on-surface-variant); }
+    .auth-loader {
+      width: 48px; height: 6px; margin: 28px auto 0;
+      border-radius: 999px; background: var(--primary-container);
+      overflow: hidden; position: relative;
+    }
+    .auth-loader::after {
+      content: ''; position: absolute; inset: 0;
+      background: var(--primary);
+      animation: slide 1.1s var(--easing) infinite;
+    }
+    @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+    /* ── шапка ── */
+    .topbar {
+      position: sticky; top: 0; z-index: 20;
+      background: color-mix(in oklab, var(--surface) 86%, transparent);
+      backdrop-filter: blur(14px);
+    }
+    .topbar-inner {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; padding: 14px 0;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+    .brand img { width: 44px; height: 44px; border-radius: 14px; object-fit: cover; }
+    .brand-title { font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 19px; }
+    .brand-sub { display: block; font-size: 12px; color: var(--on-surface-variant); }
+
+    .nav-actions { display: flex; align-items: center; gap: 8px; }
+    .top-link {
+      text-decoration: none; font-size: 14px; color: var(--on-surface-variant);
+      padding: 10px 14px; border-radius: 999px;
+      transition: background 200ms var(--easing);
+    }
+    .top-link:hover { background: var(--surface-container); }
+
+    .lang-switch {
+      display: flex; gap: 2px; padding: 3px;
+      background: var(--surface-container); border-radius: 999px;
+    }
+    .lang-switch button {
+      border: none; background: none; cursor: pointer;
+      font-family: inherit; font-size: 13px; font-weight: 700;
+      color: var(--on-surface-variant);
+      padding: 7px 14px; border-radius: 999px;
+      transition: background 200ms var(--easing), color 200ms var(--easing);
+    }
+    .lang-switch button.active { background: var(--primary); color: var(--on-primary); }
+
+    /* ── герой ── */
+    .hero {
+      margin: 12px 0 16px;
+      background: var(--primary-container);
+      color: var(--on-primary-container);
+      border-radius: var(--shape-huge);
+      padding: clamp(40px, 6vw, 80px) clamp(24px, 4vw, 56px) clamp(36px, 4vw, 56px);
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 10px;
+      font-size: 13px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+      margin-bottom: 28px; opacity: 0.85;
+    }
+    .eyebrow-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+
+    .hero h1 {
+      margin: 0;
+      font-weight: 800;
+      font-size: clamp(44px, 8.5vw, 124px);
+      line-height: 0.9;
+      letter-spacing: -0.045em;
+      text-wrap: balance;
+    }
+    .hero h1 em { font-style: normal; color: var(--primary); }
+
+    .hero-sub {
+      display: flex; align-items: end; justify-content: space-between;
+      gap: 32px; margin-top: clamp(28px, 3vw, 44px); flex-wrap: wrap;
+    }
+    .hero-sub p { margin: 0; font-size: clamp(17px, 1.6vw, 22px); max-width: 34ch; line-height: 1.5; }
+
+    .hero-actions { display: flex; gap: 12px; flex-wrap: wrap; }
+
+    .btn-filled {
+      display: inline-flex; align-items: center; gap: 10px;
+      background: var(--primary); color: var(--on-primary);
+      border: none; text-decoration: none;
+      font-family: 'Unbounded', sans-serif; font-size: 15px; font-weight: 600;
+      padding: 18px 34px; border-radius: 999px; cursor: pointer; white-space: nowrap;
+      transition: filter 200ms var(--easing);
+    }
+    .btn-filled:hover { filter: brightness(1.08); }
+
+    .btn-tonal {
+      display: inline-flex; align-items: center; gap: 10px;
+      background: var(--surface-container-lowest); color: var(--on-surface);
+      border: none; text-decoration: none;
+      font-family: inherit; font-size: 15px; font-weight: 600;
+      padding: 18px 28px; border-radius: 999px; cursor: pointer; white-space: nowrap;
+      transition: filter 200ms var(--easing);
+    }
+    .btn-tonal:hover { filter: brightness(0.97); }
+
+    /* ── плитки ── */
+    .strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px; }
+    .tile { border-radius: var(--shape-xxl); padding: clamp(28px, 3vw, 40px) clamp(22px, 2.4vw, 32px); }
+    .tile:nth-child(1) { background: var(--secondary-container); color: var(--on-secondary-container); }
+    .tile:nth-child(2) { background: var(--tertiary-container); color: var(--on-tertiary-container); }
+    .tile:nth-child(3) { background: var(--surface-container-high); color: var(--on-surface); }
+    .tile h3 { margin: 0 0 12px; font-size: clamp(21px, 2.3vw, 28px); line-height: 1.12; font-weight: 600; }
+    .tile p { margin: 0; font-size: 15px; opacity: 0.86; }
+
+    /* ── цифры ── */
+    .numbers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px; }
+    .number { background: var(--surface-container); border-radius: var(--shape-xxl); padding: clamp(24px, 2.6vw, 34px); }
+    .number b {
+      display: block; font-family: 'Unbounded', sans-serif; font-weight: 800;
+      font-size: clamp(38px, 4.6vw, 60px); line-height: 1; color: var(--primary);
+      font-variant-numeric: tabular-nums;
+    }
+    .number span { display: block; margin-top: 10px; font-size: 14px; color: var(--on-surface-variant); }
+
+    /* ── секции ── */
+    .section { margin: clamp(48px, 7vw, 96px) 0; }
+    .section-head { max-width: 22ch; margin-bottom: clamp(28px, 3vw, 44px); }
+    .section-label {
+      font-size: 13px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--primary); margin-bottom: 16px;
+    }
+    .section-head h2 {
+      margin: 0; font-weight: 700;
+      font-size: clamp(32px, 5.4vw, 72px); line-height: 0.96;
+    }
+    .section-note { margin: 20px 0 0; color: var(--on-surface-variant); max-width: 56ch; }
+
+    /* ── экраны ── */
+    .screens { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+    .screen { display: flex; flex-direction: column; gap: 14px; margin: 0; }
+    .screen img {
+      display: block; width: 100%; border-radius: var(--shape-l);
+      background: var(--surface-container);
+    }
+    .screen h3 { margin: 0; font-size: 18px; font-weight: 600; line-height: 1.2; }
+    .screen p { margin: 0; font-size: 14px; color: var(--on-surface-variant); }
+
+    /* ── шаги ── */
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .step { background: var(--surface-container-low); border-radius: var(--shape-xxl); padding: 32px 28px; }
+    .step b {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 48px; height: 48px; border-radius: 50%;
+      background: var(--primary); color: var(--on-primary);
+      font-family: 'Unbounded', sans-serif; font-size: 19px; margin-bottom: 20px;
+    }
+    .step h3 { margin: 0 0 10px; font-size: 21px; font-weight: 600; line-height: 1.15; }
+    .step p { margin: 0; font-size: 15px; color: var(--on-surface-variant); }
+
+    /* ── призыв ── */
+    .cta {
+      background: var(--primary-container); color: var(--on-primary-container);
+      border-radius: var(--shape-huge);
+      padding: clamp(40px, 5vw, 72px) clamp(24px, 4vw, 56px);
+    }
+    .cta h2 { margin: 0 0 16px; font-size: clamp(30px, 5vw, 64px); line-height: 0.98; font-weight: 700; }
+    .cta p { margin: 0 0 32px; font-size: clamp(16px, 1.5vw, 20px); max-width: 46ch; }
+    .stores { display: flex; gap: 12px; flex-wrap: wrap; }
+
+    /* ── подвал ── */
+    footer { margin: clamp(48px, 6vw, 88px) 0 40px; }
+    .footer-box {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 24px; flex-wrap: wrap;
+      padding-top: 28px; border-top: 1px solid var(--outline-variant);
+    }
+    .footer-info { display: flex; align-items: center; gap: 14px; }
+    .footer-info img { width: 46px; height: 46px; border-radius: 15px; object-fit: cover; }
+    .footer-info strong { display: block; font-family: 'Unbounded', sans-serif; font-size: 16px; }
+    .footer-info span { font-size: 13px; color: var(--on-surface-variant); }
+    .footer-links { display: flex; gap: 8px; flex-wrap: wrap; }
+    .footer-links a {
+      font-size: 14px; color: var(--on-surface-variant); text-decoration: none;
+      padding: 10px 16px; border-radius: 999px; background: var(--surface-container);
+      transition: background 200ms var(--easing);
+    }
+    .footer-links a:hover { background: var(--surface-container-high); }
+
+    /* ── появление ── */
+    .reveal { opacity: 0; transform: translateY(18px); transition: opacity 500ms var(--easing), transform 500ms var(--easing); }
+    .reveal.visible { opacity: 1; transform: none; }
+
+    @media (max-width: 900px) {
+      .strip, .steps { grid-template-columns: 1fr; }
+      .numbers, .screens { grid-template-columns: repeat(2, 1fr); }
+      .hero { border-radius: var(--shape-xxl); }
+      .brand-sub { display: none; }
+    }
+
+    @media (max-width: 560px) {
+      .numbers { grid-template-columns: 1fr; }
+      .screens { grid-template-columns: 1fr; }
+      .top-link { display: none; }
+      .btn-filled, .btn-tonal { width: 100%; justify-content: center; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; animation: none !important; }
+      .reveal { opacity: 1; transform: none; }
+    }
+  </style>
+<script defer src="https://analytics.togetherly.day/script.js" data-website-id="00feef0e-ea5b-435a-8455-af0dc5ac18cb"></script>
+</head>
+<body>
+
+  <div class="auth-view">
+    <div class="auth-card">
+      <img src="/logo.jpg" alt="Togetherly">
+      <h1>Togetherly</h1>
+      <p class="lang-ru">Открываем приложение и завершаем подтверждение входа…</p>
+      <p class="lang-en">Opening the app and finishing sign-in verification…</p>
+      <div class="auth-loader"></div>
+    </div>
+  </div>
+
+  <div class="page">
+    <header class="topbar">
+      <div class="container topbar-inner">
+        <a class="brand" href="#top">
+          <img src="/logo.jpg" alt="Togetherly">
+          <div>
+            <div class="brand-title">Togetherly</div>
+            <span class="brand-sub">private love space</span>
+          </div>
+        </a>
+        <div class="nav-actions">
+          <a class="top-link" href="/terms"><span class="lang-ru">Условия</span><span class="lang-en">Terms</span></a>
+          <a class="top-link" href="/privacy-policy"><span class="lang-ru">Политика</span><span class="lang-en">Privacy</span></a>
+          <div class="lang-switch" aria-label="Язык">
+            <button class="active" type="button" data-lang-button="ru">RU</button>
+            <button type="button" data-lang-button="en">EN</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main id="top">
+      <div class="container">
+
+        <section class="hero reveal visible">
+          <div class="eyebrow">
+            <span class="eyebrow-dot"></span>
+            <span class="lang-ru">романтичное пространство для двоих</span>
+            <span class="lang-en">a romantic space for two</span>
+          </div>
+
+          <h1 class="lang-ru">Вдвоём<br><em>и никого</em><br>больше</h1>
+          <h1 class="lang-en">Just<br><em>the two</em><br>of you</h1>
+
+          <div class="hero-sub">
+            <div>
+              <p class="lang-ru">Даты, воспоминания, настроение и виджеты на экране телефона. Всё в одном месте и без чужих глаз.</p>
+              <p class="lang-en">Dates, memories, moods and home screen widgets. All in one place, away from prying eyes.</p>
+            </div>
+            <div class="hero-actions">
+              <a class="btn-filled" href="#download">
+                <span class="lang-ru">Установить</span>
+                <span class="lang-en">Get the app</span>
+              </a>
+              <a class="btn-tonal" href="#screens">
+                <span class="lang-ru">Смотреть экраны</span>
+                <span class="lang-en">See the screens</span>
+              </a>
+            </div>
+          </div>
+        </section>
+
+        <section class="strip">
+          <div class="tile reveal">
+            <h3 class="lang-ru">Приватность без компромиссов</h3>
+            <h3 class="lang-en">Privacy-first by design</h3>
+            <p class="lang-ru">Ни ленты, ни подписчиков, ни рекомендаций. Переписка и воспоминания остаются между вами двумя.</p>
+            <p class="lang-en">No feed, no followers, no recommendations. Your chat and memories stay between the two of you.</p>
+          </div>
+          <div class="tile reveal">
+            <h3 class="lang-ru">Только для пары</h3>
+            <h3 class="lang-en">Built for couples</h3>
+            <p class="lang-ru">Приложение соединяет ровно два аккаунта: приглашение по коду или QR, третьего внутрь не пустит.</p>
+            <p class="lang-en">The app connects exactly two accounts: invite by code or QR, and nobody else gets in.</p>
+          </div>
+          <div class="tile reveal">
+            <h3 class="lang-ru">Красиво и нежно</h3>
+            <h3 class="lang-en">Dreamy and elegant</h3>
+            <p class="lang-ru">Material You подхватывает цвет ваших обоев, а двадцать палитр и тёмная тема довершают дело.</p>
+            <p class="lang-en">Material You picks up your wallpaper colours, with twenty palettes and a dark theme on top.</p>
+          </div>
+        </section>
+
+        <section class="numbers">
+          <div class="number reveal"><b>2</b><span class="lang-ru">языка на одной странице</span><span class="lang-en">languages on one page</span></div>
+          <div class="number reveal"><b>20</b><span class="lang-ru">палитр оформления</span><span class="lang-en">colour palettes</span></div>
+          <div class="number reveal"><b>10</b><span class="lang-ru">виджетов на рабочий стол</span><span class="lang-en">home screen widgets</span></div>
+          <div class="number reveal"><b>∞</b><span class="lang-ru">моментов, которые можно сохранить</span><span class="lang-en">moments worth keeping</span></div>
+        </section>
+
+        <section class="section" id="screens">
+          <div class="section-head reveal">
+            <div class="section-label"><span class="lang-ru">экран за экраном</span><span class="lang-en">screen by screen</span></div>
+            <h2 class="lang-ru">Не обещания, а настоящие экраны</h2>
+            <h2 class="lang-en">Not promises, but the actual screens</h2>
+            <p class="section-note lang-ru">Главный таймер, виджеты, подключение партнёра и настройки профиля. Всё снято из приложения как есть.</p>
+            <p class="section-note lang-en">The main timer, widgets, partner connection and profile settings. Everything captured from the app as it is.</p>
+          </div>
+
+          <div class="screens">
+            <figure class="screen reveal">
+              <img src="/appshots/hero-home.jpg" alt="Главный экран Togetherly" loading="lazy" width="420" height="900">
+              <h3 class="lang-ru">Главный экран</h3>
+              <h3 class="lang-en">Home screen</h3>
+              <p class="lang-ru">Таймер вашей истории, настроение дня и быстрые действия.</p>
+              <p class="lang-en">Your story timer, mood of the day and quick actions.</p>
+            </figure>
+            <figure class="screen reveal">
+              <img src="/appshots/widgets.jpg" alt="Виджеты Togetherly" loading="lazy" width="420" height="900">
+              <h3 class="lang-ru">Виджеты</h3>
+              <h3 class="lang-en">Widgets</h3>
+              <p class="lang-ru">Счётчик дней, кольцо года, фото и заметка на двоих прямо на рабочем столе.</p>
+              <p class="lang-en">Days together, the year ring, photos and a shared note right on your home screen.</p>
+            </figure>
+            <figure class="screen reveal">
+              <img src="/appshots/connection.jpg" alt="Экран связи Togetherly" loading="lazy" width="420" height="900">
+              <h3 class="lang-ru">Связь</h3>
+              <h3 class="lang-en">Connection</h3>
+              <p class="lang-ru">Приглашение по коду или QR и статус вашего общего пространства.</p>
+              <p class="lang-en">Invite by code or QR and the status of your shared space.</p>
+            </figure>
+            <figure class="screen reveal">
+              <img src="/appshots/profile.jpg" alt="Профиль Togetherly" loading="lazy" width="420" height="900">
+              <h3 class="lang-ru">Профиль</h3>
+              <h3 class="lang-en">Profile</h3>
+              <p class="lang-ru">Оформление, достижения, подарки и данные аккаунта.</p>
+              <p class="lang-en">Appearance, achievements, gifts and account data.</p>
+            </figure>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-head reveal">
+            <div class="section-label"><span class="lang-ru">как это работает</span><span class="lang-en">how it works</span></div>
+            <h2 class="lang-ru">Три шага до общего пространства</h2>
+            <h2 class="lang-en">Three steps to your shared space</h2>
+          </div>
+
+          <div class="steps">
+            <div class="step reveal">
+              <b>1</b>
+              <h3 class="lang-ru">Заведите аккаунт</h3>
+              <h3 class="lang-en">Create an account</h3>
+              <p class="lang-ru">Вход через Google или почту, без анкет и лишних шагов.</p>
+              <p class="lang-en">Sign in with Google or email, no forms and no extra steps.</p>
+            </div>
+            <div class="step reveal">
+              <b>2</b>
+              <h3 class="lang-ru">Позовите партнёра</h3>
+              <h3 class="lang-en">Invite your partner</h3>
+              <p class="lang-ru">Код или QR собирает пару за минуту. Ждёте из армии — место можно занять заранее.</p>
+              <p class="lang-en">A code or QR pairs you up in a minute. Waiting for someone away — the second seat can be reserved.</p>
+            </div>
+            <div class="step reveal">
+              <b>3</b>
+              <h3 class="lang-ru">Живите своей историей</h3>
+              <h3 class="lang-en">Live your story</h3>
+              <p class="lang-ru">Отмечайте даты и настроение, копите воспоминания, рисуйте вдвоём и смотрите кино вместе.</p>
+              <p class="lang-en">Mark dates and moods, collect memories, draw together and watch films side by side.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" id="download">
+          <div class="cta reveal">
+            <h2 class="lang-ru">Начните свою историю</h2>
+            <h2 class="lang-en">Start your story</h2>
+            <p class="lang-ru">Установите приложение, позовите партнёра и соберите ваши даты, воспоминания и моменты в одном месте.</p>
+            <p class="lang-en">Install the app, invite your partner and bring your dates, memories and moments into one place.</p>
+            <div class="stores">
+              <a class="btn-filled" href="https://play.google.com/store/apps/details?id=com.togetherly.love">Google Play</a>
+              <a class="btn-tonal" href="https://www.rustore.ru/catalog/app/com.togetherly.love">RuStore</a>
+              <a class="btn-tonal" href="https://github.com/THET1ME-1/Togetherly/releases/latest">
+                <span class="lang-ru">Скачать APK</span>
+                <span class="lang-en">Download APK</span>
+              </a>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+
+    <footer>
+      <div class="container footer-box reveal">
+        <div class="footer-info">
+          <img src="/logo.jpg" alt="Togetherly">
+          <div>
+            <strong>Togetherly</strong>
+            <span class="lang-ru">личное пространство для двоих</span>
+            <span class="lang-en">a private space for two</span>
+          </div>
+        </div>
+        <div class="footer-links">
+          <a href="/privacy-policy"><span class="lang-ru">Политика конфиденциальности</span><span class="lang-en">Privacy Policy</span></a>
+          <a href="/terms"><span class="lang-ru">Условия использования</span><span class="lang-en">Terms of Use</span></a>
+          <a href="/delete-account"><span class="lang-ru">Удаление аккаунта</span><span class="lang-en">Delete Account</span></a>
+          <a href="mailto:stgroup.dev@gmail.com">stgroup.dev@gmail.com</a>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    // Возврат из письма подтверждения: страница отдаёт управление приложению.
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has('oobCode') || urlParams.has('mode')) {
+      document.body.classList.add('auth-mode');
+      setTimeout(() => {
+        window.location.href = 'togetherly://emaillink?' + urlParams.toString();
+      }, 350);
+    }
+
+    const langButtons = document.querySelectorAll('[data-lang-button]');
+
+    function setLang(lang) {
+      document.documentElement.lang = lang;
+      document.body.classList.toggle('en', lang === 'en');
+      langButtons.forEach((button) => {
+        button.classList.toggle('active', button.dataset.langButton === lang);
+      });
+      try { localStorage.setItem('togetherly-lang', lang); } catch (e) {}
+    }
+
+    langButtons.forEach((button) => {
+      button.addEventListener('click', () => setLang(button.dataset.langButton));
+    });
+
+    let saved = null;
+    try { saved = localStorage.getItem('togetherly-lang'); } catch (e) {}
+    setLang(saved || ((navigator.language || '').startsWith('ru') ? 'ru' : 'en'));
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          observer.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.15 });
+
+    document.querySelectorAll('.reveal:not(.visible)').forEach((item) => observer.observe(item));
+  </script>
+</body>
+</html>

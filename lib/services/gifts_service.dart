@@ -1,0 +1,156 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:pocketbase/pocketbase.dart';
+
+import '../models/gift.dart';
+import '../models/sound_clip.dart';
+import 'gift_result.dart';
+import 'gift_telemetry.dart';
+import 'offline/pb_id.dart';
+import 'pocketbase_service.dart';
+
+/// Отправка подарков партнёру и отклик на них.
+///
+/// Монетные операции в проекте идут мимо outbox, напрямую по сети (см.
+/// `pb_coins_service.dart`), и подарки следуют тому же правилу: без связи
+/// подарок не уходит, а человек видит честную ошибку вместо ложного
+/// «отправлено».
+///
+/// Двойное списание закрыто идентификатором: `giftId` генерит клиент, он же
+/// становится `id` записи на сервере. Повтор после обрыва связи возвращает
+/// прежний баланс с пометкой [GiftResult.repeated].
+class GiftsService {
+  GiftsService._();
+
+  static final GiftsService instance = GiftsService._();
+
+  Future<GiftResult> send({
+    required String groupId,
+    required String giftKey,
+    String? note,
+    String? date,
+    String? place,
+    String? photo,
+    SoundClip? sound,
+    bool byAd = false,
+  }) async {
+    final gift = GiftCatalog.byKey(giftKey);
+    if (gift == null) {
+      return const GiftResult(ok: false, error: GiftError.unknownGift);
+    }
+    final giftId = newPbId();
+    GiftTelemetry.step(giftId, 'send:start', data: {'gift_key': giftKey});
+
+    return _call(
+      path: '/api/gifts/send',
+      body: {
+        'giftId': giftId,
+        'groupId': groupId,
+        'giftKey': giftKey,
+        if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+        if (date != null && date.isNotEmpty) 'date': date,
+        if (place != null && place.isNotEmpty) 'place': place,
+        // Снимок уже лежит в хранилище пары: едет только ссылка `pb://media/…`.
+        if (photo != null && photo.isNotEmpty) 'photo': photo,
+        // Звук к «Песне» тоже уже в хранилище пары: ссылка и волна
+        ...soundFields(sound),
+        // Подарок за ролик: сервер отдаёт его без монет, три раза в сутки.
+        if (byAd) 'ad': true,
+      },
+      giftId: giftId,
+      giftKey: giftKey,
+      step: 'send',
+    );
+  }
+
+  /// Звук подарка для запроса: ссылка отдельно, длительность, волна, вид и
+  /// теги — json-строкой, сервер его проверит и перепишет начисто.
+  static Map<String, Object> soundFields(SoundClip? sound) {
+    if (sound == null || sound.url.isEmpty) return const {};
+    final meta = sound.toJson()..remove('url');
+    return {'sound': sound.url, 'soundMeta': jsonEncode(meta)};
+  }
+
+  /// [reply] — ответ получателя дарителю: желание, загаданное на звезду.
+  Future<GiftResult> react(String giftId, {String? reply}) async {
+    GiftTelemetry.step(giftId, 'react:start');
+    return _call(
+      path: '/api/gifts/react',
+      body: {
+        'giftId': giftId,
+        if (reply != null && reply.trim().isNotEmpty) 'reply': reply.trim(),
+      },
+      giftId: giftId,
+      giftKey: '',
+      step: 'react',
+    );
+  }
+
+  /// Отказ от приглашения: дарителю возвращается вся цена.
+  Future<GiftResult> decline(String giftId) async {
+    GiftTelemetry.step(giftId, 'decline:start');
+    return _call(
+      path: '/api/gifts/decline',
+      body: {'giftId': giftId},
+      giftId: giftId,
+      giftKey: '',
+      step: 'decline',
+    );
+  }
+
+  /// Общий вызов роута.
+  ///
+  /// PocketBase SDK бросает [ClientException] на любой не-2xx ответ, поэтому
+  /// отказы вроде `insufficient` (402) приходят сюда исключением, а не
+  /// значением. Тело такого ответа лежит в `response` — разбираем его и отдаём
+  /// нормальный код ошибки, иначе нехватка монет выглядела бы как обрыв сети.
+  Future<GiftResult> _call({
+    required String path,
+    required Map<String, dynamic> body,
+    required String giftId,
+    required String giftKey,
+    required String step,
+  }) async {
+    try {
+      final res = await PocketBaseService().pb.send(
+        path,
+        method: 'POST',
+        body: body,
+      );
+      final parsed = parseGiftResponse(
+        res is Map ? Map<String, dynamic>.from(res) : null,
+      );
+      GiftTelemetry.step(giftId, '$step:${parsed.ok ? 'ok' : 'refused'}', data: {
+        'error': parsed.error?.name,
+        'coins': parsed.coins,
+        'refund': parsed.refund,
+        'repeated': parsed.repeated,
+      });
+      return parsed;
+    } on ClientException catch (e, st) {
+      final parsed = parseGiftResponse(
+        e.response.isEmpty ? null : Map<String, dynamic>.from(e.response),
+      );
+      GiftTelemetry.step(giftId, '$step:refused',
+          data: {'error': parsed.error?.name, 'status': e.statusCode});
+      // Нехватка монет и исчерпанные ролики — отказы, которые человек создаёт сам.
+      // Всё остальное (не участник, нет подарка, молчание сервера) означает
+      // поломку и обязано быть видно в панели: без этого отказ выглядит как
+      // «просто не работает» и чинить нечего.
+      if (parsed.error != GiftError.insufficient &&
+          parsed.error != GiftError.adLimit) {
+        GiftTelemetry.failure(e, st,
+            giftId: giftId, giftKey: giftKey, step: step, code: parsed.error);
+      }
+      return parsed;
+    } catch (e, st) {
+      GiftTelemetry.failure(e, st,
+          giftId: giftId,
+          giftKey: giftKey,
+          step: step,
+          code: GiftError.network);
+      return const GiftResult(ok: false, error: GiftError.network);
+    }
+  }
+}

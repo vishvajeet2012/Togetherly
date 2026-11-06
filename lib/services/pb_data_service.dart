@@ -1,0 +1,3654 @@
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:async';
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+import 'package:pocketbase/pocketbase.dart';
+
+import '../models/miss_you_event.dart';
+import '../models/invite_code_state.dart';
+import '../models/streak_alive.dart';
+import '../models/stroke_record_id.dart';
+import '../models/timer_sync.dart';
+import '../utils/calendar_day.dart';
+import '../utils/date_only.dart';
+import '../utils/pair_time.dart';
+import 'avatar_frames.dart';
+import 'love_test_id.dart';
+import 'offline/local_store.dart';
+import 'pb_errors.dart';
+import 'pocketbase_service.dart';
+import 'upsert_backoff.dart';
+import 'upsert_id_cache.dart';
+import 'mascot_guide_service.dart';
+import 'room_window_flag.dart';
+import 'app_time_service.dart';
+import 'wallet_teaser.dart';
+
+/// Результат вызова серверного атомарного group-роута: [ok] — выполнен;
+/// [missing] — роута нет (404) → легитимный локальный RMW-фолбэк; [backpressure]
+/// — сервер под нагрузкой (429/5xx/timeout/сеть) → НЕ откатываться на локальный
+/// RMW (это ломало backpressure сервера и раскручивало retry-шторм).
+enum _GroupRouteResult { ok, missing, backpressure }
+
+/// Слой данных PocketBase (миграция Firebase→PB, Этап 6, слой Данные).
+///
+/// Заменяет Firestore-CRUD. Плоские коллекции, поля snake_case (схема Этапа 3).
+/// Никакого Firebase: даты — ISO-строки/`DateTime`, не `Timestamp`. Входные карты
+/// от приложения — camelCase (как в существующем коде), здесь маппятся в колонки.
+///
+/// Realtime-подписки (`watch*`) — отдельный слой (PB SSE), медиа — отдельный.
+class PbDataService {
+  PbDataService._();
+  static final PbDataService instance = PbDataService._();
+  factory PbDataService() => instance;
+
+  PocketBase get _pb => PocketBaseService().pb;
+
+  // ── helpers ────────────────────────────────────────────────────────────
+  /// firestore-данные → JSON-safe для json-полей PB: DateTime→ISO, рекурсивно.
+  static dynamic _jsonSafe(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return v.toIso8601String();
+    if (v is Map) {
+      return v.map((k, val) => MapEntry(k.toString(), _jsonSafe(val)));
+    }
+    if (v is List) return v.map(_jsonSafe).toList();
+    return v;
+  }
+
+  /// Карта «участник → день рождения» в виде календарных дат.
+  static dynamic _birthdaysForServer(dynamic raw) {
+    if (raw is! Map) return _jsonSafe(raw ?? {});
+    final out = <String, dynamic>{};
+    raw.forEach((key, value) {
+      final day = value is DateTime ? value : DateOnly.parse(value);
+      out[key.toString()] = day == null ? null : DateOnly.store(day);
+    });
+    return out;
+  }
+
+  /// DateTime/String → ISO-строка для date-колонок, или null.
+  ///
+  /// Время уходит в UTC. Пока тут стоял голый `toIso8601String()`, на сервер
+  /// уезжали ЛОКАЛЬНЫЕ часы без зоны, а PocketBase принимал их за UTC — время
+  /// партнёра в другом поясе уезжало ровно на разницу (разбор 13 августа 2026,
+  /// см. [PairTime]).
+  /// Календарная дата на сервер: только год, месяц и день. Час у дня рождения
+  /// был бы минутой сохранения, и в соседнем поясе сдвигал бы число.
+  static String? _calendarDay(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return DateOnly.store(v);
+    return DateOnly.store(DateOnly.parse(v));
+  }
+
+  static String? _iso(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return PairTime.write(v);
+    if (v is String) return v.isEmpty ? null : v;
+    return null;
+  }
+
+  /// ISO-строка PB → DateTime, или null.
+  static DateTime? _date(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return v;
+    if (v is String) {
+      final s = v.trim();
+      return s.isEmpty ? null : DateTime.tryParse(s);
+    }
+    // Firestore Timestamp из мигрированных данных: {_seconds,_nanoseconds}
+    // (member_birthdays писались миграцией как есть, без конвертации в ISO).
+    if (v is Map) {
+      final sec = v['_seconds'] ?? v['seconds'];
+      if (sec is num) {
+        final ns = v['_nanoseconds'] ?? v['nanoseconds'] ?? 0;
+        final ms = sec.toInt() * 1000 +
+            ((ns is num ? ns.toInt() : 0) ~/ 1000000);
+        return DateTime.fromMillisecondsSinceEpoch(ms);
+      }
+      return null;
+    }
+    // Эпоха числом: секунды или миллисекунды.
+    if (v is num) {
+      final n = v.toInt();
+      return n > 100000000000
+          ? DateTime.fromMillisecondsSinceEpoch(n)
+          : DateTime.fromMillisecondsSinceEpoch(n * 1000);
+    }
+    return null;
+  }
+
+  /// Upsert по известному id: update → при 404 create с этим id.
+  /// Забыть, где лежали записи прошлого владельца телефона: после смены
+  /// аккаунта его id нам не принадлежат.
+  void forgetCachedRecordIds() {
+    _upsertIds.clear();
+    _upsertQuiet.clear();
+  }
+
+  /// Где лежат записи, которые мы обновляем постоянно (гео, присутствие,
+  /// «печатает», данные виджета). См. [UpsertIdCache].
+  final UpsertIdCache _upsertIds = UpsertIdCache();
+  /// Кому сейчас нельзя стучаться: запись, только что получившая отказ, ждёт.
+  final UpsertBackoff _upsertQuiet = UpsertBackoff();
+
+  /// Запись по известному id: обновить, а если её нет — создать.
+  ///
+  /// [expectNew] переворачивает порядок для того, что почти всегда создаётся
+  /// впервые (сообщение, отметка настроения, воспоминание). Прежний порядок
+  /// стоил лишнего запроса на каждую такую запись: сервер отвечал 404 на
+  /// обновление несуществующего, и только потом шло создание. За двенадцать
+  /// минут это давало 850 холостых запросов только по чату и настроениям.
+  ///
+  /// [ifMissing] — что ответить, если записи на сервере нет. null — создать
+  /// её из [body]; годится, только когда в нём вся запись.
+  Future<bool> _upsertById(
+    String col,
+    String id,
+    Map<String, dynamic> body, {
+    String op = 'upsert',
+    bool expectNew = false,
+    bool? ifMissing,
+  }) async {
+    body.remove('id');
+    if (expectNew) {
+      try {
+        await _pb
+            .collection(col)
+            .create(body: {'id': id, ...body}).timeout(
+                const Duration(seconds: 15));
+        return true;
+      } on ClientException catch (e) {
+        // Запись уже есть — значит это правка, а не создание.
+        if (!alreadyExists(e)) {
+          debugPrint('PbData.$op create($col/$id) failed: $e');
+          return false;
+        }
+      } catch (e) {
+        debugPrint('PbData.$op create($col/$id) failed: $e');
+        return false;
+      }
+    }
+    try {
+      // Таймаут: под нагрузкой запись на PB может висеть очень долго (один
+      // SQLite-writer). Без него flush очереди залипал на одной операции →
+      // плашка «Синхронизация…» не уходила. По таймауту → false → ограниченный
+      // ретрай; повтор безопасен (идемпотентно по id: update→404→create).
+      await _pb
+          .collection(col)
+          .update(id, body: body)
+          .timeout(const Duration(seconds: 15));
+      return true;
+    } on ClientException catch (e) {
+      if (e.statusCode == 404 && ifMissing != null) {
+        debugPrint('PbData.$op($col/$id): записи нет на сервере');
+        return ifMissing;
+      }
+      if (e.statusCode == 404) {
+        try {
+          await _pb
+              .collection(col)
+              .create(body: {'id': id, ...body}).timeout(
+                  const Duration(seconds: 15));
+          return true;
+        } catch (e2) {
+          // «Value must be unique» по id означает, что запись всё-таки есть:
+          // предыдущая попытка дошла до сервера, а ответ до нас — нет. Цель
+          // достигнута, повторять нечего. Пока это считалось провалом, очередь
+          // слала одно и то же сообщение пять раз подряд: за двадцать минут
+          // 229 отказов только по чату, и каждый занимал единственного писателя
+          // базы (разбор ночи 14 августа 2026).
+          if (alreadyExists(e2)) {
+            debugPrint('PbData.$op($col/$id): запись уже на сервере');
+            return true;
+          }
+          debugPrint('PbData.$op create($col/$id) failed: $e2');
+          return false;
+        }
+      }
+      debugPrint('PbData.$op update($col/$id) failed: $e');
+      return false;
+    } catch (e) {
+      debugPrint('PbData.$op($col/$id) failed: $e');
+      return false;
+    }
+  }
+
+  /// Upsert по составному уникальному ключу (auto-id коллекции): найти по
+  /// фильтру → update, иначе create.
+  Future<bool> _upsertByFilter(
+    String col,
+    String filter,
+    Map<String, dynamic> params,
+    Map<String, dynamic> body, {
+    String op = 'upsert',
+  }) async {
+    final f = _pb.filter(filter, params);
+    // Записи вроде геопозиции обновляются постоянно, а ищутся фильтром: без
+    // памяти о найденном id каждое обновление стоило трёх запросов — поиск,
+    // отказ на создании по уникальному ключу и только потом обновление.
+    final cacheKey = UpsertIdCache.keyOf(col, f);
+    // Отказ на записи повторяем не сразу. Пока у человека пуст список пар,
+    // правила не отдают ему собственную запись: поиск отвечает 404, создание
+    // упирается в уникальный индекс, и без паузы это долбится каждые несколько
+    // секунд — так 13 августа встал единственный писатель базы.
+    if (!_upsertQuiet.allows(cacheKey, now: DateTime.now())) return false;
+    try {
+      final knownId = _upsertIds[cacheKey];
+      if (knownId != null) {
+        try {
+          await _pb.collection(col).update(knownId, body: body);
+          return true;
+        } on ClientException catch (e) {
+          // Запись удалили или сменился аккаунт — забываем и идём общим путём.
+          if (e.statusCode == 404) {
+            _upsertIds.forget(cacheKey);
+          } else {
+            rethrow;
+          }
+        }
+      }
+      try {
+        final existing = await _pb.collection(col).getFirstListItem(f);
+        _upsertIds.remember(cacheKey, existing.id);
+        await _pb.collection(col).update(existing.id, body: body);
+      } on ClientException catch (e) {
+        if (e.statusCode == 404) {
+          try {
+            final made = await _pb.collection(col).create(body: body);
+            _upsertIds.remember(cacheKey, made.id);
+          } on ClientException catch (e2) {
+            // DATA-3: TOCTOU — между getFirstListItem(404) и create параллельный
+            // вызов уже создал запись по тому же уникальному ключу (create падает
+            // на unique-индексе). Перечитываем и обновляем существующую вместо
+            // потери записи.
+            if (!alreadyExists(e2)) rethrow;
+            final existing = await _pb.collection(col).getFirstListItem(f);
+            _upsertIds.remember(cacheKey, existing.id);
+            await _pb.collection(col).update(existing.id, body: body);
+          }
+        } else {
+          rethrow;
+        }
+      }
+      _upsertQuiet.succeeded(cacheKey);
+      return true;
+    } catch (e) {
+      _upsertQuiet.failed(cacheKey, now: DateTime.now());
+      debugPrint('PbData.$op($col) failed: $e');
+      return false;
+    }
+  }
+
+  /// POST на серверный АТОМАРНЫЙ group-роут (pb_hooks/groups.pb.js). true =
+  /// Зов партнёру: «зашёл на холст, порисуй со мной».
+  ///
+  /// Один запрос на вход в раскраску, всё остальное решает сервер
+  /// (`pb_hooks/draw_invite.pb.js`): и частоту, и выключатель, и то, что
+  /// партнёру в приложении звать незачем. Ошибки глотаем молча — зов не должен
+  /// мешать рисовать, а старый сервер про этот роут просто не знает.
+  Future<bool> inviteToDraw(String groupId) async {
+    if (groupId.isEmpty) return false;
+    try {
+      final res = await _pb
+          .send('/api/draw/invite', method: 'POST', body: {'group_id': groupId})
+          .timeout(const Duration(seconds: 8));
+      return res is Map && res['sent'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// сервер выполнил операцию в транзакции (ok:true). false на любой
+  /// ошибке/недоступности роута → вызывающий откатывается на локальный RMW, так
+  /// что версия-скью клиент/сервер безопасна. Закрывает гонки DATA-5/6/7/8/9.
+  Future<_GroupRouteResult> _callGroupRoute(
+      String path, Map<String, dynamic> body) async {
+    try {
+      final res = await _pb
+          .send('/api/group/$path', method: 'POST', body: body)
+          .timeout(const Duration(seconds: 12));
+      if (res is Map && res['ok'] == true) return _GroupRouteResult.ok;
+      // 200, но без ok:true — роут не подтвердил операцию → локальный фолбэк.
+      return _GroupRouteResult.missing;
+    } on ClientException catch (e) {
+      // 404 — атомарного роута нет на этом сервере → легитимный локальный RMW.
+      if (e.statusCode == 404) return _GroupRouteResult.missing;
+      // 429/5xx/сеть(0) — сервер под нагрузкой. НЕ долбить локальным RMW: это
+      // ровно то, что ломало backpressure сервера и раскручивало шторм.
+      if (e.statusCode == 429 || e.statusCode == 0 || e.statusCode >= 500) {
+        debugPrint('PbData._callGroupRoute($path) backpressure ${e.statusCode}');
+        return _GroupRouteResult.backpressure;
+      }
+      // Прочие 4xx (400/403/422) — роут ответил отказом; локальный RMW не
+      // поможет, но поведение сохраняем как раньше (фолбэк).
+      debugPrint('PbData._callGroupRoute($path) ${e.statusCode}: ${e.response}');
+      return _GroupRouteResult.missing;
+    } on TimeoutException {
+      debugPrint('PbData._callGroupRoute($path) timeout → backpressure');
+      return _GroupRouteResult.backpressure;
+    } catch (e) {
+      // Сеть/неизвестное — транзиент, не амплифицируем повторами.
+      debugPrint('PbData._callGroupRoute($path) transient: $e');
+      return _GroupRouteResult.backpressure;
+    }
+  }
+
+  // ══════════════════════════════════════════════ GROUP
+  /// Зеркало группы из «сырого» firestore-документа (camelCase). Upsert по id.
+  Future<bool> upsertGroupRaw(String groupId, Map<String, dynamic> raw) async {
+    if (groupId.isEmpty) return false;
+    final body = <String, dynamic>{
+      'members': _jsonSafe(raw['members'] ?? []),
+      'member_names': _jsonSafe(raw['memberNames'] ?? {}),
+      'member_avatars': _jsonSafe(raw['memberAvatars'] ?? {}),
+      'member_ailments': _jsonSafe(raw['memberAilments'] ?? {}),
+      'max_members': raw['maxMembers'] ?? 2,
+      'relationship_type': raw['relationshipType'] ?? 'couple',
+      'custom_relationship_label': raw['customRelationshipLabel'],
+      'custom_relationship_emoji': raw['customRelationshipEmoji'],
+      'custom_relationship_types':
+          _jsonSafe(raw['customRelationshipTypes'] ?? []),
+      'start_date': _iso(raw['startDate']),
+      'anniversary_date': _iso(raw['anniversaryDate']),
+      'first_kiss_date': _iso(raw['firstKissDate']),
+      // День рождения кладём календарной датой, без часа и пояса. Пока он
+      // хранился моментом времени (`2004-10-25T20:54:00.000Z` — час взят из
+      // минуты сохранения), у соседних поясов день уезжал: жалоба 14 августа
+      // 2026 «перепутались именно дни, месяцы и годы те же».
+      'member_birthdays': _birthdaysForServer(raw['memberBirthdays']),
+      'member_moods': _jsonSafe(raw['memberMoods'] ?? {}),
+      'current_status': _jsonSafe(raw['currentStatus']),
+      'custom_statuses': _jsonSafe(raw['customStatuses'] ?? []),
+      'memories_count': raw['memoriesCount'] ?? 0,
+      'drawings_count': raw['drawingsCount'] ?? 0,
+      'active_session': _jsonSafe(raw['activeSession']),
+      'disbanded': raw['disbanded'] ?? false,
+      'disbanded_at': _iso(raw['disbandedAt']),
+      'timers': _jsonSafe(raw['timers'] ?? []),
+      'mascots': _jsonSafe(raw['mascots'] ?? []),
+    }..removeWhere((k, v) => v == null);
+    return _upsertById('groups', groupId, body, op: 'upsertGroupRaw');
+  }
+
+  /// Точечное обновление колонок группы (snake_case→значение). update-only
+  /// (нет вставки): годится и для очистки полей в null.
+  Future<bool> updateGroupFields(
+    String groupId,
+    Map<String, dynamic> columns,
+  ) async {
+    if (groupId.isEmpty || columns.isEmpty) return false;
+    try {
+      final rec = await _pb
+          .collection('groups')
+          .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+      await _pb.collection('groups').update(rec.id, body: columns);
+      return true;
+    } catch (e) {
+      debugPrint('PbData.updateGroupFields($groupId) failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> setMemberMood(String groupId, String uid, dynamic mood) =>
+      _patchGroupMapField(groupId, 'member_moods', uid, _jsonSafe(mood));
+  Future<bool> clearMemberMood(String groupId, String uid) =>
+      _patchGroupMapField(groupId, 'member_moods', uid, null);
+  Future<bool> setMemberName(String groupId, String uid, String name) =>
+      _patchGroupMapField(groupId, 'member_names', uid, name);
+  Future<bool> setMemberAvatar(String groupId, String uid, String url) =>
+      _patchGroupMapField(groupId, 'member_avatars', uid, url);
+
+  /// RMW по json-полю-словарю группы (member_moods/names/avatars): прочитать,
+  /// поменять ключ uid, записать целиком. null-значение удаляет ключ.
+  /// Retry (до 3 попыток) спасает от ТРАНЗИЕНТНЫХ ошибок (сеть/5xx), но НЕ от
+  /// lost-update: при настоящей гонке параллельная запись проходит УСПЕШНО (без
+  /// исключения) и перетирает наше изменение, а ретрай срабатывает лишь на throw.
+  /// Полностью race-free только серверная транзакция (DATA-5, см. groups.pb.js —
+  /// TODO). Для редких правок member_* в паре из 2 человек риск низкий.
+  Future<bool> _patchGroupMapField(
+    String groupId,
+    String col,
+    String uid,
+    dynamic value,
+  ) async {
+    // DATA-5: сперва атомарный серверный роут; при недоступности — локальный RMW.
+    final r = await _callGroupRoute('patch-map',
+        {'groupId': groupId, 'field': col, 'uid': uid, 'value': value});
+    if (r == _GroupRouteResult.ok) return true;
+    // Под нагрузкой (429/timeout) НЕ откатываемся на локальный RMW — это усиливало шторм.
+    if (r == _GroupRouteResult.backpressure) return false;
+    return _patchGroupMapFieldLocal(groupId, col, uid, value);
+  }
+
+  Future<bool> _patchGroupMapFieldLocal(
+    String groupId,
+    String col,
+    String uid,
+    dynamic value,
+  ) async {
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        final rec = await _pb
+            .collection('groups')
+            .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+        final cur = rec.data[col];
+        final map = cur is Map ? Map<String, dynamic>.from(cur) : <String, dynamic>{};
+        if (value == null) {
+          map.remove(uid);
+        } else {
+          map[uid] = value;
+        }
+        await _pb.collection('groups').update(rec.id, body: {col: map});
+        return true;
+      } catch (e) {
+        if (attempt == maxAttempts - 1) {
+          debugPrint('PbData._patchGroupMapField($col,$uid) failed after ${attempt + 1} attempts: $e');
+          return false;
+        }
+        // Небольшая задержка перед повтором (ponential backoff).
+        await Future<void>.delayed(Duration(milliseconds: 50 * (attempt + 1)));
+      }
+    }
+    return false;
+  }
+
+  /// Группа по id (raw данные записи, даты — DateTime). null если нет/распущена.
+  Future<RecordModel?> loadGroupById(String groupId) async {
+    if (groupId.isEmpty) return null;
+    try {
+      final rec = await _pb
+          .collection('groups')
+          .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+      if (rec.data['disbanded'] == true) return null;
+      return rec;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return null;
+      debugPrint('PbData.loadGroupById($groupId) failed: $e');
+      return null;
+    }
+  }
+
+  /// Группа, где currentUid в members и не распущена.
+  Future<RecordModel?> loadPairForUser(String uid) async {
+    if (uid.isEmpty) return null;
+    try {
+      final res = await _pb.collection('groups').getList(
+            perPage: 1,
+            filter: _pb.filter('members ~ {:u} && disbanded = false', {'u': uid}),
+          );
+      return res.items.isEmpty ? null : res.items.first;
+    } catch (e) {
+      debugPrint('PbData.loadPairForUser($uid) failed: $e');
+      return null;
+    }
+  }
+
+  /// НЕатомарный read-modify-write. Retry (до 3 попыток) закрывает только
+  /// транзиентные ошибки; lost-update при одновременном инкременте с двух
+  /// устройств ретрай НЕ ловит (конкурентная запись успешна, без исключения) →
+  /// часть инкрементов теряется. Для точности нужен серверный atomic inc
+  /// (DATA-7, PB-hook/транзакция — TODO).
+  Future<bool> incrementGroupCounter(String groupId, String col, int by) async {
+    // DATA-7: атомарный серверный инкремент; при недоступности — локальный RMW.
+    final r = await _callGroupRoute(
+        'increment', {'groupId': groupId, 'field': col, 'by': by});
+    if (r == _GroupRouteResult.ok) return true;
+    if (r == _GroupRouteResult.backpressure) return false;
+    return _incrementGroupCounterLocal(groupId, col, by);
+  }
+
+  Future<bool> _incrementGroupCounterLocal(
+      String groupId, String col, int by) async {
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        final rec = await _pb
+            .collection('groups')
+            .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+        final cur = (rec.data[col] as num?)?.toInt() ?? 0;
+        await _pb.collection('groups').update(rec.id, body: {col: cur + by});
+        return true;
+      } catch (e) {
+        if (attempt == maxAttempts - 1) {
+          debugPrint('PbData.incrementGroupCounter($col) failed after ${attempt + 1} attempts: $e');
+          return false;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 50 * (attempt + 1)));
+      }
+    }
+    return false;
+  }
+
+  // ── pairing-слой (миграция ConnectionsManager/Connection на PB) ──────────
+  //
+  // PB-модель пары: членство = массив `groups.members` (uid-строки), имена и
+  // аватары — отдельные map-поля. «Указателя» pairIds в users НЕТ — активная
+  // группа находится запросом `members ~ uid && disbanded = false`.
+
+  /// PB-запись группы → карта в форме старого Firestore-парсера
+  /// (`Connection._applyPairData`/`_listenToPair`): camelCase-ключи, members —
+  /// список объектов {uid,name,avatar}, даты — `DateTime`. [myUid] нужен для
+  /// вычисления partnerName/partnerAvatar (первый участник, кроме себя).
+  static Map<String, dynamic> groupRecordToPairMap(
+    RecordModel rec,
+    String myUid,
+  ) {
+    final data = rec.data;
+    final rawMembers =
+        (data['members'] as List?)?.map((e) => e.toString()).toList() ??
+            <String>[];
+    final members = rawMembers.toSet().toList(); // дедуп на всякий
+    final names = data['member_names'] is Map
+        ? Map<String, dynamic>.from(data['member_names'] as Map)
+        : <String, dynamic>{};
+    final avatars = data['member_avatars'] is Map
+        ? Map<String, dynamic>.from(data['member_avatars'] as Map)
+        : <String, dynamic>{};
+    final others = members.where((m) => m != myUid).toList();
+    final partnerUid = others.isNotEmpty ? others.first : '';
+
+    // memberMoods/memberAilments: {uid:{..., updatedAt}} — updatedAt → DateTime.
+    Map<String, dynamic> innerWithDate(dynamic raw) {
+      if (raw is! Map) return <String, dynamic>{};
+      return Map<String, dynamic>.from(raw).map((uid, v) {
+        final inner = v is Map ? Map<String, dynamic>.from(v) : <String, dynamic>{};
+        if (inner.containsKey('updatedAt')) {
+          inner['updatedAt'] = _date(inner['updatedAt']);
+        }
+        return MapEntry(uid, inner);
+      });
+    }
+
+    Map<String, DateTime?>? birthdays() {
+      final raw = data['member_birthdays'];
+      if (raw is! Map) return null;
+      // Читаем календарным днём: у старых записей внутри лежит время
+      // сохранения, и число берётся из строки как есть — иначе у пары из
+      // разных поясов одна и та же дата показывалась разными числами.
+      return Map<String, dynamic>.from(raw)
+          .map((k, v) => MapEntry(k, DateOnly.parse(v)));
+    }
+
+    return {
+      'pairId': rec.id,
+      'partnerName': names[partnerUid] ?? '',
+      'partnerAvatar': avatars[partnerUid] ?? '',
+      'startDate': _date(data['start_date']),
+      'members': members
+          .map((uid) => {
+                'uid': uid,
+                'name': names[uid] ?? '',
+                'avatar': avatars[uid] ?? '',
+              })
+          .toList(),
+      'maxMembers': data['max_members'] ?? 2,
+      'memberMoods': innerWithDate(data['member_moods']),
+      'memberAilments': innerWithDate(data['member_ailments']),
+      'currentStatus': data['current_status'] is Map
+          ? Map<String, dynamic>.from(data['current_status'] as Map)
+          : null,
+      'customStatuses':
+          data['custom_statuses'] is List ? data['custom_statuses'] as List : null,
+      'relationshipType': data['relationship_type'] as String?,
+      'customRelationshipLabel': data['custom_relationship_label'] as String?,
+      'customRelationshipEmoji': data['custom_relationship_emoji'] as String?,
+      'customRelationshipTypes': data['custom_relationship_types'] is List
+          ? data['custom_relationship_types'] as List
+          : null,
+      'anniversaryDate': DateOnly.parse(data['anniversary_date']),
+      'firstKissDate': DateOnly.parse(data['first_kiss_date']),
+      'memberBirthdays': birthdays(),
+      // Пара с пустым местом («он в армии»): второго участника ещё нет, его
+      // место держит заглушка, а `claim_token` ждёт своего человека.
+      'waitingMode': data['waiting_mode'] == true,
+      'placeholderName': (data['placeholder_name'] ?? '').toString(),
+      'placeholderAvatar': (data['placeholder_avatar'] ?? '').toString(),
+      'returnDate': _date(data['return_date']),
+      'claimToken': (data['claim_token'] ?? '').toString(),
+      'claimUid': (data['claim_uid'] ?? '').toString(),
+      'claimName': (data['claim_name'] ?? '').toString(),
+      'claimAt': (data['claim_at'] as num?)?.toInt() ?? 0,
+    };
+  }
+
+  // ══════════════════════════════════════════════ ПАРА С ПУСТЫМ МЕСТОМ
+  // Второе место пары держит заглушка, пока человек в армии (на вахте, в
+  // экспедиции). Всё делают серверные роуты `waiting.pb.js`: клиент не может ни
+  // выдать себе код, ни объявить место свободным — `groups_guard` эти поля
+  // закрывает.
+
+  /// Завести пару с пустым местом. Возвращает `{pairId, code}` или null.
+  Future<Map<String, String>?> waitingCreate({
+    required String name,
+    String? avatar,
+    DateTime? returnDate,
+  }) async {
+    lastWaitingError = null;
+    try {
+      final res = await _pb.send('/api/waiting/create', method: 'POST', body: {
+        'name': name,
+        if (avatar != null && avatar.isNotEmpty) 'avatar': avatar,
+        if (returnDate != null) 'returnDate': _iso(returnDate),
+      });
+      final map = res is Map
+          ? Map<String, dynamic>.from(res)
+          : <String, dynamic>{};
+      if (map['success'] != true) {
+        lastWaitingError = (map['message'] ?? '').toString();
+        return null;
+      }
+      return {
+        'pairId': (map['pairId'] ?? '').toString(),
+        'code': (map['code'] ?? '').toString(),
+      };
+    } on ClientException catch (e) {
+      // Отказ роута приходит исключением, а причина — телом ответа. Без неё
+      // человек видит «не получилось» и не знает, что делать.
+      lastWaitingError = (e.response['message'] ?? '').toString();
+      debugPrint('PbData.waitingCreate ${e.statusCode}: $lastWaitingError');
+      return null;
+    } catch (e) {
+      debugPrint('PbData.waitingCreate failed: $e');
+      return null;
+    }
+  }
+
+  /// Поправить заглушку: имя, фото, дату возвращения.
+  Future<bool> waitingUpdate({
+    required String groupId,
+    String? name,
+    String? avatar,
+    DateTime? returnDate,
+    bool clearReturnDate = false,
+  }) async {
+    try {
+      final res = await _pb.send('/api/waiting/update', method: 'POST', body: {
+        'groupId': groupId,
+        if (name != null) 'name': name,
+        if (avatar != null) 'avatar': avatar,
+        if (clearReturnDate) 'returnDate': '',
+        if (!clearReturnDate && returnDate != null)
+          'returnDate': _iso(returnDate),
+      });
+      return res is Map && res['success'] == true;
+    } catch (e) {
+      debugPrint('PbData.waitingUpdate failed: $e');
+      return false;
+    }
+  }
+
+  /// Попроситься на второе место по коду. Возвращает статус
+  /// (`pending`, `member`) или null с текстом ошибки в [lastWaitingError].
+  String? lastWaitingError;
+
+  Future<Map<String, dynamic>?> waitingClaim(String code) async {
+    lastWaitingError = null;
+    try {
+      final res = await _pb.send('/api/waiting/claim',
+          method: 'POST', body: {'code': code});
+      final map = res is Map
+          ? Map<String, dynamic>.from(res)
+          : <String, dynamic>{};
+      if (map['success'] != true) {
+        lastWaitingError = (map['message'] ?? '').toString();
+        return null;
+      }
+      return map;
+    } on ClientException catch (e) {
+      lastWaitingError = (e.response['message'] ?? '').toString();
+      debugPrint('PbData.waitingClaim ${e.statusCode}: $lastWaitingError');
+      return null;
+    } catch (e) {
+      debugPrint('PbData.waitingClaim failed: $e');
+      return null;
+    }
+  }
+
+  /// Подтвердить или отклонить заявку на второе место.
+  Future<bool> waitingApprove(String groupId, {required bool approve}) async {
+    try {
+      final res = await _pb.send('/api/waiting/approve',
+          method: 'POST', body: {'groupId': groupId, 'approve': approve});
+      return res is Map && res['success'] == true;
+    } catch (e) {
+      debugPrint('PbData.waitingApprove failed: $e');
+      return false;
+    }
+  }
+
+  /// Сбросить код второго места (расставание, код утёк). Возвращает новый код.
+  Future<String?> waitingReset(String groupId) async {
+    try {
+      final res = await _pb.send('/api/waiting/reset',
+          method: 'POST', body: {'groupId': groupId});
+      final map = res is Map
+          ? Map<String, dynamic>.from(res)
+          : <String, dynamic>{};
+      if (map['success'] != true) return null;
+      return (map['code'] ?? '').toString();
+    } catch (e) {
+      debugPrint('PbData.waitingReset failed: $e');
+      return null;
+    }
+  }
+
+  /// Передумала ждать: пара с пустым местом распускается, код гаснет.
+  ///
+  /// Сам клиент так не может — `claim_token` и `waiting_mode` ему закрыты
+  /// стражем, а без гашения кода вернувшийся попал бы в распущенную группу.
+  Future<bool> waitingCancel(String groupId) async {
+    lastWaitingError = null;
+    try {
+      final res = await _pb.send('/api/waiting/cancel',
+          method: 'POST', body: {'groupId': groupId});
+      final map =
+          res is Map ? Map<String, dynamic>.from(res) : <String, dynamic>{};
+      if (map['success'] != true) {
+        lastWaitingError = (map['message'] ?? '').toString();
+        return false;
+      }
+      return true;
+    } on ClientException catch (e) {
+      lastWaitingError = (e.response['message'] ?? '').toString();
+      debugPrint('PbData.waitingCancel ${e.statusCode}: $lastWaitingError');
+      return false;
+    } catch (e) {
+      debugPrint('PbData.waitingCancel failed: $e');
+      return false;
+    }
+  }
+
+  /// Адреса STUN/TURN для голосовой связи в комнате просмотра. Пустой список
+  /// не возвращаем: без STUN соединение не соберётся вовсе, поэтому при отказе
+  /// сервера оставляем публичный.
+  Future<List<Map<String, dynamic>>> iceServers() async {
+    try {
+      final res = await _pb.send('/api/watch/rtc');
+      final map = res is Map
+          ? Map<String, dynamic>.from(res)
+          : <String, dynamic>{};
+      final list = (map['iceServers'] as List?)
+          ?.map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      if (list != null && list.isNotEmpty) return list;
+    } catch (e) {
+      debugPrint('PbData.iceServers failed: $e');
+    }
+    return [
+      {
+        'urls': ['stun:stun.l.google.com:19302'],
+      }
+    ];
+  }
+
+  /// Карточка товара по ссылке: название, картинка, магазин, цена.
+  /// null — магазин закрылся от нас (антибот, нет og-тегов): форма даст
+  /// заполнить руками, а не покажет пустоту после «загрузки».
+  Future<Map<String, dynamic>?> linkPreview(String url) async {
+    if (url.trim().isEmpty) return null;
+    try {
+      final res = await _pb
+          .send('/api/link/preview?url=${Uri.encodeQueryComponent(url.trim())}')
+          .timeout(const Duration(seconds: 15));
+      final map = res is Map
+          ? Map<String, dynamic>.from(res)
+          : <String, dynamic>{};
+      if (map['success'] != true) return null;
+      return map;
+    } catch (e) {
+      debugPrint('PbData.linkPreview failed: $e');
+      return null;
+    }
+  }
+
+  /// Статус своей заявки: `pending`, `approved`, `rejected`, `gone`, `none`.
+  /// Пока заявку не подтвердили, группа заявителю не видна вовсе — этот роут
+  /// единственный, что ему отвечает.
+  Future<Map<String, dynamic>> waitingState(String code) async {
+    try {
+      final res = await _pb.send('/api/waiting/state?code=$code');
+      return res is Map
+          ? Map<String, dynamic>.from(res)
+          : <String, dynamic>{};
+    } catch (e) {
+      debugPrint('PbData.waitingState failed: $e');
+      return <String, dynamic>{};
+    }
+  }
+
+  /// Группа по id → pair-карта (или null, если нет/распущена).
+  Future<Map<String, dynamic>?> loadPairMapById(
+    String groupId,
+    String myUid,
+  ) async {
+    final rec = await loadGroupById(groupId);
+    return rec == null ? null : groupRecordToPairMap(rec, myUid);
+  }
+
+  /// Активная группа пользователя → pair-карта (или null).
+  Future<Map<String, dynamic>?> loadPairMapForUser(String myUid) async {
+    final rec = await loadPairForUser(myUid);
+    return rec == null ? null : groupRecordToPairMap(rec, myUid);
+  }
+
+  /// Id всех живых групп, где [uid] состоит (discovery/self-heal).
+  Future<List<String>> activeGroupIdsForUser(String uid) async {
+    if (uid.isEmpty) return const [];
+    try {
+      final res = await _pb.collection('groups').getFullList(
+            filter:
+                _pb.filter('members ~ {:u} && disbanded = false', {'u': uid}),
+          );
+      return res.map((r) => r.id).toList();
+    } catch (e) {
+      debugPrint('PbData.activeGroupIdsForUser($uid) failed: $e');
+      return const [];
+    }
+  }
+
+  // ── внутригрупповые записи ───────────────────────────────────────────────
+  Future<bool> setMemberAilment(
+    String groupId,
+    String uid,
+    Map<String, dynamic> ail,
+  ) =>
+      _patchGroupMapField(groupId, 'member_ailments', uid, _jsonSafe(ail));
+  Future<bool> clearMemberAilment(String groupId, String uid) =>
+      _patchGroupMapField(groupId, 'member_ailments', uid, null);
+
+  Future<bool> setGroupRelationshipType(
+    String groupId, {
+    required String type,
+    int maxMembers = 2,
+    String customLabel = '',
+    String customEmoji = '',
+  }) =>
+      updateGroupFields(groupId, {
+        'relationship_type': type,
+        'max_members': maxMembers,
+        'custom_relationship_label': customLabel,
+        'custom_relationship_emoji': customEmoji,
+      });
+
+  Future<bool> setGroupStatus(String groupId, Map<String, dynamic> status) =>
+      updateGroupFields(groupId, {'current_status': _jsonSafe(status)});
+  Future<bool> clearGroupStatus(String groupId) =>
+      updateGroupFields(groupId, {'current_status': null});
+
+  Future<bool> addOrUpdateCustomStatus(
+    String groupId,
+    Map<String, dynamic> status,
+  ) =>
+      _patchGroupListById(groupId, 'custom_statuses', upsert: status);
+  Future<bool> deleteCustomStatus(String groupId, String statusId) =>
+      _patchGroupListById(groupId, 'custom_statuses', deleteId: statusId);
+
+  Future<bool> addOrUpdateCustomRelationshipType(
+    String groupId,
+    Map<String, dynamic> entry,
+  ) =>
+      _patchGroupListById(groupId, 'custom_relationship_types', upsert: entry);
+  Future<bool> deleteCustomRelationshipType(String groupId, String id) =>
+      _patchGroupListById(groupId, 'custom_relationship_types', deleteId: id);
+
+  /// RMW по json-полю-СПИСКУ группы: upsert/удаление элемента по ключу [idKey].
+  Future<bool> _patchGroupListById(
+    String groupId,
+    String col, {
+    Map<String, dynamic>? upsert,
+    String? deleteId,
+    String idKey = 'id',
+  }) async {
+    try {
+      final rec = await _pb
+          .collection('groups')
+          .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+      final cur = rec.data[col];
+      final list = cur is List
+          ? cur.map((e) => Map<String, dynamic>.from(e as Map)).toList()
+          : <Map<String, dynamic>>[];
+      if (deleteId != null) list.removeWhere((e) => e[idKey] == deleteId);
+      if (upsert != null) {
+        final idx = list.indexWhere((e) => e[idKey] == upsert[idKey]);
+        if (idx >= 0) {
+          list[idx] = upsert;
+        } else {
+          list.add(upsert);
+        }
+      }
+      await _pb.collection('groups').update(rec.id, body: {col: _jsonSafe(list)});
+      return true;
+    } catch (e) {
+      debugPrint('PbData._patchGroupListById($col) failed: $e');
+      return false;
+    }
+  }
+
+  // ── жизненный цикл пары ──────────────────────────────────────────────────
+  /// Распустить группу для всех (soft-delete: disbanded=true, восстановимо).
+  Future<bool> disbandGroup(String groupId) => updateGroupFields(groupId, {
+        'disbanded': true,
+        'disbanded_at': PairTime.write(DateTime.now()),
+      });
+
+  /// Убрать [uid] из группы (members + имена + аватары + настроения + недуги).
+  /// Если участников не осталось — помечаем распущенной. Retry (до 3 попыток)
+  /// закрывает транзиентные ошибки, но НЕ lost-update: при одновременном выходе
+  /// обоих участников обе записи успешны, вторая перетирает первую → ушедший может
+  /// «воскреснуть» (DATA-6). Полный фикс — серверная транзакция (groups.pb.js,
+  /// TODO). Одновременный выход обоих — крайне редкий сценарий.
+  Future<bool> leaveGroup(String groupId, String uid) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    // DATA-6: атомарный серверный выход; при недоступности — локальный RMW.
+    final r = await _callGroupRoute('leave', {'groupId': groupId, 'uid': uid});
+    if (r == _GroupRouteResult.ok) return true;
+    if (r == _GroupRouteResult.backpressure) return false;
+    return _leaveGroupLocal(groupId, uid);
+  }
+
+  Future<bool> _leaveGroupLocal(String groupId, String uid) async {
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        final rec = await _pb
+            .collection('groups')
+            .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+        final members =
+            (rec.data['members'] as List?)?.map((e) => e.toString()).toList() ??
+                <String>[];
+        members.remove(uid);
+        final names = rec.data['member_names'] is Map
+            ? Map<String, dynamic>.from(rec.data['member_names'] as Map)
+            : <String, dynamic>{};
+        final avatars = rec.data['member_avatars'] is Map
+            ? Map<String, dynamic>.from(rec.data['member_avatars'] as Map)
+            : <String, dynamic>{};
+        final moods = rec.data['member_moods'] is Map
+            ? Map<String, dynamic>.from(rec.data['member_moods'] as Map)
+            : <String, dynamic>{};
+        final ailments = rec.data['member_ailments'] is Map
+            ? Map<String, dynamic>.from(rec.data['member_ailments'] as Map)
+            : <String, dynamic>{};
+        names.remove(uid);
+        avatars.remove(uid);
+        moods.remove(uid);
+        ailments.remove(uid);
+        final body = <String, dynamic>{
+          'members': members,
+          'member_names': names,
+          'member_avatars': avatars,
+          'member_moods': moods,
+          'member_ailments': ailments,
+        };
+        if (members.isEmpty) {
+          body['disbanded'] = true;
+          body['disbanded_at'] = PairTime.write(DateTime.now());
+        }
+        await _pb.collection('groups').update(rec.id, body: body);
+        return true;
+      } catch (e) {
+        if (attempt == maxAttempts - 1) {
+          debugPrint('PbData.leaveGroup($groupId,$uid) failed after ${attempt + 1} attempts: $e');
+          return false;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 50 * (attempt + 1)));
+      }
+    }
+    return false;
+  }
+
+  /// Выйти из пары: пару (≤2 участника) распускаем для обоих (восстановимо),
+  /// группу больше 2 — просто покидаем. = unpairById на Firebase.
+  Future<bool> unpairGroup(String groupId, String uid) async {
+    if (groupId.isEmpty) return false;
+    try {
+      final rec = await _pb
+          .collection('groups')
+          .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+      final members =
+          (rec.data['members'] as List?)?.map((e) => e.toString()).toList() ??
+              <String>[];
+      if (members.length <= 2) return await disbandGroup(groupId);
+      return await leaveGroup(groupId, uid);
+    } catch (e) {
+      debugPrint('PbData.unpairGroup($groupId) failed: $e');
+      return false;
+    }
+  }
+
+  /// Живые группы (записи) пользователя — для race-guard в создании пары.
+  Future<List<RecordModel>> activeGroupRecordsForUser(String uid) async {
+    if (uid.isEmpty) return const [];
+    try {
+      return await _pb.collection('groups').getFullList(
+            filter:
+                _pb.filter('members ~ {:u} && disbanded = false', {'u': uid}),
+          );
+    } catch (e) {
+      debugPrint('PbData.activeGroupRecordsForUser($uid) failed: $e');
+      return const [];
+    }
+  }
+
+  // ══════════════════════════════════════════════ INVITE CODES (Фаза 2)
+  // Коллекция invite_codes: code (uniq), owner_uid, group_id?. Аналог Firestore
+  // inviteCodes/{code}. Приём кода создаёт/восстанавливает/входит в группу;
+  // партнёр подхватывает её через watchMyGroups (members ~ uid). Правила PB
+  // открыты для authed (тест-постура) — любой залогиненный может найти чужой
+  // код для приёма; ужесточить до членства перед публикой.
+  static const String _codeChars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+  String _newCode() {
+    final r = Random.secure();
+    return List.generate(6, (_) => _codeChars[r.nextInt(_codeChars.length)])
+        .join();
+  }
+
+  Future<RecordModel?> lookupInviteCode(String code) async {
+    if (code.isEmpty) return null;
+    try {
+      return await _pb
+          .collection('invite_codes')
+          .getFirstListItem(_pb.filter('code = {:c}', {'c': code}));
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return null;
+      debugPrint('PbData.lookupInviteCode($code) failed: $e');
+      return null;
+    }
+  }
+
+  /// Живёт ли [code] на сервере и принадлежит ли он [ownerUid].
+  ///
+  /// Нужен, чтобы поймать фантомный код: сборки до 24 июля при недоступном
+  /// сервере рисовали код сами, и он осел в памяти телефона навсегда —
+  /// перевыпуск идёт только на пустом поле. Партнёр вводил такой код и получал
+  /// «Код не найден» при живом с виду коде (95 отказов в сутки на 33 человека).
+  ///
+  /// `null` — ответа нет (офлайн, таймаут, нет живой сессии): звонящий НЕ
+  /// должен трогать код, иначе рабочий код заменится на пустой при первом же
+  /// обрыве связи.
+  ///
+  /// Ответ пишется в [ConfirmedInviteCodes]: экран раздаёт только те коды,
+  /// что сервер подтвердил.
+  Future<bool?> inviteCodeIsMine(String code, {required String ownerUid}) async {
+    if (code.isEmpty || ownerUid.isEmpty) return null;
+    // С протухшим токеном PocketBase считает запрос гостевым и отдаёт по
+    // правилу owner-only пустой список, а SDK превращает его в 404. Такой 404
+    // про код ничего не говорит, поэтому без живого токена не спрашиваем.
+    if (!_pb.authStore.isValid) return null;
+    try {
+      final rec = await _pb
+          .collection('invite_codes')
+          .getFirstListItem(_pb.filter('code = {:c}', {'c': code}))
+          .timeout(const Duration(seconds: 10));
+      final mine = rec.getStringValue('owner_uid') == ownerUid;
+      if (mine) {
+        ConfirmedInviteCodes.confirm(code, ownerUid: ownerUid);
+      } else {
+        ConfirmedInviteCodes.forget(code);
+      }
+      return mine;
+    } on ClientException catch (e) {
+      // 404 — записи нет: код фантомный. Правило listRule у коллекции
+      // owner-only, так что свой код виден всегда, и при живом токене 404
+      // здесь однозначен.
+      if (e.statusCode == 404) {
+        ConfirmedInviteCodes.forget(code);
+        return false;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> deleteInviteCode(String code) async {
+    if (code.isEmpty) return;
+    try {
+      final rec = await _pb
+          .collection('invite_codes')
+          .getFirstListItem(_pb.filter('code = {:c}', {'c': code}));
+      await _pb.collection('invite_codes').delete(rec.id);
+    } catch (_) {
+      // нет кода / уже удалён / гонка — некритично
+    }
+    ConfirmedInviteCodes.forget(code);
+  }
+
+  /// Сгенерировать уникальный код, зарегистрировать (owner_uid, опц. group_id),
+  /// удалить [oldCode]. Возвращает код или '' при ошибке (вызывающий — локальный
+  /// фолбэк).
+  Future<String> generateInviteCode({
+    required String ownerUid,
+    String? groupId,
+    String? oldCode,
+  }) async {
+    if (ownerUid.isEmpty) return '';
+    // Старый код сносим ТОЛЬКО после того, как новый лёг на сервер. Пока
+    // удаление шло первым, любой тяжёлый вечер оставлял человека вообще без
+    // кода: восемь попыток создания падали по таймауту, прежний код был уже
+    // стёрт, экран видел пустоту и запускал перевыпуск заново — «код
+    // генерируется бесконечно», а партнёру нечего вводить. В базе от этого
+    // осело 60 тысяч кодов на 26 тысяч владельцев.
+    var refreshedSession = false;
+    for (var attempt = 0; attempt < 8; attempt++) {
+      final code = _newCode();
+      // listRule invite_codes = owner-only (анти-enumeration) → этот pre-check
+      // видит лишь СВОИ коды; реальный страж коллизий — уникальный индекс на
+      // create. На провал create (коллизия/гонка) пробуем следующий код.
+      if (await lookupInviteCode(code) != null) continue;
+      try {
+        await _pb.collection('invite_codes').create(body: {
+          'code': code,
+          'owner_uid': ownerUid,
+          if (groupId != null && groupId.isNotEmpty) 'group_id': groupId,
+        });
+        ConfirmedInviteCodes.confirm(code, ownerUid: ownerUid);
+        if (oldCode != null && oldCode.isNotEmpty && oldCode != code) {
+          await deleteInviteCode(oldCode);
+        }
+        return code;
+      } catch (e) {
+        debugPrint('PbData.generateInviteCode attempt ${attempt + 1} failed: $e');
+        // ЧАСТАЯ ПРИЧИНА (подтверждено логами: auth='' на сервере): токен протух/
+        // не приложен → createRule `owner_uid = @request.auth.id` не проходит →
+        // 400 «create rule failure». Освежаем сессию ОДИН раз и продолжаем — тогда
+        // следующий create уйдёт с валидным токеном. Если токен мёртв (401 на
+        // refresh) — refresh молча упадёт, код не создастся, вызывающий покажет
+        // ошибку (а не фейковый локальный код).
+        if (!refreshedSession) {
+          refreshedSession = true;
+          try {
+            await _pb
+                .collection('users')
+                .authRefresh()
+                .timeout(const Duration(seconds: 8));
+          } catch (_) {}
+        }
+        continue;
+      }
+    }
+    return '';
+  }
+
+  /// Приём кода → создать/войти/восстановить пару. Делегирует серверному хуку
+  /// `POST /api/invite/accept` (pb_hooks/invite.pb.js): он ищет код под $app
+  /// (коды НЕ читаются клиентом кросс-юзерно — закрыт enumeration) и
+  /// присоединяет к паре в обход ACL по членству (клиент не может дописать себя
+  /// в чужую группу). Хук возвращает {success,message,pairId,restored} — группу
+  /// дочитываем сами (теперь мы её член → правила пускают) и строим pair-карту
+  /// в форме старого FirebaseService.acceptInviteCode.
+  Future<Map<String, dynamic>> acceptInviteCode(
+    String code, {
+    required String myUid,
+  }) async {
+    code = code.toUpperCase().trim();
+    if (code.isEmpty) return {'success': false, 'message': 'Введите код'};
+    // Полумёртвая/протухшая сессия: authStore.record не восстановился или токен
+    // устал → myUid пуст, и запрос молча НЕ уходит на сервер (в логах PB ноль
+    // /api/invite/accept — код «всегда не найден», хотя маршрут жив). Освежаем
+    // сессию и достаём uid заново; если и после этого пусто — честно говорим, что
+    // сессия истекла, а не вводим в заблуждение «код не найден».
+    if (myUid.isEmpty) {
+      try {
+        await _pb
+            .collection('users')
+            .authRefresh()
+            .timeout(const Duration(seconds: 8));
+      } catch (_) {}
+      myUid = PocketBaseService().userId ?? '';
+    }
+    if (myUid.isEmpty) {
+      return {
+        'success': false,
+        'message': 'Сессия истекла — войдите заново',
+        'authExpired': true,
+      };
+    }
+    try {
+      Future<dynamic> send() => _pb.send(
+            '/api/invite/accept',
+            method: 'POST',
+            body: {'code': code},
+          );
+      dynamic resp;
+      try {
+        resp = await send();
+      } on ClientException catch (e) {
+        // 401 от маршрута (`requireAuth`) значит протухший токен, а не плохой
+        // код: myUid лежит в памяти, поэтому проверка выше его не поймала, и
+        // человек видел «код не найден» при живом коде. Освежаем сессию и
+        // пробуем ещё раз — жалоба от @frizzovoi была ровно про это (в логах
+        // PB все обращения к /api/invite/accept за двое суток — 401).
+        if (e.statusCode != 401) rethrow;
+        try {
+          await _pb
+              .collection('users')
+              .authRefresh()
+              .timeout(const Duration(seconds: 8));
+        } catch (_) {}
+        if ((PocketBaseService().userId ?? '').isEmpty) {
+          return {
+            'success': false,
+            'message': 'Сессия истекла — войдите заново',
+            'authExpired': true,
+          };
+        }
+        resp = await send();
+      }
+      final map =
+          resp is Map ? Map<String, dynamic>.from(resp) : <String, dynamic>{};
+      if (map['success'] != true) {
+        return {
+          'success': false,
+          'message': (map['message'] ?? 'Не удалось принять код').toString(),
+        };
+      }
+      final pairId = (map['pairId'] ?? '').toString();
+      if (pairId.isEmpty) {
+        return {'success': false, 'message': 'Сервер не вернул пару'};
+      }
+      // Код второго места у пары «он в армии»: группа существует, но пока нас
+      // в неё не пустили — сперва заявка, потом подтверждение хозяйкой.
+      if (map['waiting'] == true) {
+        return {
+          'success': false,
+          'waiting': true,
+          'pairId': pairId,
+          'code': code,
+          'message': 'Это код второго места — отправляем заявку',
+        };
+      }
+      final g = await _pb.collection('groups').getOne(pairId);
+      return _acceptResult(
+        g,
+        myUid,
+        (map['message'] ?? 'Connected!').toString(),
+        restored: map['restored'] == true,
+      );
+    } on ClientException catch (e) {
+      // Хук вернул 4xx (код не найден / свой код / занято) — текст в response.
+      if (e.statusCode == 401) {
+        return {
+          'success': false,
+          'message': 'Сессия истекла — войдите заново',
+          'authExpired': true,
+        };
+      }
+      final msg = (e.response['message'] ?? 'Ошибка приёма кода').toString();
+      debugPrint('PbData.acceptInviteCode hook ${e.statusCode}: $msg');
+      return {'success': false, 'message': msg};
+    } catch (e) {
+      debugPrint('PbData.acceptInviteCode failed: $e');
+      return {'success': false, 'message': 'Ошибка: $e'};
+    }
+  }
+
+  /// Результат-карта из (свежепрочитанной) записи группы.
+  Map<String, dynamic> _acceptResult(
+    RecordModel g,
+    String myUid,
+    String message, {
+    bool restored = false,
+  }) {
+    final m = groupRecordToPairMap(g, myUid);
+    return {
+      'success': true,
+      'message': message,
+      'partnerName': m['partnerName'],
+      'partnerAvatar': m['partnerAvatar'],
+      'pairId': g.id,
+      'startDate': m['startDate'] ?? DateTime.now(),
+      'relationshipType': m['relationshipType'] ?? 'couple',
+      'customRelationshipLabel': m['customRelationshipLabel'] ?? '',
+      'customRelationshipEmoji': m['customRelationshipEmoji'] ?? '',
+      'customRelationshipTypes': m['customRelationshipTypes'] ?? <dynamic>[],
+      'members': m['members'],
+      if (restored) 'restored': true,
+    };
+  }
+
+  // ══════════════════════════════════════════════ MEMORIES
+  Future<bool> upsertMemory(
+    String groupId,
+    String id,
+    Map<String, dynamic> data,
+  ) async {
+    if (id.isEmpty) return false;
+    return _upsertById('memories', id, {
+      'group_id': groupId,
+      'type': data['type'],
+      'author_uid': data['authorUid'],
+      'author_name': data['authorName'],
+      'author_avatar': data['authorAvatar'],
+      'created_at': _iso(data['createdAt']),
+      'edited_at': _iso(data['editedAt']),
+      // Пояс автора идёт рядом со временем: по нему читатель отличает новую
+      // запись (время абсолютное) от старой, где лежат часы автора.
+      'tz': data['tz'] ?? PairTime.zoneNow(),
+      // Дата занесения записи: `created_at` человек ставит сам, задним числом.
+      'added_at': _iso(data['addedAt']),
+      'is_pinned': data['isPinned'] ?? false,
+      'deleted': data['deleted'] ?? false,
+      'data': _jsonSafe(data),
+    }, op: 'upsertMemory');
+  }
+
+  Future<bool> patchMemory(String id, Map<String, dynamic> fb) async {
+    if (id.isEmpty) return false;
+    final cols = <String, dynamic>{};
+    if (fb.containsKey('isPinned')) cols['is_pinned'] = fb['isPinned'];
+    if (fb.containsKey('editedAt')) cols['edited_at'] = _iso(fb['editedAt']);
+    if (fb.containsKey('createdAt')) {
+      cols['created_at'] = _iso(fb['createdAt']);
+      // Время переписали — пояс обязан переехать вместе с ним, иначе правка
+      // старой записи оставит её без пояса и время уедет.
+      cols['tz'] = fb['tz'] ?? PairTime.zoneNow();
+    }
+    if (cols.isEmpty) return true;
+    return _upsertById('memories', id, cols, op: 'patchMemory');
+  }
+
+  Future<bool> deleteMemory(String id, {bool hard = false}) async {
+    if (id.isEmpty) return false;
+    try {
+      if (hard) {
+        await _pb.collection('memories').delete(id);
+      } else {
+        // DATA-16: soft-delete только через update. Раньше _upsertById делал
+        // create-on-404 → удаление НЕсуществующего воспоминания создавало
+        // ghost-tombstone {id, deleted:true}. Нечего удалять (404) ловит catch
+        // ниже как успех.
+        await _pb.collection('memories').update(id, body: {'deleted': true});
+      }
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteMemory($id) failed: $e');
+      return false;
+    }
+  }
+
+  /// Лента группы (новые сверху), soft-deleted отфильтрованы. [beforeIso] —
+  /// курсор по created_at для пагинации. Возвращает raw-записи.
+  Future<List<RecordModel>> loadMemories(
+    String groupId, {
+    int limit = 50,
+    String? beforeIso,
+  }) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      var filter = 'group_id = {:g} && deleted = false';
+      final params = <String, dynamic>{'g': groupId};
+      if (beforeIso != null) {
+        filter += ' && created_at < {:b}';
+        params['b'] = beforeIso;
+      }
+      final res = await _pb.collection('memories').getList(
+            perPage: limit,
+            filter: _pb.filter(filter, params),
+            sort: '-created_at',
+          );
+      return res.items;
+    } catch (e) {
+      debugPrint('PbData.loadMemories($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  /// Создаёт воспоминание (PB генерирует id). [data] — camelCase-карта (как
+  /// `Memory.toJson()`, ISO-даты). Возвращает запись или null. Используется
+  /// репозиторием на cutover, когда id генерит сервер (а не клиент).
+  Future<RecordModel?> createMemory(
+    String groupId,
+    Map<String, dynamic> data,
+  ) async {
+    if (groupId.isEmpty) return null;
+    try {
+      return await _pb.collection('memories').create(body: {
+        'group_id': groupId,
+        'type': data['type'],
+        'author_uid': data['authorUid'],
+        'author_name': data['authorName'],
+        'author_avatar': data['authorAvatar'],
+        'created_at': _iso(data['createdAt']),
+        'edited_at': _iso(data['editedAt']),
+        'tz': data['tz'] ?? PairTime.zoneNow(),
+        'added_at': _iso(data['addedAt']) ?? PairTime.write(DateTime.now()),
+        'is_pinned': data['isPinned'] ?? false,
+        'deleted': data['deleted'] ?? false,
+        'data': _jsonSafe(data),
+      });
+    } catch (e) {
+      debugPrint('PbData.createMemory failed: $e');
+      return null;
+    }
+  }
+
+  /// Точечное чтение воспоминания по id (deep-link пина из чата). Уважает
+  /// soft-delete: удалённое воспоминание возвращает null (как старый путь).
+  /// Наклейка на запись: тело `{sticker_put: …}` или `{sticker_del: id}`.
+  ///
+  /// Пишет её отдельная операция сервера, а не правка всей записи: двое
+  /// клеят одновременно и не затирают друг друга. [refused] — сервер ответил
+  /// отказом по сути (своих уже три, чужая наклейка, записи нет): повтор
+  /// ничего не даст. Иначе null-запись значит «сеть не ответила».
+  Future<({RecordModel? record, bool refused})> memoryStickerOp(
+      String memoryId, Map<String, dynamic> body) async {
+    if (memoryId.isEmpty) return (record: null, refused: true);
+    try {
+      final rec = await _pb.collection('memories').update(memoryId, body: body);
+      return (record: rec, refused: false);
+    } on ClientException catch (e) {
+      final code = e.statusCode;
+      final refused = code >= 400 &&
+          code < 500 &&
+          code != 401 &&
+          code != 408 &&
+          code != 429;
+      if (!refused) debugPrint('PbData.memoryStickerOp($memoryId) failed: $e');
+      return (record: null, refused: refused);
+    } catch (e) {
+      debugPrint('PbData.memoryStickerOp($memoryId) failed: $e');
+      return (record: null, refused: false);
+    }
+  }
+
+  Future<RecordModel?> loadMemoryById(String id) async {
+    if (id.isEmpty) return null;
+    try {
+      return await _pb.collection('memories').getFirstListItem(
+            _pb.filter('id = {:id} && deleted = false', {'id': id}),
+          );
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return null;
+      debugPrint('PbData.loadMemoryById($id) failed: $e');
+      return null;
+    }
+  }
+
+  // ══════════════════════════════════════════════ MOODS
+  Future<bool> upsertMood(
+    String groupId,
+    String uid,
+    Map<String, dynamic> entry,
+  ) async {
+    final id = entry['id'] as String?;
+    if (id == null || id.isEmpty) return false;
+    return _upsertById('mood_entries', id, {
+      'group_id': groupId,
+      'user_uid': uid,
+      'mood_id': entry['moodId'],
+      'image_path': entry['imagePath'],
+      'label': entry['label'],
+      'timestamp': _iso(entry['timestamp']) ?? PairTime.write(DateTime.now()),
+      'tz': entry['tz'] ?? PairTime.zoneNow(),
+    }, op: 'upsertMood', expectNew: true);
+  }
+
+  /// Создаёт запись настроения (PB генерирует id, как [createMemory]). [entry] —
+  /// camelCase-карта (moodId/imagePath/label/timestamp). Возвращает запись или
+  /// null. Используется [MoodRepository] на cutover вместо client-id.
+  Future<RecordModel?> createMood(
+    String groupId,
+    String uid,
+    Map<String, dynamic> entry,
+  ) async {
+    if (groupId.isEmpty || uid.isEmpty) return null;
+    try {
+      return await _pb.collection('mood_entries').create(body: {
+        'group_id': groupId,
+        'user_uid': uid,
+        'mood_id': entry['moodId'],
+        'image_path': entry['imagePath'],
+        'label': entry['label'],
+        'timestamp':
+            _iso(entry['timestamp']) ?? PairTime.write(DateTime.now()),
+        'tz': entry['tz'] ?? PairTime.zoneNow(),
+      });
+    } catch (e) {
+      debugPrint('PbData.createMood failed: $e');
+      return null;
+    }
+  }
+
+  Future<bool> deleteMood(String entryId) async {
+    if (entryId.isEmpty) return false;
+    try {
+      await _pb.collection('mood_entries').delete(entryId);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteMood($entryId) failed: $e');
+      return false;
+    }
+  }
+
+  Future<List<RecordModel>> loadMoods(String groupId, String uid) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      final res = await _pb.collection('mood_entries').getFullList(
+            filter: _pb.filter('group_id = {:g} && user_uid = {:u}',
+                {'g': groupId, 'u': uid}),
+          );
+      return res;
+    } catch (e) {
+      debugPrint('PbData.loadMoods($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  // ══════════════════════════════════════════════ CYCLE
+
+  /// Отметки календаря цикла. Свои — всегда, партнёрские — только те, что
+  /// разрешено показывать: остальные не отдаст само правило чтения коллекции.
+  Future<List<RecordModel>> loadCycle(String groupId, String uid) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('cycle_entries').getFullList(
+            filter: _pb.filter('group_id = {:g} && user_uid = {:u}',
+                {'g': groupId, 'u': uid}),
+            sort: 'day',
+          );
+    } catch (e) {
+      debugPrint('PbData.loadCycle($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  Future<bool> upsertCycle(
+    String groupId,
+    String uid,
+    Map<String, dynamic> entry,
+  ) async {
+    final id = entry['id'] as String?;
+    if (id == null || id.isEmpty) return false;
+    return _upsertById('cycle_entries', id, {
+      'group_id': groupId,
+      'user_uid': uid,
+      'day': _iso(entry['day']) ?? PairTime.write(DateTime.now()),
+      'kind': entry['kind'],
+      'flow': entry['flow'],
+      'shared': entry['shared'] ?? false,
+    }, op: 'upsertCycle');
+  }
+
+  Future<bool> deleteCycle(String entryId) async {
+    if (entryId.isEmpty) return false;
+    try {
+      await _pb.collection('cycle_entries').delete(entryId);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteCycle($entryId) failed: $e');
+      return false;
+    }
+  }
+
+  /// Переключает видимость СРАЗУ У ВСЕХ своих отметок.
+  ///
+  /// Видимость — это поле каждой записи, а не флажок в профиле: правило чтения
+  /// смотрит именно на него, поэтому выключенный доступ закрывает данные на
+  /// сервере. Значит при переключении тумблера надо пройтись по всем записям.
+  Future<bool> setCycleShared(String groupId, String uid, bool shared) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    try {
+      final recs = await _pb.collection('cycle_entries').getFullList(
+            filter: _pb.filter('group_id = {:g} && user_uid = {:u}',
+                {'g': groupId, 'u': uid}),
+          );
+      for (final rec in recs) {
+        if (rec.getBoolValue('shared') == shared) continue;
+        await _pb
+            .collection('cycle_entries')
+            .update(rec.id, body: {'shared': shared});
+      }
+      return true;
+    } catch (e) {
+      debugPrint('PbData.setCycleShared($groupId) failed: $e');
+      return false;
+    }
+  }
+
+  /// Стирает все свои отметки цикла — по кнопке «удалить данные».
+  Future<bool> wipeCycle(String groupId, String uid) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    try {
+      final recs = await _pb.collection('cycle_entries').getFullList(
+            filter: _pb.filter('group_id = {:g} && user_uid = {:u}',
+                {'g': groupId, 'u': uid}),
+          );
+      for (final rec in recs) {
+        await _pb.collection('cycle_entries').delete(rec.id);
+      }
+      return true;
+    } catch (e) {
+      debugPrint('PbData.wipeCycle($groupId) failed: $e');
+      return false;
+    }
+  }
+
+  // ══════════════════════════════════════════════ УМЕНИЕ ЛЮБИТЬ
+
+  /// Результаты теста «Умение любить» у пары: свой и партнёрский.
+  ///
+  /// Запись на человека одна — id складывается из пары и uid, поэтому повторное
+  /// прохождение правит её, а не плодит вторую. Realtime тут не нужен: экран
+  /// открывают руками, а фигура партнёра всё равно показывается только после
+  /// своих ответов.
+  Future<List<RecordModel>> loadLoveTests(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('love_tests').getFullList(
+            filter: _pb.filter('group_id = {:g}', {'g': groupId}),
+          );
+    } catch (e) {
+      debugPrint('PbData.loadLoveTests($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  Future<bool> saveLoveTest(
+    String groupId,
+    String uid,
+    Map<String, dynamic> result,
+  ) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    // Id из пары и человека: одна запись на прохождение, без дублей после
+    // повторного теста и без гонки «создали дважды с двух устройств».
+    final id = _loveTestId(groupId, uid);
+    return _upsertById(
+      'love_tests',
+      id,
+      {
+        'group_id': groupId,
+        'user_uid': uid,
+        'data': result,
+        'total': result['total'] ?? 0,
+      },
+      op: 'saveLoveTest',
+      expectNew: true,
+    );
+  }
+
+  String _loveTestId(String groupId, String uid) =>
+      loveTestRecordId(groupId, uid);
+
+  // ══════════════════════════════════════════════ WISHES
+
+  /// Общие желания пары. Запись одна на двоих, поэтому фильтр только по
+  /// группе — чужих здесь не бывает, их не пускает правило коллекции.
+  Future<List<RecordModel>> loadWishes(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('wishes').getFullList(
+            filter: _pb.filter('group_id = {:g}', {'g': groupId}),
+            sort: '-created',
+          );
+    } catch (e) {
+      debugPrint('PbData.loadWishes($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  /// Заводит или правит желание. Отметка «сбылось» приходит сюда же: она
+  /// меняет поля той же записи, отдельного роута под неё нет.
+  Future<bool> upsertWish(String groupId, Map<String, dynamic> wish) async {
+    final id = wish['id'] as String?;
+    if (id == null || id.isEmpty || groupId.isEmpty) return false;
+    return _upsertById('wishes', id, wishUpsertBody(groupId, wish),
+        op: 'upsertWish');
+  }
+
+  /// Тело записи желания.
+  ///
+  /// Вынесено отдельно и под тесты, потому что тут уже терялась половина
+  /// желания: `Wish.toMap` клал поля вещи (`kind`, `price`, `currency`, `url`,
+  /// `image`, `shop`), а этот список их не знал — ссылка, цена, магазин и
+  /// фотография не уходили на сервер ни разу. Ставя новое поле в модель, ставить
+  /// его и сюда.
+  static Map<String, dynamic> wishUpsertBody(
+    String groupId,
+    Map<String, dynamic> wish,
+  ) =>
+      <String, dynamic>{
+        'group_id': groupId,
+        'author_uid': wish['author_uid'] ?? '',
+        'title': wish['title'] ?? '',
+        'note': wish['note'] ?? '',
+        'category': wish['category'] ?? 'other',
+        'symbol': wish['symbol'] ?? '',
+        'done': wish['done'] ?? false,
+        // Пустая строка стирает дату на сервере: отмена отметки должна убирать
+        // её целиком, иначе в архиве останется дата у вернувшегося желания.
+        'done_at': _iso(wish['done_at']) ?? '',
+        'done_by': wish['done_by'] ?? '',
+        'done_note': wish['done_note'] ?? '',
+        // Вещь: цена, ссылка, магазин, фотография. Пустое значение доезжает
+        // намеренно — иначе снятую ссылку или фото не убрать.
+        'kind': wish['kind'] ?? 'deed',
+        'price': wish['price'] ?? 0,
+        'currency': wish['currency'] ?? '',
+        'url': wish['url'] ?? '',
+        'image': wish['image'] ?? '',
+        'shop': wish['shop'] ?? '',
+      };
+
+  /// Свои категории желаний, заведённые парой.
+  Future<List<RecordModel>> loadWishCategories(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('wish_categories').getFullList(
+            filter: _pb.filter('group_id = {:g}', {'g': groupId}),
+            sort: 'created',
+          );
+    } catch (e) {
+      debugPrint('PbData.loadWishCategories($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  Future<bool> upsertWishCategory(
+      String groupId, Map<String, dynamic> kind) async {
+    final id = kind['id'] as String?;
+    if (id == null || id.isEmpty || groupId.isEmpty) return false;
+    return _upsertById('wish_categories', id, {
+      'group_id': groupId,
+      'author_uid': kind['author_uid'] ?? '',
+      'title': kind['title'] ?? '',
+      'symbol': kind['symbol'] ?? 'star',
+      'note': kind['note'] ?? '',
+    }, op: 'upsertWishCategory');
+  }
+
+  Future<bool> deleteWishCategory(String id) async {
+    if (id.isEmpty) return false;
+    try {
+      await _pb.collection('wish_categories').delete(id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteWishCategory($id) failed: $e');
+      return false;
+    }
+  }
+
+  /// Отметка «сбылось» на ЧУЖОМ желании: шлём только поля отметки.
+  ///
+  /// Полное тело здесь не годится — страж `wishes_guard.pb.js` пускает не-автора
+  /// ровно в эти четыре поля, а `upsertWish` отправляет и название с заметкой,
+  /// и обычная галочка отваливалась бы с 403. Записи может не быть только если
+  /// её только что снёс автор — тогда отмечать нечего, и это не ошибка.
+  Future<bool> markWish(String wishId, Map<String, dynamic> fields) async {
+    if (wishId.isEmpty) return false;
+    try {
+      await _pb.collection('wishes').update(wishId, body: {
+        'done': fields['done'] ?? false,
+        'done_at': _iso(fields['done_at']) ?? '',
+        'done_by': fields['done_by'] ?? '',
+        'done_note': fields['done_note'] ?? '',
+      }).timeout(const Duration(seconds: 15));
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.markWish($wishId) failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> deleteWish(String wishId) async {
+    if (wishId.isEmpty) return false;
+    try {
+      await _pb.collection('wishes').delete(wishId);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteWish($wishId) failed: $e');
+      return false;
+    }
+  }
+
+  /// Свои отметки «дарю». Фильтр только по группе намеренно: правило
+  /// коллекции отдаёт записи с `uid = auth.id` и ничего больше, так что
+  /// чужого сюда не приедет, даже если попросить.
+  Future<List<RecordModel>> loadWishReservations(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('wish_reservations').getFullList(
+            filter: _pb.filter('group_id = {:g}', {'g': groupId}),
+          );
+    } catch (e) {
+      debugPrint('PbData.loadWishReservations($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  /// Берёт вещь на себя. Запись создаётся своим id, повтор идемпотентен.
+  Future<bool> upsertWishReservation(
+      String groupId, Map<String, dynamic> res) async {
+    final id = res['id'] as String?;
+    if (id == null || id.isEmpty || groupId.isEmpty) return false;
+    return _upsertById('wish_reservations', id, {
+      'group_id': groupId,
+      'wish_id': res['wish_id'] ?? '',
+      'uid': res['uid'] ?? '',
+    }, op: 'upsertWishReservation');
+  }
+
+  Future<bool> deleteWishReservation(String id) async {
+    if (id.isEmpty) return false;
+    try {
+      await _pb.collection('wish_reservations').delete(id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteWishReservation($id) failed: $e');
+      return false;
+    }
+  }
+
+  // ══════════════════════════════════════════════ TIMERS
+  // Групповые таймеры живут json-массивом в колонке `groups.timers`; соло —
+  // в `users.solo_timers`. Гранулярные правки — RMW массива (PB без транзакций;
+  // для редких правок таймеров гонка некритична).
+
+  /// Записать весь массив групповых таймеров (saveTimers).
+  Future<bool> setGroupTimers(String groupId, List<dynamic> timers) =>
+      updateGroupFields(groupId, {'timers': _jsonSafe(timers)});
+
+  /// RMW над `groups.timers`: прочитать массив, преобразовать, записать.
+  ///
+  /// Три попытки с нарастающей паузой. Правка идёт через прокси, и минутный
+  /// 502 или 429 раньше означал молча потерянную дату: экран закрывался как
+  /// после успеха, а на сервере оставалось прежнее число. Так у пары
+  /// `xristozs@icloud.com` счётчик «дней вместе» остался на дне создания пары
+  /// (жалоба 20.08.2026).
+  Future<bool> _patchGroupTimers(
+    String groupId,
+    List<dynamic> Function(List<dynamic>) transform, {
+    String op = 'patchGroupTimers',
+  }) async {
+    if (groupId.isEmpty) return false;
+    Object? lastError;
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      try {
+        final rec = await _pb
+            .collection('groups')
+            .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+        final cur = rec.data['timers'];
+        final list = cur is List ? List<dynamic>.from(cur) : <dynamic>[];
+        await _pb
+            .collection('groups')
+            .update(rec.id, body: {'timers': _jsonSafe(transform(list))});
+        return true;
+      } catch (e) {
+        lastError = e;
+        debugPrint('PbData.$op($groupId) попытка $attempt не прошла: $e');
+        if (attempt < 3) {
+          await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
+        }
+      }
+    }
+    debugPrint('PbData.$op($groupId) не сохранено: $lastError');
+    return false;
+  }
+
+  /// Вставить/обновить один таймер по id (детерминированный id системного
+  /// схлопывает дубли при одновременном создании пары — паритет с Firebase).
+  /// Флаг основного сводится по серверному списку: свой список целиком телефон
+  /// больше не пишет, его старая копия затирала свежую дату (обращение 358).
+  Future<bool> upsertGroupTimer(String groupId, Map<String, dynamic> timer) =>
+      _patchGroupTimers(groupId, (list) => upsertTimerJson(list, timer), op: 'upsertGroupTimer');
+
+  Future<bool> deleteGroupTimer(String groupId, String timerId) =>
+      _patchGroupTimers(groupId,
+          (list) => list.where((e) => !(e is Map && e['id'] == timerId)).toList(),
+          op: 'deleteGroupTimer');
+
+  Future<bool> setDefaultGroupTimer(String groupId, String timerId) =>
+      _patchGroupTimers(groupId, (list) {
+        for (final e in list) {
+          if (e is Map) e['isDefault'] = e['id'] == timerId;
+        }
+        return list;
+      }, op: 'setDefaultGroupTimer');
+
+  /// Соло-таймеры пользователя (users.solo_timers). null — нет/ошибка.
+  Future<List<Map<String, dynamic>>?> loadSoloTimers(String uid) async {
+    final rec = await loadUserProfile(uid);
+    final raw = rec?.data['solo_timers'];
+    return raw is List
+        ? raw.map((e) => Map<String, dynamic>.from(e as Map)).toList()
+        : null;
+  }
+
+  Future<bool> saveSoloTimers(String uid, List<dynamic> timers) =>
+      updateUserProfile(uid, {'soloTimers': timers});
+
+  // ══════════════════════════════════════════════ ACTIVE SESSION (co-watch invite)
+  // Приглашение хранится json-полем `groups.active_session` (плеер co-watch —
+  // отдельный RTDB-слой, мигрирует позже). Один write — партнёрский live-листенер
+  // группы ловит его без доп. чтения.
+  Future<bool> setActiveSession(
+          String groupId, Map<String, dynamic> session) =>
+      updateGroupFields(groupId, {'active_session': _jsonSafe(session)});
+
+  /// Снять активный сеанс (null в json-колонке).
+  Future<bool> clearActiveSession(String groupId) =>
+      updateGroupFields(groupId, {'active_session': null});
+
+  // ══════════════════════════════════════════════ LIVE LOCATION («Где мы»)
+  // Точка участника в канале пары `pair_<a>_<b>` (json `data`). Upsert по
+  // (channel,user_uid). Замена RTDB liveLocation/{channel}/points/{uid}.
+  Future<bool> setLivePoint(
+    String channel,
+    String uid,
+    Map<String, dynamic> point,
+  ) async {
+    if (channel.isEmpty || uid.isEmpty) return false;
+    return _upsertByFilter(
+      'live_location',
+      'channel = {:c} && user_uid = {:u}',
+      {'c': channel, 'u': uid},
+      {'channel': channel, 'user_uid': uid, 'data': _jsonSafe(point)},
+      op: 'setLivePoint',
+    );
+  }
+
+  // ══════════════════════════════════════════════ CO-WATCH SESSION (плеер)
+  // Состояние сеанса — запись live_sessions (id=pairId); презенс — live_session_
+  // presence (heartbeat+TTL); чат — live_session_chat. Замена RTDB liveSessions.
+  Future<bool> startSession(String pairId, Map<String, dynamic> data) =>
+      _upsertById('live_sessions', pairId, {
+        'activity': data['activity'],
+        'media_id': data['mediaId'],
+        'is_playing': data['isPlaying'] ?? false,
+        'position_ms': data['positionMs'] ?? 0,
+        'last_action_at':
+            data['lastActionAt'] ?? DateTime.now().millisecondsSinceEpoch,
+        'controller_uid': data['controllerUid'],
+        'seq': data['seq'] ?? 0,
+      }, op: 'startSession');
+
+  /// Действие плеера (play/pause/seek/heartbeat). last_action_at — клиентский
+  /// epoch (PB без serverTimestamp; heartbeat каждые ~8с пере-синкает дрейф).
+  Future<bool> pushSessionAction(String pairId, Map<String, dynamic> a) {
+    final body = <String, dynamic>{
+      'is_playing': a['isPlaying'],
+      'position_ms': a['positionMs'],
+      'last_action_at': DateTime.now().millisecondsSinceEpoch,
+      'controller_uid': a['controllerUid'],
+      'seq': a['seq'],
+      if (a['mediaId'] != null) 'media_id': a['mediaId'],
+    };
+    return _upsertById('live_sessions', pairId, body, op: 'pushSessionAction');
+  }
+
+  /// Завершить сеанс: удалить запись + презенс + чат пары.
+  Future<bool> endSession(String pairId) async {
+    if (pairId.isEmpty) return false;
+    try {
+      try {
+        await _pb.collection('live_sessions').delete(pairId);
+      } on ClientException catch (e) {
+        if (e.statusCode != 404) rethrow;
+      }
+      for (final col in ['live_session_presence', 'live_session_chat']) {
+        final rows = await _pb
+            .collection(col)
+            .getFullList(filter: _pb.filter('pair_id = {:p}', {'p': pairId}));
+        for (final r in rows) {
+          await _pb.collection(col).delete(r.id);
+        }
+      }
+      return true;
+    } catch (e) {
+      debugPrint('PbData.endSession failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> touchSessionPresence(String pairId, String uid) =>
+      _upsertByFilter('live_session_presence',
+          'pair_id = {:p} && user_uid = {:u}', {'p': pairId, 'u': uid}, {
+        'pair_id': pairId,
+        'user_uid': uid,
+        'seen_at': DateTime.now().millisecondsSinceEpoch,
+      }, op: 'touchSessionPresence');
+
+  /// Презенс «онлайн» (общий heartbeat, НЕ co-watch): обновить seen_at своего uid.
+  Future<bool> touchPresence(String uid) {
+    if (uid.isEmpty) return Future.value(false);
+    return _upsertByFilter('user_presence', 'user_uid = {:u}', {'u': uid}, {
+      'user_uid': uid,
+      'seen_at': DateTime.now().millisecondsSinceEpoch,
+    }, op: 'touchPresence');
+  }
+
+  /// «Я ушёл»: отметка присутствия сдвигается в прошлое при уходе в фон.
+  ///
+  /// Сервер не шлёт пуш тому, кто прямо сейчас в приложении: сердце партнёра он
+  /// и так видит на экране. Пока отметка гасла сама по истечении окна, сердце,
+  /// прилетевшее сразу после закрытия приложения, не давало уведомления вовсе —
+  /// с этим и пришли обе пары 17.08.2026. Гасим отметку сами, и следующий
+  /// импульс уходит пушем без задержки.
+  Future<bool> clearPresence(String uid) {
+    if (uid.isEmpty) return Future.value(false);
+    return _upsertByFilter('user_presence', 'user_uid = {:u}', {'u': uid}, {
+      'user_uid': uid,
+      'seen_at': 0,
+    }, op: 'clearPresence');
+  }
+
+  Future<bool> removeSessionPresence(String pairId, String uid) async {
+    if (pairId.isEmpty || uid.isEmpty) return false;
+    try {
+      final rec = await _pb.collection('live_session_presence').getFirstListItem(
+          _pb.filter('pair_id = {:p} && user_uid = {:u}',
+              {'p': pairId, 'u': uid}));
+      await _pb.collection('live_session_presence').delete(rec.id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.removeSessionPresence failed: $e');
+      return false;
+    }
+  }
+
+  Future<RecordModel?> sendSessionChat(
+      String pairId, Map<String, dynamic> msg) async {
+    if (pairId.isEmpty) return null;
+    try {
+      return await _pb.collection('live_session_chat').create(body: {
+        'pair_id': pairId,
+        'uid': msg['uid'],
+        'name': msg['name'],
+        'text': msg['text'],
+        'ts': msg['ts'] ?? DateTime.now().millisecondsSinceEpoch,
+        'reply_to_id': msg['replyToId'],
+        'reply_to_name': msg['replyToName'],
+        'reply_to_text': msg['replyToText'],
+      }..removeWhere((k, v) => v == null));
+    } catch (e) {
+      debugPrint('PbData.sendSessionChat failed: $e');
+      return null;
+    }
+  }
+
+  /// Реакция на сообщение session-чата (RMW json reactions). id = id записи.
+  Future<bool> setSessionChatReaction(
+      String messageId, String uid, String? emoji) async {
+    if (messageId.isEmpty || uid.isEmpty) return false;
+    try {
+      final rec = await _pb.collection('live_session_chat').getOne(messageId);
+      final cur = rec.data['reactions'];
+      final r = cur is Map ? Map<String, dynamic>.from(cur) : <String, dynamic>{};
+      if (emoji == null || emoji.isEmpty) {
+        r.remove(uid);
+      } else {
+        r[uid] = emoji;
+      }
+      await _pb
+          .collection('live_session_chat')
+          .update(messageId, body: {'reactions': r});
+      return true;
+    } catch (e) {
+      debugPrint('PbData.setSessionChatReaction failed: $e');
+      return false;
+    }
+  }
+
+  /// Удалить свою точку (явное выключение шеринга).
+  Future<bool> clearLivePoint(String channel, String uid) async {
+    if (channel.isEmpty || uid.isEmpty) return false;
+    try {
+      final rec = await _pb.collection('live_location').getFirstListItem(
+          _pb.filter('channel = {:c} && user_uid = {:u}',
+              {'c': channel, 'u': uid}));
+      await _pb.collection('live_location').delete(rec.id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.clearLivePoint failed: $e');
+      return false;
+    }
+  }
+
+  // ══════════════════════════════════════════════ COMMENTS
+  Future<bool> upsertComment(
+    String groupId,
+    String memoryId,
+    String id,
+    Map<String, dynamic> data,
+  ) async {
+    if (id.isEmpty) return false;
+    return _upsertById('memory_comments', id, {
+      'group_id': groupId,
+      'memory_id': memoryId,
+      'author_uid': data['authorUid'],
+      'author_name': data['authorName'],
+      'author_avatar': data['authorAvatar'],
+      'text': data['text'],
+      'created_at': _iso(data['createdAt']) ?? PairTime.write(DateTime.now()),
+      'tz': data['tz'] ?? PairTime.zoneNow(),
+    }, op: 'upsertComment');
+  }
+
+  /// Создаёт комментарий (PB генерирует id). Возвращает запись или null.
+  Future<RecordModel?> createComment(
+    String groupId,
+    String memoryId,
+    Map<String, dynamic> data,
+  ) async {
+    if (memoryId.isEmpty) return null;
+    try {
+      return await _pb.collection('memory_comments').create(body: {
+        'group_id': groupId,
+        'memory_id': memoryId,
+        'author_uid': data['authorUid'],
+        'author_name': data['authorName'],
+        'author_avatar': data['authorAvatar'],
+        'text': data['text'],
+        'created_at':
+            _iso(data['createdAt']) ?? PairTime.write(DateTime.now()),
+        'tz': data['tz'] ?? PairTime.zoneNow(),
+      });
+    } catch (e) {
+      debugPrint('PbData.createComment failed: $e');
+      return null;
+    }
+  }
+
+  Future<bool> deleteComment(String id) async {
+    if (id.isEmpty) return false;
+    try {
+      // id комментария = id PB-записи (createComment отдаёт rec.id) → удаляем
+      // напрямую, без лишнего getFirstListItem.
+      await _pb.collection('memory_comments').delete(id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteComment($id) failed: $e');
+      return false;
+    }
+  }
+
+  Future<List<RecordModel>> loadComments(String memoryId) async {
+    if (memoryId.isEmpty) return const [];
+    try {
+      return await _pb.collection('memory_comments').getFullList(
+            filter: _pb.filter(
+                'memory_id = {:m} && deleted = false', {'m': memoryId}),
+            sort: 'created_at',
+          );
+    } catch (e) {
+      debugPrint('PbData.loadComments($memoryId) failed: $e');
+      return const [];
+    }
+  }
+
+  // ══════════════════════════════════════════════ WIDGET DATA (составной ключ)
+  /// Тело запроса `widget_data`: только те поля, которые действительно просили
+  /// изменить.
+  ///
+  /// Запись обновляют по одному полю (сменил статус — ушёл статус), и раньше
+  /// json-поля подставлялись значениями по умолчанию: `data` → `{}`, карусель
+  /// «для партнёра» и сетка фото → `[]`, число ячеек → 1. `removeWhere` их не
+  /// снимал — они уже не null, — поэтому любая смена статуса или настроения
+  /// стирала заметку на двоих и наборы фото. На проде это выглядело так:
+  /// 22 578 записей и ни одной с непустой `data`.
+  ///
+  /// Очистка по-прежнему работает — но только явная: переданный пустой список
+  /// или пустая строка доезжают до сервера и стирают поле.
+  static Map<String, dynamic> widgetUpsertBody(
+    String groupId,
+    String uid,
+    Map<String, dynamic> d,
+  ) =>
+      <String, dynamic>{
+        'group_id': groupId,
+        'user_uid': uid,
+        'display_name': d['displayName'],
+        'avatar_url': d['avatarUrl'],
+        'gender': d['gender'],
+        'status': d['status'],
+        'mood_emoji': d['moodEmoji'],
+        'mood_label': d['moodLabel'],
+        'message': d['message'],
+        'music_title': d['musicTitle'],
+        'music_artist': d['musicArtist'],
+        'music_url': d['musicUrl'],
+        'music_cover_url': d['musicCoverUrl'],
+        'photo_url': d['photoUrl'],
+        'photo_for_partner_url': d['photoForPartnerUrl'],
+        'photo_for_partner_urls': _jsonSafe(d['photoForPartnerUrls']),
+        'photo_grid_count': d['photoGridCount'],
+        'photo_grid_urls': _jsonSafe(d['photoGridUrls']),
+        'data': _jsonSafe(d['data']),
+        'updated_at': PairTime.write(DateTime.now()),
+      }..removeWhere((k, v) => v == null);
+
+  Future<bool> upsertWidget(
+    String groupId,
+    String uid,
+    Map<String, dynamic> d,
+  ) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    final body = widgetUpsertBody(groupId, uid, d);
+    return _upsertByFilter(
+      'widget_data',
+      'group_id = {:g} && user_uid = {:u}',
+      {'g': groupId, 'u': uid},
+      body,
+      op: 'upsertWidget',
+    );
+  }
+
+  Future<RecordModel?> loadWidget(String groupId, String uid) async {
+    if (groupId.isEmpty || uid.isEmpty) return null;
+    try {
+      return await _pb.collection('widget_data').getFirstListItem(
+            _pb.filter('group_id = {:g} && user_uid = {:u}',
+                {'g': groupId, 'u': uid}),
+          );
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return null;
+      debugPrint('PbData.loadWidget failed: $e');
+      return null;
+    }
+  }
+
+  /// Данные виджетов обоих участников группы.
+  ///
+  /// Нужны заметке на двоих: она общая, и свежую версию выбираем из записей
+  /// обоих, а не только своей.
+  Future<List<RecordModel>> loadWidgetsForGroup(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('widget_data').getFullList(
+            filter: _pb.filter('group_id = {:g}', {'g': groupId}),
+          );
+    } catch (e) {
+      debugPrint('PbData.loadWidgetsForGroup($groupId) failed: $e');
+      return const [];
+    }
+  }
+
+  // ══════════════════════════════════════════════ CANVAS
+  Future<bool> upsertStroke(
+    String groupId,
+    String canvasId,
+    String id,
+    Map<String, dynamic> data,
+  ) async {
+    if (id.isEmpty) return false;
+    return _upsertById('canvas_strokes', id, {
+      'group_id': groupId,
+      'canvas_id': canvasId,
+      'order_index': (data['orderIndex'] as num?)?.toInt() ?? 0,
+      'data': _jsonSafe(data),
+    }, op: 'upsertStroke');
+  }
+
+  /// Создаёт штрих. [data] — camelCase-карта (`DrawStroke.toFirestore()`);
+  /// вся геометрия в json `data` + индексируемый order_index. Возвращает запись
+  /// или null.
+  ///
+  /// [id] — id записи, посчитанный телефоном ([strokeRecordId]). С ним повтор
+  /// после таймаута или 502 упирается в «уже есть» и считается успехом, а не
+  /// заводит вторую копию мазка (TOG-12). Номер мазка старого вида (`local_…`
+  /// из очереди прежних версий) серверу не отдаём — id тогда выдаёт сервер.
+  Future<RecordModel?> createStroke(
+    String groupId,
+    String canvasId,
+    Map<String, dynamic> data, {
+    String? id,
+  }) async {
+    if (groupId.isEmpty) return null;
+    final recordId = (id != null && isStrokeRecordId(id)) ? id : null;
+    try {
+      return await _pb.collection('canvas_strokes').create(body: {
+        'id': ?recordId,
+        'group_id': groupId,
+        'canvas_id': canvasId,
+        'order_index': (data['orderIndex'] as num?)?.toInt() ?? 0,
+        'data': _jsonSafe(data),
+      });
+    } catch (e) {
+      // Мазок уже лёг с прошлой попытки: ответ потерялся, запись на месте.
+      if (recordId != null && alreadyExists(e)) {
+        return RecordModel({
+          'id': recordId,
+          'collectionName': 'canvas_strokes',
+          'group_id': groupId,
+          'canvas_id': canvasId,
+        });
+      }
+      debugPrint('PbData.createStroke failed: $e');
+      return null;
+    }
+  }
+
+  /// Live-штрих (in-progress) пользователя: upsert по (group,canvas,user), вся
+  /// геометрия в json `data` (`DrawStroke.toLiveMap()`). Замена эфемерного
+  /// Firestore live-дока. Высокочастотно — но на PB записи бесплатны.
+  Future<bool> setLiveStroke(
+    String groupId,
+    String canvasId,
+    String uid,
+    Map<String, dynamic> liveData,
+  ) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    return _upsertByFilter(
+      'canvas_live',
+      'group_id = {:g} && canvas_id = {:c} && user_uid = {:u}',
+      {'g': groupId, 'c': canvasId, 'u': uid},
+      {
+        'group_id': groupId,
+        'canvas_id': canvasId,
+        'user_uid': uid,
+        'data': _jsonSafe(liveData),
+      },
+      op: 'setLiveStroke',
+    );
+  }
+
+  /// Убрать свой live-штрих при отрыве пальца.
+  Future<bool> clearLiveStroke(
+      String groupId, String canvasId, String uid) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    try {
+      final rec = await _pb.collection('canvas_live').getFirstListItem(
+          _pb.filter('group_id = {:g} && canvas_id = {:c} && user_uid = {:u}',
+              {'g': groupId, 'c': canvasId, 'u': uid}));
+      await _pb.collection('canvas_live').delete(rec.id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.clearLiveStroke failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> patchStroke(String id, Map<String, dynamic> updates) async {
+    if (id.isEmpty) return false;
+    // RMW: PB не умеет json-merge на сервере → читаем, мёржим data, пишем.
+    try {
+      final rec = await _pb
+          .collection('canvas_strokes')
+          .getFirstListItem(_pb.filter('id = {:id}', {'id': id}));
+      final cur = rec.data['data'];
+      final merged = cur is Map
+          ? (Map<String, dynamic>.from(cur)..addAll(_jsonSafe(updates) as Map<String, dynamic>))
+          : _jsonSafe(updates);
+      await _pb.collection('canvas_strokes').update(rec.id, body: {'data': merged});
+      return true;
+    } catch (e) {
+      debugPrint('PbData.patchStroke($id) failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> deleteStroke(String id) async {
+    if (id.isEmpty) return false;
+    try {
+      await _pb.collection('canvas_strokes').delete(id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteStroke($id) failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> clearCanvas(String groupId, String canvasId, int version,
+      {int? bgColor}) async {
+    if (groupId.isEmpty) return false;
+    try {
+      final strokes = await _pb.collection('canvas_strokes').getFullList(
+            filter: _pb.filter('group_id = {:g} && canvas_id = {:c}',
+                {'g': groupId, 'c': canvasId}),
+          );
+      for (final s in strokes) {
+        await _pb.collection('canvas_strokes').delete(s.id);
+      }
+      // Чистим и live-курсоры (паритет с Firebase clearDrawingCanvas).
+      final live = await _pb.collection('canvas_live').getFullList(
+            filter: _pb.filter('group_id = {:g} && canvas_id = {:c}',
+                {'g': groupId, 'c': canvasId}),
+          );
+      for (final l in live) {
+        await _pb.collection('canvas_live').delete(l.id);
+      }
+      final body = <String, dynamic>{
+        'group_id': groupId,
+        'canvas_id': canvasId,
+        'clear_version': version,
+        'updated_at': PairTime.write(DateTime.now()),
+      };
+      if (bgColor != null) body['bg_color'] = bgColor;
+      return await _upsertByFilter('canvas_meta',
+          'group_id = {:g} && canvas_id = {:c}', {'g': groupId, 'c': canvasId},
+          body, op: 'clearCanvas');
+    } catch (e) {
+      debugPrint('PbData.clearCanvas($groupId/$canvasId) failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> upsertCanvasMeta(String groupId, String canvasId,
+      {int? bgColor,
+      int? clearVersion,
+      String? coloringId,
+      String? coloringMode,
+      bool? coloringSwap,
+      Map<String, dynamic>? coloringDone,
+      String? coloringOutline}) async {
+    if (groupId.isEmpty) return false;
+    final body = <String, dynamic>{
+      'group_id': groupId,
+      'canvas_id': canvasId,
+      'updated_at': PairTime.write(DateTime.now()),
+    };
+    if (bgColor != null) body['bg_color'] = bgColor;
+    if (clearVersion != null) body['clear_version'] = clearVersion;
+    // Раскраска вдвоём: какая картинка, режим и кто уже нажал «Готово».
+    if (coloringId != null) body['coloring_id'] = coloringId;
+    if (coloringMode != null) body['coloring_mode'] = coloringMode;
+    if (coloringDone != null) body['coloring_done'] = coloringDone;
+    // Контур своей раскраски: у встроенных он в ассетах, свой человек загрузил
+    // со своего телефона — без ссылки партнёру достаётся пустой лист.
+    if (coloringOutline != null) body['coloring_outline'] = coloringOutline;
+    // Половины поменяны местами — общее решение пары, иначе стороны разъедутся.
+    if (coloringSwap != null) body['coloring_swap'] = coloringSwap;
+    return _upsertByFilter('canvas_meta',
+        'group_id = {:g} && canvas_id = {:c}', {'g': groupId, 'c': canvasId},
+        body, op: 'upsertCanvasMeta');
+  }
+
+  Future<bool> upsertCanvasCatalogue(
+      String groupId, String canvasId, Map<String, dynamic> data) async {
+    if (groupId.isEmpty || canvasId.isEmpty) return false;
+    final body = <String, dynamic>{'group_id': groupId, 'canvas_id': canvasId};
+    if (data.containsKey('name')) body['name'] = data['name'];
+    if (data.containsKey('createdAt')) body['created_at'] = data['createdAt'];
+    if (data.containsKey('updatedAt')) body['updated_at'] = data['updatedAt'];
+    if (data.containsKey('createdBy')) body['created_by'] = data['createdBy'];
+    if (data.containsKey('pixelW')) body['pixel_w'] = data['pixelW'];
+    if (data.containsKey('pixelH')) body['pixel_h'] = data['pixelH'];
+    if (data.containsKey('sheetRatio')) body['sheet_ratio'] = data['sheetRatio'];
+    return _upsertByFilter('canvas_catalogue',
+        'group_id = {:g} && canvas_id = {:c}', {'g': groupId, 'c': canvasId},
+        body, op: 'upsertCanvasCatalogue');
+  }
+
+  Future<bool> deleteCanvasCatalogue(String groupId, String canvasId) async {
+    if (groupId.isEmpty || canvasId.isEmpty) return false;
+    try {
+      final rec = await _pb.collection('canvas_catalogue').getFirstListItem(
+          _pb.filter('group_id = {:g} && canvas_id = {:c}',
+              {'g': groupId, 'c': canvasId}));
+      await _pb.collection('canvas_catalogue').delete(rec.id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteCanvasCatalogue failed: $e');
+      return false;
+    }
+  }
+
+  Future<List<RecordModel>> loadStrokes(String groupId, String canvasId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('canvas_strokes').getFullList(
+            filter: _pb.filter('group_id = {:g} && canvas_id = {:c}',
+                {'g': groupId, 'c': canvasId}),
+            sort: 'order_index',
+          );
+    } catch (e) {
+      debugPrint('PbData.loadStrokes failed: $e');
+      return const [];
+    }
+  }
+
+  /// Начало холста — для плитки в галерее.
+  ///
+  /// `loadStrokes` тянет холст целиком, а у пары бывают рисунки на сотню тысяч
+  /// штрихов: ради миниатюры размером с ноготь это лишнее. Берём первую
+  /// страницу по порядку рисования.
+  Future<List<RecordModel>> loadStrokesPage(
+    String groupId,
+    String canvasId, {
+    int limit = 400,
+  }) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      final page = await _pb.collection('canvas_strokes').getList(
+            page: 1,
+            perPage: limit,
+            filter: _pb.filter('group_id = {:g} && canvas_id = {:c}',
+                {'g': groupId, 'c': canvasId}),
+            sort: 'order_index',
+          );
+      return page.items;
+    } catch (e) {
+      debugPrint('PbData.loadStrokesPage failed: $e');
+      return const [];
+    }
+  }
+
+  /// Мета холстов пары, свежие первыми: по ним ищется уже начатая раскраска
+  /// той же картинки. Фильтр только по группе — hotpath фильтрует
+  /// `canvas_meta` по `group_id`/`canvas_id`, а у самой людной пары на проде
+  /// 54 холста, так что одна страница в сотню покрывает всех.
+  Future<List<Map<String, dynamic>>> loadCanvasMetaRows(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      final page = await _pb.collection('canvas_meta').getList(
+            page: 1,
+            perPage: 100,
+            filter: _pb.filter('group_id = {:g}', {'g': groupId}),
+            sort: '-updated_at',
+          );
+      return page.items.map((r) => r.data).toList();
+    } catch (e) {
+      debugPrint('PbData.loadCanvasMetaRows failed: $e');
+      return const [];
+    }
+  }
+
+  Future<List<RecordModel>> loadCanvasCatalogue(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('canvas_catalogue').getFullList(
+          filter: _pb.filter('group_id = {:g}', {'g': groupId}));
+    } catch (e) {
+      debugPrint('PbData.loadCanvasCatalogue failed: $e');
+      return const [];
+    }
+  }
+
+  // ══════════════════════════════════════════════ MASCOTS (составной group+mascot_id)
+  Map<String, dynamic> _mascotBody(String groupId, Map<String, dynamic> m) => {
+        'group_id': groupId,
+        'mascot_id': m['id'], // SQL-поле id маскота → колонка mascot_id в PB
+        'name': m['name'],
+        'image_url': m['imageUrl'],
+        'default_asset': m['defaultAsset'],
+        'created_by': m['createdBy'],
+        'created_at': _iso(m['createdAt']),
+        'is_default': m['isDefault'] ?? false,
+      }..removeWhere((k, v) => v == null);
+
+  Future<bool> upsertMascot(String groupId, Map<String, dynamic> m) async {
+    final mid = (m['id'] ?? '').toString();
+    if (groupId.isEmpty || mid.isEmpty) return false;
+    return _upsertByFilter('mascots',
+        'group_id = {:g} && mascot_id = {:m}', {'g': groupId, 'm': mid},
+        _mascotBody(groupId, m), op: 'upsertMascot');
+  }
+
+  Future<bool> upsertMascotsBatch(
+      String groupId, List<Map<String, dynamic>> mascots) async {
+    if (groupId.isEmpty || mascots.isEmpty) return false;
+    var ok = true;
+    for (final m in mascots) {
+      ok = await upsertMascot(groupId, m) && ok;
+    }
+    return ok;
+  }
+
+  Future<bool> deleteMascot(String groupId, String mascotId) async {
+    if (groupId.isEmpty || mascotId.isEmpty) return false;
+    try {
+      final rec = await _pb.collection('mascots').getFirstListItem(_pb.filter(
+          'group_id = {:g} && mascot_id = {:m}', {'g': groupId, 'm': mascotId}));
+      await _pb.collection('mascots').delete(rec.id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbData.deleteMascot failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> updateMascotFields(
+      String groupId, String mascotId, Map<String, dynamic> cols) async {
+    if (groupId.isEmpty || mascotId.isEmpty || cols.isEmpty) return false;
+    try {
+      final rec = await _pb.collection('mascots').getFirstListItem(_pb.filter(
+          'group_id = {:g} && mascot_id = {:m}', {'g': groupId, 'm': mascotId}));
+      await _pb.collection('mascots').update(rec.id, body: cols);
+      return true;
+    } catch (e) {
+      debugPrint('PbData.updateMascotFields failed: $e');
+      return false;
+    }
+  }
+
+  Future<List<RecordModel>> loadMascots(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      return await _pb.collection('mascots').getFullList(
+          filter: _pb.filter('group_id = {:g}', {'g': groupId}));
+    } catch (e) {
+      debugPrint('PbData.loadMascots failed: $e');
+      return const [];
+    }
+  }
+
+  // ── Состояние маскота — колонки group-дока (active/position/streak) ─────────
+  /// Активный маскот пары. `null` → очистка (пишем пустую строку: text-колонка
+  /// PB не nullable; [GroupMascotState.fromPb] коэрсит `''`→null).
+  Future<bool> setActiveMascot(String groupId, String? mascotId) =>
+      updateGroupFields(groupId, {'active_mascot_id': mascotId ?? ''});
+
+  /// Позиция/масштаб плавающего маскота на экране.
+  Future<bool> updateMascotPosition(
+    String groupId,
+    double x,
+    double y,
+    double scale,
+  ) =>
+      updateGroupFields(groupId, {
+        'mascot_position_x': x,
+        'mascot_position_y': y,
+        'mascot_scale': scale,
+      });
+
+  /// Отметить, что [uid] зашёл сегодня → ведение «огонька» пары. Порт логики
+  /// Firebase.recordGroupActivity: серия растёт ТОЛЬКО когда за день зашли ОБА
+  /// разных участника (первый фиксируется в streak_pending_*, второй поднимает
+  /// streak_days). Retry (до 3 попыток) закрывает транзиентные ошибки, но НЕ
+  /// lost-update: если оба заходят одновременно, оба читают пустой
+  /// streak_pending_*, оба пишут себя — вторая запись успешна и перетирает первую,
+  /// день серии может потеряться (DATA-9). Полный фикс — серверная транзакция
+  /// (groups.pb.js, TODO). Точная одновременность первого захода обоих — редкость.
+  Future<void> recordGroupActivity(String groupId, String uid) async {
+    if (groupId.isEmpty || uid.isEmpty) return;
+    final now = DateTime.now();
+    final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-'
+        '${now.day.toString().padLeft(2, '0')}';
+    // DATA-9: атомарный серверный учёт стрика; today = локальная дата клиента
+    // (сохраняет семантику). При недоступности роута — локальный RMW.
+    final r = await _callGroupRoute('record-activity',
+        {'groupId': groupId, 'uid': uid, 'today': today});
+    if (r == _GroupRouteResult.ok) return;
+    // Под нагрузкой не долбим локальным RMW (стрик до-учтётся при следующем заходе).
+    if (r == _GroupRouteResult.backpressure) return;
+    return _recordGroupActivityLocal(groupId, uid);
+  }
+
+  /// Вернуть паре сгоревшую серию (ролик уже досмотрен). Идёт адресом
+  /// отметки дня с флагом `restore`: отдельного маршрута на точке входа нет.
+  /// Отдаёт новые поля записи пары для кэша или `null`, если сервер отказал
+  /// (возвращать нечего, срок вышел, нет связи).
+  Future<Map<String, dynamic>?> restoreGroupStreak(String groupId) async {
+    if (groupId.isEmpty) return null;
+    final now = DateTime.now();
+    final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-'
+        '${now.day.toString().padLeft(2, '0')}';
+    try {
+      final res = await _pb.send('/api/group/record-activity',
+          method: 'POST',
+          body: {'groupId': groupId, 'today': today, 'restore': true}).timeout(
+        const Duration(seconds: 12),
+      );
+      if (res is Map && res['ok'] == true) {
+        return {
+          'mascot_streaks': res['mascot_streaks'],
+          'streak_days': res['streak_days'],
+          'streak_last_opened_date': res['streak_last_opened_date'],
+        };
+      }
+    } catch (e) {
+      debugPrint('PbData.restoreGroupStreak failed: $e');
+    }
+    return null;
+  }
+
+  Future<void> _recordGroupActivityLocal(String groupId, String uid) async {
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        final now = DateTime.now();
+        final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-'
+            '${now.day.toString().padLeft(2, '0')}';
+        final rec = await _pb
+            .collection('groups')
+            .getFirstListItem(_pb.filter('id = {:id}', {'id': groupId}));
+        final d = rec.data;
+        String? nz(dynamic v) {
+          final s = v?.toString();
+          return (s == null || s.isEmpty) ? null : s;
+        }
+
+        final last = nz(d['streak_last_opened_date']);
+        if (last == today) return; // уже засчитано сегодня (оба заходили)
+
+        bool bothPresent() {
+          final pUid = nz(d['streak_pending_uid']);
+          return nz(d['streak_pending_date']) == today &&
+              pUid != null &&
+              pUid != uid;
+        }
+
+        if (bothPresent()) {
+          final todayDate = DateTime(now.year, now.month, now.day);
+          int daysSince(String? iso) {
+            final dt = (iso != null && iso.isNotEmpty)
+                ? DateTime.tryParse(iso)
+                : null;
+            return dt != null
+                ? todayDate
+                    .difference(DateTime(dt.year, dt.month, dt.day))
+                    .inDays
+                : 999;
+          }
+
+          // Здесь общим днём считается только точное совпадение дат: пару,
+          // где партнёр отметился уже после полуночи, запасной путь оставит
+          // ждать, а день ей засчитает сервер (там это идёт в транзакции и
+          // серия считается по дате первого — см. _record_activity_pg).
+          // Обнулить серию, как было до 20.09.2026, он при этом не может.
+          final currentStreak = (d['streak_days'] as num?)?.toInt() ?? 0;
+          final newStreak = daysSince(last) == 1 ? currentStreak + 1 : 1;
+
+          // PER-MASCOT серия активного маскота (его собственная дата). Пропуск → 1.
+          final activeMascotId = nz(d['active_mascot_id']);
+          final raw = d['mascot_streaks'];
+          final streaks =
+              raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+          int mStreak = 0;
+          if (activeMascotId != null) {
+            final prev = streaks[activeMascotId];
+            final prevS =
+                (prev is Map ? (prev['s'] as num?)?.toInt() : 0) ?? 0;
+            final prevD = prev is Map ? prev['d']?.toString() : null;
+            mStreak = daysSince(prevD) == 1 ? prevS + 1 : 1;
+            streaks[activeMascotId] = {'s': mStreak, 'd': today};
+          }
+
+          await _pb.collection('groups').update(rec.id, body: {
+            'streak_days': newStreak,
+            'streak_last_opened_date': today,
+            'streak_pending_date': '',
+            'streak_pending_uid': '',
+            if (activeMascotId != null) 'mascot_streaks': streaks,
+          });
+          if (activeMascotId != null) {
+            try {
+              final mascot = await _pb.collection('mascots').getFirstListItem(
+                  _pb.filter('group_id = {:g} && mascot_id = {:m}',
+                      {'g': groupId, 'm': activeMascotId}));
+              final record = (mascot.data['record_streak'] as num?)?.toInt() ?? 0;
+              if (mStreak > record) {
+                await _pb
+                    .collection('mascots')
+                    .update(mascot.id, body: {'record_streak': mStreak});
+              }
+            } catch (_) {}
+          }
+          return;
+        }
+
+        final pendingDate = nz(d['streak_pending_date']);
+        final pendingUid = nz(d['streak_pending_uid']);
+        // Ожидание партнёра на соседний день не затираем (TOG-26): сервер
+        // засчитает день и тогда, когда второй пришёл назавтра по своим часам,
+        // а здесь такой зачёт без транзакции не делается. Затёртое ожидание
+        // стоило паре дня и серии.
+        final partnerWaits = pendingUid != null &&
+            pendingUid != uid &&
+            (pendingDate == dayKey(calendarDay(now, -1)) ||
+                pendingDate == dayKey(calendarDay(now, 1)));
+        if (partnerWaits) return;
+        if (pendingDate != today || pendingUid == null) {
+          await _pb.collection('groups').update(rec.id, body: {
+            'streak_pending_date': today,
+            'streak_pending_uid': uid,
+          });
+        }
+        return; // успех — выходим
+      } catch (e) {
+        if (attempt == maxAttempts - 1) {
+          debugPrint('PbData.recordGroupActivity failed after ${attempt + 1} attempts: $e');
+          return;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 50 * (attempt + 1)));
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════ MISS YOU (составной)
+  /// Инкремент «скучаю» + тип вайба. При гонке (двойное нажатие) — retry с
+  /// перечтением (до 3 попыток), чтобы счётчик рос корректно.
+  Future<bool> incrementMissYou(
+    String groupId,
+    String uid, {
+    String vibe = 'miss_you',
+    String? text,
+    int count = 1,
+    String? replyTo,
+  }) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    // DATA-8: атомарный серверный инкремент; при недоступности — локальный RMW.
+    // weekday шлём свой: сервер живёт в UTC, и вечерние нажатия у нас попадали
+    // бы в следующий день недели.
+    final r = await _callGroupRoute('miss-you', {
+      'groupId': groupId,
+      'uid': uid,
+      'vibe': vibe,
+      'text': text ?? '',
+      'weekday': DateTime.now().weekday, // 1 = понедельник
+      // Частые нажатия приезжают пачкой: по одному запросу на тап человек
+      // упирался в ограничитель, и половина «скучаю» пропадала.
+      'count': count,
+      // Ответ на конкретный импульс из истории дня.
+      if (replyTo != null && replyTo.isNotEmpty) 'replyTo': replyTo,
+    });
+    if (r == _GroupRouteResult.ok) return true;
+    if (r == _GroupRouteResult.backpressure) return false;
+    return _incrementMissYouLocal(groupId, uid, vibe: vibe, text: text);
+  }
+
+  /// История импульсов пары с [sinceMs] (сервер отдаёт не старше двух суток).
+  /// Тот же маршрут, что и импульс, с флагом `history`: новый путь пришлось бы
+  /// заводить в Caddy на обоих серверах. null — сервер не ответил или старый.
+  Future<List<MissYouEvent>?> missYouHistory(String groupId, int sinceMs) async {
+    if (groupId.isEmpty) return null;
+    try {
+      final res = await _pb
+          .send('/api/group/miss-you', method: 'POST', body: {'groupId': groupId, 'history': true, 'since': sinceMs})
+          .timeout(const Duration(seconds: 12));
+      if (res is Map && res['ok'] == true && res['events'] is List) {
+        return MissYouEvent.parseList(res['events']);
+      }
+    } catch (e) {
+      debugPrint('PbData.missYouHistory: $e');
+    }
+    return null;
+  }
+
+  Future<bool> _incrementMissYouLocal(
+    String groupId,
+    String uid, {
+    String vibe = 'miss_you',
+    String? text,
+  }) async {
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        final f = _pb.filter('group_id = {:g} && user_uid = {:u}',
+            {'g': groupId, 'u': uid});
+        final extra = {'last_vibe': vibe, 'last_vibe_text': text ?? ''};
+        try {
+          final rec = await _pb.collection('miss_you').getFirstListItem(f);
+          final cur = (rec.data['count'] as num?)?.toInt() ?? 0;
+          await _pb.collection('miss_you').update(rec.id, body: {
+            'count': cur + 1,
+            'updated_at': PairTime.write(DateTime.now()),
+            ...extra,
+          });
+        } on ClientException catch (e) {
+          if (e.statusCode != 404) rethrow;
+          await _pb.collection('miss_you').create(body: {
+            'group_id': groupId,
+            'user_uid': uid,
+            'count': 1,
+            'updated_at': PairTime.write(DateTime.now()),
+            ...extra,
+          });
+        }
+        return true;
+      } catch (e) {
+        if (attempt == maxAttempts - 1) {
+          debugPrint('PbData.incrementMissYou failed after ${attempt + 1} attempts: $e');
+          return false;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 50 * (attempt + 1)));
+      }
+    }
+    return false;
+  }
+
+  Future<bool> setMissYouCount(String groupId, String uid, int count) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    return _upsertByFilter('miss_you',
+        'group_id = {:g} && user_uid = {:u}', {'g': groupId, 'u': uid}, {
+      'group_id': groupId,
+      'user_uid': uid,
+      'count': count,
+      'updated_at': PairTime.write(DateTime.now()),
+    }, op: 'setMissYouCount');
+  }
+
+  /// Записи `miss_you` пары целиком, разово. null — сервер не ответил.
+  Future<List<Map<String, dynamic>>?> getMissYouRows(String groupId) async {
+    if (groupId.isEmpty) return null;
+    try {
+      final rows = await _pb
+          .collection('miss_you')
+          .getFullList(filter: _pb.filter('group_id = {:g}', {'g': groupId}))
+          .timeout(const Duration(seconds: 12));
+      return [for (final r in rows) r.data];
+    } catch (e) {
+      debugPrint('PbData.getMissYouRows failed: $e');
+      return null;
+    }
+  }
+
+  Future<Map<String, int>> getMissYouCounts(String groupId) async {
+    if (groupId.isEmpty) return const {};
+    try {
+      final rows = await _pb.collection('miss_you').getFullList(
+          filter: _pb.filter('group_id = {:g}', {'g': groupId}));
+      return {
+        for (final r in rows)
+          (r.data['user_uid'] ?? '').toString():
+              (r.data['count'] as num?)?.toInt() ?? 0,
+      };
+    } catch (e) {
+      debugPrint('PbData.getMissYouCounts failed: $e');
+      return const {};
+    }
+  }
+
+  // ══════════════════════════════════════════════ CHAT
+  Future<bool> chatSend(String groupId, String id, Map<String, dynamic> msg) async {
+    if (id.isEmpty) return false;
+    if (await chatSendRecord(groupId, id, msg) != null) return true;
+    // Повтор из очереди или сбой сети: дальше прежним, идемпотентным путём
+    // (update → 404 → create). Записи оттуда не достать, и это не беда —
+    // время в кэше поправит следующая загрузка списка.
+    return _upsertById('chat_messages', id, _withSentAt(chatBody(groupId, msg)), op: 'chatSend');
+  }
+
+  /// Тело сообщения с часами телефона в момент отправки (`sent_at`). Сервер
+  /// вычитает их из своих и узнаёт сдвиг часов телефона, а по нему — время
+  /// написания. Без этого сообщение из офлайна вставало на время доставки:
+  /// «окей», написанное в 11:27 и довезённое в 13:12, встало ответом на другое
+  /// (обращение 409, 21.10.2026). Колонки под `sent_at` нет, сервер её не хранит.
+  Map<String, dynamic> _withSentAt(Map<String, dynamic> body) =>
+      {...body, 'sent_at': DateTime.now().millisecondsSinceEpoch};
+
+  /// Создаёт сообщение и возвращает его таким, каким сохранил сервер. null —
+  /// создать не вышло (запись уже есть, сеть молчит).
+  ///
+  /// Ответ нужен из-за времени: порядок в чате держится на `ts`, а ставит его
+  /// телефон отправителя, и при расхождении часов больше двух минут сервер
+  /// пишет своё (`время_сообщения` в hotpath.py). Пока ответ выбрасывался,
+  /// у автора в кэше оставалось его собственное, кривое: сообщения партнёра
+  /// вставали выше его own и «после перезагрузки приложения встают на место»
+  /// (обращение №133, 06.09.2026). Живая дельта этого не чинит — поток
+  /// отбрасывает события про записи, которые ещё числятся в очереди.
+  Future<RecordModel?> chatSendRecord(
+      String groupId, String id, Map<String, dynamic> msg) async {
+    if (id.isEmpty) return null;
+    try {
+      final rec = await _pb
+          .collection('chat_messages')
+          .create(body: _withSentAt({'id': id, ...chatBody(groupId, msg)}))
+          .timeout(const Duration(seconds: 15));
+      await LocalStore.instance.upsert('chat_messages', rec);
+      return rec;
+    } catch (e) {
+      if (!alreadyExists(e)) {
+        debugPrint('PbData.chatSend create(chat_messages/$id) failed: $e');
+      }
+      return null;
+    }
+  }
+
+  /// Тело сообщения в колонках PocketBase.
+  Map<String, dynamic> chatBody(String groupId, Map<String, dynamic> msg) {
+    final body = <String, dynamic>{
+      'group_id': groupId,
+      'user_uid': msg['uid'],
+      'user_name': msg['name'],
+      'text': msg['text'],
+      'ts': msg['ts'],
+      'pin_id': msg['pinId'],
+      'pin_title': msg['pinTitle'],
+      'pin_thumb': msg['pinThumb'],
+      'reply_to_id': msg['replyToId'],
+      'reply_to_name': msg['replyToName'],
+      'reply_to_text': msg['replyToText'],
+      'face': msg['face'],
+      'color': msg['color'],
+      'text_color': msg['textColor'],
+      'face_x': msg['faceX'],
+      'face_y': msg['faceY'],
+      'voice_url': msg['voiceUrl'],
+      'voice_ms': msg['voiceMs'],
+      'voice_peaks': msg['voicePeaks'],
+      'note_url': msg['noteUrl'],
+      'note_ms': msg['noteMs'],
+      'note_shape': msg['noteShape'],
+      'note_thumb': msg['noteThumb'],
+      'deliver_at': msg['deliverAt'],
+      'call_ms': msg['callMs'],
+    }..removeWhere((k, v) => v == null);
+    return body;
+  }
+
+  /// Создаёт сообщение (PB генерирует id, как [createMemory]). [msg] —
+  /// camelCase-карта (uid/name/text/ts/pin*/reply*/face/color/faceX/faceY).
+  /// Возвращает запись или null. ts — клиентский epoch-ms (PB не пишет
+  /// server-time в number-поле; для пары этого достаточно, как и в Supabase).
+  Future<RecordModel?> createMessage(
+    String groupId,
+    Map<String, dynamic> msg,
+  ) async {
+    if (groupId.isEmpty) return null;
+    try {
+      final body = <String, dynamic>{
+        'group_id': groupId,
+        'user_uid': msg['uid'],
+        'user_name': msg['name'],
+        'text': msg['text'],
+        'ts': msg['ts'],
+        'pin_id': msg['pinId'],
+        'pin_title': msg['pinTitle'],
+        'pin_thumb': msg['pinThumb'],
+        'reply_to_id': msg['replyToId'],
+        'reply_to_name': msg['replyToName'],
+        'reply_to_text': msg['replyToText'],
+        'face': msg['face'],
+        'color': msg['color'],
+        'text_color': msg['textColor'],
+        'face_x': msg['faceX'],
+        'face_y': msg['faceY'],
+      }..removeWhere((k, v) => v == null);
+      return await _pb.collection('chat_messages').create(body: body);
+    } catch (e) {
+      debugPrint('PbData.createMessage failed: $e');
+      return null;
+    }
+  }
+
+  /// Правка отправленного сообщения. В правке только изменённые поля, и
+  /// создать по ним сообщение нельзя: сервер отвечает 400, а очередь крутила
+  /// такую правку без конца (обращение 336). Сообщения на сервере нет —
+  /// отвечаем [missingIsDone].
+  Future<bool> chatUpdate(
+    String id,
+    Map<String, dynamic> fields, {
+    bool missingIsDone = true,
+  }) async {
+    if (id.isEmpty) return false;
+    return _upsertById('chat_messages', id, Map.of(fields),
+        op: 'chatUpdate', ifMissing: missingIsDone);
+  }
+
+  Future<bool> chatRead(String groupId, String uid, int ts) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    return _upsertByFilter('chat_reads',
+        'group_id = {:g} && user_uid = {:u}', {'g': groupId, 'u': uid}, {
+      'group_id': groupId,
+      'user_uid': uid,
+      'last_read_ts': ts,
+      'updated_at': PairTime.write(DateTime.now()),
+    }, op: 'chatRead');
+  }
+
+  /// Маркер «печатает…»: upsert по (group,uid). [typingAt] — epoch-ms текущего
+  /// heartbeat'а либо 0, когда перестал печатать (партнёр считает по свежести).
+  /// Замена RTDB typing с onDisconnect — маркер протухает по TTL (см. схему).
+  Future<bool> setTyping(String groupId, String uid, int typingAt) async {
+    if (groupId.isEmpty || uid.isEmpty) return false;
+    return _upsertByFilter('chat_typing',
+        'group_id = {:g} && user_uid = {:u}', {'g': groupId, 'u': uid}, {
+      'group_id': groupId,
+      'user_uid': uid,
+      'typing_at': typingAt,
+    }, op: 'setTyping');
+  }
+
+  /// Ставит/снимает реакцию uid на сообщение (RMW по json-полю reactions).
+  /// Сообщения на сервере нет — отвечаем [missingIsDone], как [chatUpdate].
+  Future<bool> setChatReaction(
+    String id,
+    String uid,
+    String? emoji, {
+    bool missingIsDone = true,
+  }) async {
+    if (id.isEmpty || uid.isEmpty) return false;
+    try {
+      final rec = await _pb
+          .collection('chat_messages')
+          .getFirstListItem(_pb.filter('id = {:id}', {'id': id}));
+      final cur = rec.data['reactions'];
+      final r = cur is Map ? Map<String, dynamic>.from(cur) : <String, dynamic>{};
+      if (emoji == null || emoji.isEmpty) {
+        r.remove(uid);
+      } else {
+        r[uid] = emoji;
+      }
+      await _pb.collection('chat_messages').update(rec.id, body: {'reactions': r});
+      return true;
+    } on ClientException catch (e) {
+      if (e.statusCode == 404) {
+        debugPrint('PbData.setChatReaction($id): сообщения нет на сервере');
+        return missingIsDone;
+      }
+      debugPrint('PbData.setChatReaction failed: $e');
+      return false;
+    } catch (e) {
+      debugPrint('PbData.setChatReaction failed: $e');
+      return false;
+    }
+  }
+
+  /// Поиск по переписке: [filter] собирает `chatSearchFilter`. null — не
+  /// ответил сервер (экран скажет «нет связи», а не «ничего не нашлось»).
+  Future<List<RecordModel>?> searchChat(String filter, {int limit = 40}) async {
+    try {
+      final res = await _pb.collection('chat_messages').getList(
+            perPage: limit,
+            filter: filter,
+            sort: '-ts',
+            skipTotal: true,
+          );
+      return res.items;
+    } catch (e) {
+      debugPrint('PbData.searchChat failed: $e');
+      return null;
+    }
+  }
+
+  /// Сколько сообщений пары не старше [ts] — столько надо подгрузить в ленту,
+  /// чтобы найденное старое сообщение в неё попало.
+  Future<int?> countChatSince(String groupId, int ts) async {
+    if (groupId.isEmpty) return null;
+    try {
+      final res = await _pb.collection('chat_messages').getList(
+            perPage: 1,
+            filter: _pb.filter('group_id = {:g} && deleted != true && ts >= {:t}',
+                {'g': groupId, 't': ts}),
+          );
+      return res.totalItems;
+    } catch (e) {
+      debugPrint('PbData.countChatSince failed: $e');
+      return null;
+    }
+  }
+
+  /// Последние [limit] сообщений (новые сверху; разверни на стороне UI).
+  Future<List<RecordModel>> loadMessages(String groupId, {int limit = 100}) async {
+    if (groupId.isEmpty) return const [];
+    try {
+      final res = await _pb.collection('chat_messages').getList(
+            perPage: limit,
+            filter: _pb.filter('group_id = {:g} && deleted != true', {'g': groupId}),
+            sort: '-ts',
+          );
+      return res.items;
+    } catch (e) {
+      debugPrint('PbData.loadMessages failed: $e');
+      return const [];
+    }
+  }
+
+  Future<Map<String, int>> loadChatReads(String groupId) async {
+    if (groupId.isEmpty) return const {};
+    try {
+      final rows = await _pb.collection('chat_reads').getFullList(
+          filter: _pb.filter('group_id = {:g}', {'g': groupId}));
+      return {
+        for (final r in rows)
+          (r.data['user_uid'] ?? '').toString():
+              (r.data['last_read_ts'] as num?)?.toInt() ?? 0,
+      };
+    } catch (e) {
+      debugPrint('PbData.loadChatReads failed: $e');
+      return const {};
+    }
+  }
+
+  // ══════════════════════════════════════════════ USER PROFILE / CATALOG
+  /// Профиль юзера = запись users по id (= uid). Возвращает raw-данные записи.
+  Future<RecordModel?> loadUserProfile(String uid) async {
+    if (uid.isEmpty) return null;
+    try {
+      return await _pb.collection('users').getOne(uid);
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return null;
+      debugPrint('PbData.loadUserProfile($uid) failed: $e');
+      return null;
+    }
+  }
+
+  /// Публичная карточка человека из своей пары.
+  ///
+  /// Читать чужую запись `users` нельзя: правило коллекции пускает только к
+  /// себе (`id = @request.auth.id`), и `getOne(partnerUid)` всегда отвечал 404.
+  /// Из-за этого баннер партнёра не появлялся ни у кого, хотя его поставили
+  /// 2372 человека, и значок партнёра тоже оставался пустым. Отдаёт роут
+  /// `/api/user/card` (`pb_hooks/user_card.pb.js`) — только те поля, которые и
+  /// так видно на экране пары.
+  Future<Map<String, dynamic>?> loadPartnerCard(String uid) async {
+    if (uid.isEmpty) return null;
+    try {
+      final res = await _pb
+          .send('/api/user/card', method: 'GET', query: {'uid': uid})
+          .timeout(const Duration(seconds: 10));
+      if (res is! Map || res['ok'] != true) return null;
+      // Рамку аватарки знает весь экран, а не только тот, кто спросил карточку.
+      AvatarFrames.instance.put(uid, res['frame']);
+      return {
+        'displayName': res['display_name'],
+        'avatarUrl': res['avatar_url'],
+        'bannerUrl': res['banner_url'],
+        // GIF в баннере шевелится, пока у владельца открыт Togetherly+.
+        'bannerLive': res['banner_live'] == true,
+        'badge': res['badge'],
+        'frame': res['frame'],
+        'gender': res['gender'],
+        'birthDate': res['birth_date'],
+        'mascotSleep': res['mascot_sleep'],
+        'grantedBadges': res['granted_badges'],
+        // Часы в приложении — звание на странице партнёра.
+        'appSeconds': res['app_seconds'],
+      };
+    } catch (e) {
+      debugPrint('PbData.loadPartnerCard($uid) failed: $e');
+      return null;
+    }
+  }
+
+  /// Профиль users как camelCase-карта (зеркало прежнего Firestore-формата) —
+  /// чтобы UserData._syncFromFirestore/refreshCoinsFromServer читали без правок.
+  /// json-поля Dart SDK уже отдаёт списками; birth_date — ISO-строка.
+  ///
+  /// Чужой uid сюда передавать бесполезно — правила отдадут 404. Для партнёра
+  /// есть [loadPartnerCard].
+  Future<Map<String, dynamic>?> loadUserProfileMap(String uid) async {
+    final rec = await loadUserProfile(uid);
+    if (rec == null) return null;
+    final d = rec.data;
+    return {
+      'displayName': d['display_name'],
+      'email': d['email'],
+      'avatarUrl': d['avatar_url'],
+      'bannerUrl': d['banner_url'],
+      'gender': d['gender'],
+      'badge': d['badge'],
+      'frame': d['frame'],
+      'coins': d['coins'],
+      'ownedThemes': d['owned_themes'],
+      'ownedIcons': d['owned_icons'],
+      'ownedFeatures': d['owned_features'],
+      'grantedBadges': d['granted_badges'],
+      'devCoinsGranted': d['dev_coins_granted'],
+      'adRewardsToday': d['ad_rewards_today'],
+      'adRewardsDate': d['ad_rewards_date'],
+      'adGrants': d['ad_grants'],
+      // Серверные таймстампы кулдаунов (epoch-ms). Нужны клиенту, чтобы
+      // восстановить статус «выполнено» для ежедневного бонуса/воспоминания
+      // между сессиями — иначе ✓ держится только на сессионном флаге и
+      // задание показывается невыполненным, хотя коин за период уже получен.
+      'lastDailyBonusMs': d['last_daily_bonus_ms'],
+      'lastMemoryRewardMs': d['last_memory_reward_ms'],
+      'birthDate': d['birth_date'],
+      // Когда каждый маскот уходит в ночную сцену. Поле правит сам человек,
+      // разбирает его MascotSleep — оно бывает и картой, и строкой.
+      'mascotSleep': d['mascot_sleep'],
+      // Свои темы Togetherly+ (до пяти цветов), см. models/custom_theme.dart
+      'customThemes': d['custom_themes'],
+      'missYouWishes': d['miss_you_wishes'],
+      // Когда заведён аккаунт: от неё зависят сезонные темы («Хэллоуин»
+      // остаётся у тех, кто пришёл до конца сезона).
+      'created': d['created'],
+    };
+  }
+
+  /// Пропагировать значение в map-поле всех групп пользователя (member_names/
+  /// member_avatars[uid]=value) — чтобы партнёры увидели свежее имя/аватар.
+  Future<void> updateMemberFieldInGroups(
+      String uid, String col, dynamic value) async {
+    if (uid.isEmpty) return;
+    try {
+      final groups = await _pb.collection('groups').getFullList(
+            filter: _pb.filter(
+                'members ~ {:u} && disbanded = false', {'u': uid}),
+          );
+      for (final g in groups) {
+        await _patchGroupMapField(g.id, col, uid, value);
+      }
+    } catch (e) {
+      debugPrint('PbData.updateMemberFieldInGroups($col) failed: $e');
+    }
+  }
+
+  /// Обновляет профильные поля users (camelCase→snake_case). id=uid должен
+  /// существовать (создаётся при регистрации/импорте, не здесь).
+  Future<bool> updateUserProfile(String uid, Map<String, dynamic> data) async {
+    if (uid.isEmpty) return false;
+    final row = userProfileRow(data);
+    if (row.isEmpty) return true;
+    row['updated_at'] = PairTime.write(DateTime.now());
+    // Пользователя без пароля не создать: на 404 (аккаунт удалён, а сессия на
+    // телефоне осталась) правка просто не удаётся. Общий путь «нет записи —
+    // создать» слал сюда 150–180 заведомых отказов в сутки.
+    return _upsertById('users', uid, row,
+        op: 'updateUserProfile', ifMissing: false);
+  }
+
+  /// Тело запроса профиля: camelCase-ключ → колонка. Вынесено из
+  /// [updateUserProfile], чтобы формат каждого поля можно было проверить
+  /// тестом, не поднимая сеть.
+  @visibleForTesting
+  static Map<String, dynamic> userProfileRow(Map<String, dynamic> data) {
+    final row = <String, dynamic>{};
+    void put(String key, String col,
+        {bool json = false, bool ts = false, bool day = false}) {
+      if (!data.containsKey(key)) return;
+      final v = data[key];
+      row[col] = day
+          ? _calendarDay(v)
+          : ts
+              ? _iso(v)
+              : (json ? _jsonSafe(v) : v);
+    }
+
+    put('displayName', 'display_name');
+    put('avatarUrl', 'avatar_url');
+    put('bannerUrl', 'banner_url');
+    put('gender', 'gender');
+    // Календарной датой, а не моментом времени. Момент писался в UTC, а число
+    // читалось из строки как есть: у родившихся ночью день уезжал на вчера.
+    // Письмо 23 августа 2026 — «поставила 2 октября 02:45, показывает
+    // 1 октября 23:45, сколько раз ни исправляй».
+    put('birthDate', 'birth_date', day: true);
+    // ЭКОНОМИКА НЕ ПИШЕТСЯ КЛИЕНТОМ: coins/owned_themes/owned_icons/
+    // owned_features/granted_badges и кулдауны ведут ТОЛЬКО серверные коин-роуты
+    // (pb_hooks/coins.pb.js через $app.save). Прямой клиентский PATCH этих полей
+    // отвергает pb_hooks/users_guard.pb.js. Клиент их только читает (см. UserData).
+    put('badge', 'badge'); // выбранный к показу значок (косметика, не владение)
+    put('frame', 'frame'); // надетая рамка аватарки, тоже косметика
+    put('pairId', 'pair_id');
+    put('pairIds', 'pair_ids', json: true);
+    put('inviteCode', 'invite_code');
+    put('fcmToken', 'fcm_token');
+    put('fcmTokens', 'fcm_tokens', json: true);
+    put('notifMissYou', 'notif_miss_you');
+    put('notifNewMemory', 'notif_new_memory');
+    put('notifMood', 'notif_mood');
+    put('notifChat', 'notif_chat');
+    put('notifDraw', 'notif_draw');
+    put('notifComments', 'notif_comments');
+    // Утренний сундук: колонка перевёрнута, ноль — присылать (NotifPrefsSync).
+    put('notifChestOff', 'notif_chest_off');
+    // Метка «телефон присылал настройки». Без неё сервер не знает, ноль в
+    // колонке — выбор человека или ещё не заполненное поле, и молчал тем, кто
+    // не открывал вкладку «Профиль» (обращение №133, 06.09.2026).
+    put('notifSyncedAt', 'notif_synced_at');
+    put('soloTimers', 'solo_timers', json: true);
+    // Оформление: нужно только статистике — какой палитрой и в каком режиме
+    // пользуются. Локальный выбор от этого не зависит, он живёт в prefs.
+    put('themeMode', 'theme_mode');
+    put('themeId', 'theme_id');
+    // Своя тема Togetherly+ (до пяти цветов) и окно сна маскотов. Оба поля
+    // человек правит сам, и оба обязаны переезжать вместе с аккаунтом.
+    //
+    // Список тут БЕЛЫЙ: незнакомый ключ выбрасывается молча, а функция
+    // отвечает успехом. Так `mascot_sleep` не уезжал на сервер НИ РАЗУ — на
+    // проде ноль непустых значений при ста тысячах аккаунтов, хотя настройка
+    // обещает переезд на новое устройство. Стережёт
+    // `test/services/user_profile_fields_test.dart`.
+    put('mascotSleep', 'mascot_sleep', json: true);
+    put('customThemes', 'custom_themes', json: true);
+    // Свои пожелания «Скучаю»: до 19.08.2026 жили только в prefs и пропадали
+    // при переустановке. Ключа здесь не было — а незнакомый ключ эта функция
+    // выбрасывает молча, отвечая успехом.
+    put('missYouWishes', 'miss_you_wishes', json: true);
+    // Метка аккаунта для покупок в App Store. Пишется ДО оплаты: уведомление
+    // Apple приносит только её, и без записи в базе покупка приходит без
+    // хозяина — сервер знает, что деньги пришли, и не знает, кому открывать.
+    put('appleAccountToken', 'apple_account_token');
+    return row;
+  }
+
+  /// Каталог (mood-паки/маскоты): включённые записи нужного типа.
+  Future<List<RecordModel>> loadCatalog(String kind) async {
+    try {
+      return await _pb.collection('catalog_items').getFullList(
+            filter: _pb.filter('kind = {:k} && enabled = true', {'k': kind}),
+            sort: 'sort',
+          );
+    } catch (e) {
+      debugPrint('PbData.loadCatalog($kind) failed: $e');
+      return const [];
+    }
+  }
+
+  /// Весь включённый каталог (любого типа), отсортированный по `sort`. Чтение
+  /// публичное (viewRule/listRule = ''), вход не требуется. Заменяет
+  /// чтение `catalog_items` из Supabase в [CatalogService] на cutover.
+  Future<List<RecordModel>> loadCatalogAll() async {
+    try {
+      // Вещи Ту приходят и выключенными: снятая с сервера вещь остаётся у
+      // тех, кому досталась (`TuWear.retired`), из сундука она уже не выпадает.
+      return await _pb.collection('catalog_items').getFullList(
+            filter: "enabled = true || kind = 'wear'",
+            sort: 'sort',
+          );
+    } catch (e) {
+      debugPrint('PbData.loadCatalogAll failed: $e');
+      return const [];
+    }
+  }
+
+  /// Минимально поддерживаемая сборка (force-update) из коллекции `app_config`.
+  /// 0 = не блокировать (нет записи / ошибка / пустое поле). Заменяет
+  /// `SupabaseService.fetchMinSupportedBuild` на cutover.
+  Future<int> fetchMinSupportedBuild() async {
+    try {
+      final res = await _pb.collection('app_config').getList(perPage: 1);
+      if (res.items.isEmpty) return 0;
+      WalletTeaser.ingest(res.items.first.data['wallet']);
+      RoomWindowFlag.ingest(res.items.first.data['room_native_ios']);
+      MascotGuideService.instance.ingest(res.items.first.data['mascot_guide']);
+      AppTimeService.instance.ingestHours(res.items.first.data['rank_hours']);
+      final v = res.items.first.data['min_build'];
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      return 0;
+    } catch (e) {
+      debugPrint('PbData.fetchMinSupportedBuild failed: $e');
+      return 0;
+    }
+  }
+
+  /// Подарки, полученные участником [uid] в группе [groupId] — новые сверху.
+  ///
+  /// Пустой [groupId] = все связи пользователя: в личном профиле полка иначе
+  /// пустует, когда подарок пришёл в другой паре (у кого их несколько). Чужого
+  /// сюда не попадёт — правило коллекции пускает только к своим группам.
+  ///
+  /// Возвращает сырые записи: полку из них собирает `tallyGifts`
+  /// (`lib/models/partner_profile.dart`). Пустой список при любой ошибке —
+  /// профиль партнёра не та страница, ради которой стоит показывать сбой.
+  ///
+  /// Все подарки, а не первая страница: до 05.11.2026 здесь стоял `perPage:
+  /// 200`, и у пары, где подарков больше, счёт «Что дарили» застывал на 200,
+  /// а полка считала только последние двести (обращение 591).
+  Future<List<Map<String, dynamic>>> fetchGiftsFor({
+    String groupId = '',
+    required String uid,
+  }) async {
+    if (uid.isEmpty) return const [];
+    try {
+      final filter = groupId.isEmpty
+          ? 'recipient_uid = "$uid"'
+          : 'group_id = "$groupId" && recipient_uid = "$uid"';
+      final items = await _pb.collection('gifts').getFullList(
+            batch: 500,
+            filter: filter,
+            sort: '-created',
+          );
+      return items.map((r) => Map<String, dynamic>.from(r.data)).toList();
+    } catch (e) {
+      debugPrint('PbData.fetchGiftsFor failed: $e');
+      return const [];
+    }
+  }
+
+  /// Сколько подарков получил [uid] за всё время — для плитки в профиле.
+  ///
+  /// Берём `totalItems` при `perPage: 1`: сами записи тут не нужны, а полка у
+  /// давней пары тянет сотни строк на каждый заход в профиль.
+  Future<int> countGiftsFor({required String uid}) async {
+    if (uid.isEmpty) return 0;
+    try {
+      final res = await _pb.collection('gifts').getList(
+            page: 1,
+            perPage: 1,
+            filter: 'recipient_uid = "$uid"',
+          );
+      return res.totalItems;
+    } catch (e) {
+      debugPrint('PbData.countGiftsFor failed: $e');
+      return 0;
+    }
+  }
+
+  /// Подарки, которые ждут действия получателя [uid] — свежие сверху.
+  Future<List<Map<String, dynamic>>> fetchIncomingGifts({
+    required String groupId,
+    required String uid,
+  }) async {
+    if (groupId.isEmpty || uid.isEmpty) return const [];
+    try {
+      final res = await _pb.collection('gifts').getList(
+            perPage: 20,
+            // deliver_at отсекает письмо, которое ещё летит, и завтрак до утра
+            filter: 'group_id = "$groupId" && recipient_uid = "$uid" && '
+                'state = "sent" && deliver_at <= ${DateTime.now().millisecondsSinceEpoch}',
+            sort: '-created',
+          );
+      return res.items
+          .map((r) => {'id': r.id, ...Map<String, dynamic>.from(r.data)})
+          .toList();
+    } catch (e) {
+      debugPrint('PbData.fetchIncomingGifts failed: $e');
+      return const [];
+    }
+  }
+
+  /// Запись «скучаю» участника [uid]: счётчик и карта дней недели.
+  Future<Map<String, dynamic>?> fetchMissYouFor({
+    required String groupId,
+    required String uid,
+  }) async {
+    if (groupId.isEmpty || uid.isEmpty) return null;
+    try {
+      final rec = await _pb.collection('miss_you').getFirstListItem(
+            'group_id = "$groupId" && user_uid = "$uid"',
+          );
+      return Map<String, dynamic>.from(rec.data);
+    } catch (e) {
+      debugPrint('PbData.fetchMissYouFor failed: $e');
+      return null;
+    }
+  }
+
+  /// Включён ли раздел подарков (поле `gifts_enabled` в той же единственной
+  /// записи `app_config`, что и `min_build`).
+  ///
+  /// false при любой неопределённости — нет записи, нет поля, сбой сети:
+  /// выключенный раздел безопаснее раздела, который наполовину работает.
+  Future<bool> fetchGiftsEnabled() async {
+    try {
+      final res = await _pb.collection('app_config').getList(perPage: 1);
+      if (res.items.isEmpty) return false;
+      WalletTeaser.ingest(res.items.first.data['wallet']);
+      RoomWindowFlag.ingest(res.items.first.data['room_native_ios']);
+      MascotGuideService.instance.ingest(res.items.first.data['mascot_guide']);
+      AppTimeService.instance.ingestHours(res.items.first.data['rank_hours']);
+      return res.items.first.data['gifts_enabled'] == true;
+    } catch (e) {
+      debugPrint('PbData.fetchGiftsEnabled failed: $e');
+      return false;
+    }
+  }
+
+  /// Включён ли раздел «Хочу с тобой» (поле `wishes_enabled` там же).
+  ///
+  /// Здесь неопределённость решается в другую сторону, чем у подарков: раздел
+  /// бесплатный и ничего не тратит, поэтому он виден, пока его явно не
+  /// выключили. Сбой сети не должен прятать список, который человек уже завёл.
+  Future<bool> fetchWishesEnabled() async {
+    try {
+      final res = await _pb.collection('app_config').getList(perPage: 1);
+      if (res.items.isEmpty) return true;
+      // Флаг выхода Wallet едет в той же записи: кнопка на главной узнаёт о
+      // выходе без отдельного запроса (см. `WalletTeaser`).
+      WalletTeaser.ingest(res.items.first.data['wallet']);
+      RoomWindowFlag.ingest(res.items.first.data['room_native_ios']);
+      MascotGuideService.instance.ingest(res.items.first.data['mascot_guide']);
+      AppTimeService.instance.ingestHours(res.items.first.data['rank_hours']);
+      return res.items.first.data['wishes_enabled'] != false;
+    } catch (e) {
+      debugPrint('PbData.fetchWishesEnabled failed: $e');
+      return true;
+    }
+  }
+
+  /// Показывать ли сундук на главной (поле `chest_enabled` там же).
+  ///
+  /// Выключатель на случай, если сундук надо убрать без релиза — одной
+  /// командой на сервере (см. CLAUDE.md, раздел про сундук). Пока поле не
+  /// выключено явно, сундук виден; сбой сети его не прячет.
+  Future<bool> fetchChestEnabled() async {
+    try {
+      final res = await _pb.collection('app_config').getList(perPage: 1);
+      if (res.items.isEmpty) return true;
+      return res.items.first.data['chest_enabled'] != false;
+    } catch (e) {
+      debugPrint('PbData.fetchChestEnabled failed: $e');
+      return true;
+    }
+  }
+
+  /// Слать ли самоотчёт о контейнере виджетов (поле `widget_diag_enabled`).
+  ///
+  /// По умолчанию НЕТ. Разбор пустой галереи на iPhone закончился 23.08.2026, а
+  /// отчёт продолжал уходить с каждого открытия главной: 719 событий в сутки —
+  /// больше половины всего, что видит панель крашей. Включается на время
+  /// следующего разбора одним PATCH записи конфига, без релиза.
+  /// Включена ли отправка отчёта о виджетах.
+  ///
+  /// Ответ держим сутки в prefs: разбор кончился, флаг на проде стоит в нуле,
+  /// а запрос уходил при КАЖДОМ открытии главной — лишний поход в сеть на
+  /// старте у каждого. Включают флаг руками и редко, сутки задержки здесь
+  /// ничего не стоят.
+  static const String _diagFlagKey = 'widget_diag_enabled_cached';
+  static const String _diagFlagAtKey = 'widget_diag_enabled_at';
+
+  Future<bool> fetchWidgetDiagEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    final at = prefs.getInt(_diagFlagAtKey) ?? 0;
+    final fresh = DateTime.now().millisecondsSinceEpoch - at <
+        const Duration(hours: 24).inMilliseconds;
+    if (fresh) return prefs.getBool(_diagFlagKey) ?? false;
+    try {
+      final res = await _pb.collection('app_config').getList(perPage: 1);
+      final on =
+          res.items.isNotEmpty && res.items.first.data['widget_diag_enabled'] == true;
+      await prefs.setBool(_diagFlagKey, on);
+      await prefs.setInt(_diagFlagAtKey, DateTime.now().millisecondsSinceEpoch);
+      return on;
+    } catch (e) {
+      debugPrint('PbData.fetchWidgetDiagEnabled failed: $e');
+      return false;
+    }
+  }
+
+  /// ISO-строка PB → DateTime (публичный хелпер для слоя моделей на cutover).
+  static DateTime? parseDate(dynamic v) => _date(v);
+}

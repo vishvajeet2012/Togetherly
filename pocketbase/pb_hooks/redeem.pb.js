@@ -1,0 +1,181 @@
+/// Погашение кодов пополнения (покупка монет мимо магазинов).
+///
+/// Деньги принимает lava.top, бот выдаёт покупателю код и кладёт его в
+/// коллекцию `redeem_codes`. Здесь код гасится: один код — одно погашение,
+/// монеты уходят на аккаунт того, кто его ввёл.
+///
+/// Почему гасит сервер, а не приложение: подписанный офлайн-ключ (как в Fern)
+/// можно предъявить с двух аккаунтов, а баланс монет живёт на сервере. Здесь
+/// же запись помечается внутри транзакции, и повтор ничего не даёт.
+///
+/// !!! ГРАБЛИ PB JSVM (см. coins.pb.js:5-19): обработчик исполняется в
+/// ИЗОЛИРОВАННОМ пуле и НЕ видит функции уровня файла — всё инлайнится.
+
+routerAdd("POST", "/api/coins/redeem", (e) => {
+  const body = new DynamicModel({ code: "" });
+  e.bindBody(body);
+
+  // Человек вводит код руками: чистим пробелы, дефисы и регистр, чтобы
+  // «tg-4f2a b19c» и «TG4F2AB19C» считались одним кодом.
+  const code = String(body.code || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  if (code.length < 6) {
+    return e.json(400, { ok: false, error: "invalid_code" });
+  }
+
+  let out = { s: 500, b: { ok: false, error: "internal" } };
+  try {
+    $app.runInTransaction((txApp) => {
+      const me = e.auth.id;
+      const user = txApp.findRecordById("users", me);
+
+      let rec = null;
+      try {
+        rec = txApp.findFirstRecordByFilter(
+          "redeem_codes", "code = {:c}", { c: code });
+      } catch (_) {
+        rec = null;
+      }
+      if (!rec) {
+        out = { s: 404, b: { ok: false, error: "invalid_code" } };
+        return;
+      }
+
+      const usedBy = rec.getString("used_by") || "";
+      if (usedBy) {
+        // Свой же код, введённый повторно (обрыв связи после начисления) —
+        // не ошибка: отвечаем спокойно и показываем текущий баланс.
+        if (usedBy === me) {
+          out = {
+            s: 200,
+            b: {
+              ok: true,
+              alreadyRedeemed: true,
+              coins: user.getInt("coins") || 0,
+              plus: user.getBool("plus") || false,
+              awarded: 0,
+            },
+          };
+        } else {
+          out = { s: 409, b: { ok: false, error: "code_used" } };
+        }
+        return;
+      }
+
+      // Код Togetherly+ монет не несёт — он открывает возможности. Проверяем
+      // это раньше суммы, иначе такой код упёрся бы в «invalid_code».
+      const isPlus = rec.getBool("plus");
+      if (isPlus) {
+        rec.set("used_by", me);
+        rec.set("used_at", Date.now());
+        txApp.save(rec);
+
+        user.set("plus", true);
+        // Код от бота — оплата шла мимо магазина; помечаем, чтобы поддержка
+        // не гадала, откуда доступ (особенно у тех, кто сидит с iPhone, где
+        // витрины Togetherly+ нет).
+        user.set("plus_platform", "code");
+        txApp.save(user);
+        out = { s: 200, b: { ok: true, plus: true, awarded: 0 } };
+        return;
+      }
+
+      // Код на элемент каталога (пак настроений, маскот): монет не несёт,
+      // открывает ключ владения — тот же, что даёт покупка за монеты. Как и у
+      // Плюса, проверяем раньше суммы, иначе такой код упёрся бы в
+      // «invalid_code».
+      const feature = rec.getString("feature") || "";
+      if (feature) {
+        rec.set("used_by", me);
+        rec.set("used_at", Date.now());
+        txApp.save(rec);
+
+        const parse = (s, fb) => {
+          try { return JSON.parse(s || JSON.stringify(fb)) || fb; } catch (_) { return fb; }
+        };
+        const owned = parse(user.getString("owned_features"), []);
+        if (owned.indexOf(feature) === -1) {
+          user.set("owned_features", JSON.stringify(owned.concat([feature])));
+        }
+        txApp.save(user);
+
+        // Купленное общее на пару — см. shareToGroups в coins.pb.js.
+        // `group_ids` читаем только getStringSlice: это relation, а не json.
+        let groupIds = [];
+        try { groupIds = user.getStringSlice("group_ids") || []; } catch (_) { groupIds = []; }
+        if (!groupIds.length) groupIds = parse(user.getString("pair_ids"), []);
+        // Купленное открыто обоим, а запись пары живёт в Postgres: ключ владения
+        // добавляет hotpath одним запросом и идемпотентно — повтор чека, второй
+        // канал оплаты и восстановление покупки ничего не задваивают.
+        for (let i = 0; i < groupIds.length; i++) {
+          try {
+            $http.send({
+              url: "http://127.0.0.1:8120/internal/group-write",
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                group_id: String(groupIds[i]),
+                arr_add: { owned_features: [feature] },
+              }),
+              timeout: 10,
+            });
+          } catch (err) {
+            $app.logger().warn("владение не доехало до пары",
+              "group", String(groupIds[i]), "feature", String(feature), "err", String(err));
+          }
+        }
+        out = { s: 200, b: { ok: true, feature: feature, awarded: 0 } };
+        return;
+      }
+
+      const amount = rec.getInt("coins") || 0;
+      if (amount <= 0) {
+        out = { s: 400, b: { ok: false, error: "invalid_code" } };
+        return;
+      }
+
+      rec.set("used_by", me);
+      rec.set("used_at", Date.now());
+      txApp.save(rec);
+
+      const newBalance = (user.getInt("coins") || 0) + amount;
+      user.set("coins", newBalance);
+      txApp.save(user);
+
+      out = {
+        s: 200,
+        b: {
+          ok: true,
+          alreadyRedeemed: false,
+          coins: newBalance,
+          awarded: amount,
+        },
+      };
+    });
+  } catch (err) {
+    try {
+      $http.send({
+        url: "http://127.0.0.1:8000/api/1/store/",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Sentry-Auth":
+            "Sentry sentry_version=7, sentry_key=05953bce75c54cdb9fe149861d159da5",
+        },
+        body: JSON.stringify({
+          message: "coins/redeem: " + String(err),
+          level: "error",
+          logger: "pb_hooks.redeem",
+          tags: { feature: "redeem", route: "coins_redeem", error_code: "server" },
+        }),
+        timeout: 5,
+      });
+    } catch (_) {}
+    try {
+      $app.logger().error("coins/redeem: " + String(err));
+    } catch (_) {}
+    out = { s: 500, b: { ok: false, error: "internal" } };
+  }
+  return e.json(out.s, out.b);
+}, $apis.requireAuth());

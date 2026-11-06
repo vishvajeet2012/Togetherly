@@ -1,0 +1,779 @@
+/* Страница комнаты: плеер и чат на весь экран, без прокрутки.
+ * Базовые токены и кнопки берутся из ../landing.css.
+ *
+ * Экран ожидания партнёра убран намеренно: комната открывается сразу рабочей,
+ * ссылку зовущий копирует кнопкой в шапке.
+ */
+
+/* Высота берётся из --vph, куда room.js кладёт настоящую высоту видимой
+   области (visualViewport). На iPhone клавиатура НЕ меняет 100dvh внутри
+   WKWebView: страница остаётся во весь экран, поле со ссылкой оказывается
+   под клавиатурой, а прокрутки нет — отсюда «ссылка не вводится». */
+.room-body {
+  /* Прибито к видимой области: при открытой клавиатуре iOS не только урезает
+     видимое, но и прокручивает документ вверх — без компенсации offsetTop
+     (`--vpt`) шапка и кадр уезжают за край, а вернуть их нечем: прокрутки у
+     комнаты нет. */
+  position: fixed;
+  top: var(--vpt, 0px);
+  left: 0;
+  right: 0;
+  height: var(--vph, 100dvh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Нативное окно приложения (iPhone, адрес с `nb=1`, 12.10.2026). Встроенный
+   браузер стоял под строкой состояния — место под неё оставлял экран
+   приложения. Нативное окно идёт во весь экран, поэтому от выреза отступает
+   сама страница. Отступ приложение сообщает переменной `--app-top`; пока её
+   нет, берём системный. */
+.native-window .room-body {
+  padding-top: max(var(--app-top, 0px), env(safe-area-inset-top, 0px));
+}
+.native-window .gate {
+  padding-top: calc(16px + max(var(--app-top, 0px), env(safe-area-inset-top, 0px)));
+}
+
+/* ── шапка ───────────────────────────────────────────────────────────────── */
+
+.top--room {
+  position: static;
+  gap: 14px;
+  padding: 12px var(--pad);
+  flex: none;
+}
+.top--room .brand { margin-right: auto; min-width: 0; overflow: hidden; }
+.top--room .room-code, .top--room .btn, .top--room .theme-btn { flex: none; }
+.top--room .btn--compact, .top--room .theme-btn { min-height: 44px; height: 44px; }
+.top--room .theme-btn { width: 44px; }
+
+.room-code { text-align: right; line-height: 1.15; }
+.room-code__cap {
+  display: block;
+  font: 600 10.5px/1 'Onest';
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.room-code b {
+  font: 800 17px/1 'Unbounded', sans-serif;
+  letter-spacing: .06em;
+}
+.status-line {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* ── сетка комнаты ───────────────────────────────────────────────────────── */
+/*
+ * Две колонки и две строки: кадр и чат равной высоты, под ними одной линией
+ * строка со ссылкой и поле сообщения. Поэтому «Включить» и кнопка отправки
+ * стоят на одном уровне, а чат кончается там же, где кадр.
+ */
+.stage-wrap {
+  flex: 1;
+  display: grid;
+  /* Чат растёт вместе с экраном: на 4K колонка в 340 точек выглядела ниткой
+     рядом с кадром. */
+  grid-template-columns: minmax(0, 1fr) clamp(340px, 20vw, 560px);
+  grid-template-rows: auto auto auto;
+  grid-template-areas:
+    'player chat'
+    'manual chat'
+    'source composer';
+  align-content: center;
+  gap: 12px 16px;
+  padding: clamp(12px, 2vw, 22px);
+  min-height: 0;
+  width: 100%;
+  /* Комната занимала 1720 точек посреди 4K-монитора: кадр в островке, вокруг
+     чёрные поля во весь экран. Предел поднят и завязан на саму ширину. */
+  max-width: min(3200px, 100%);
+  margin: 0 auto;
+}
+
+.player {
+  grid-area: player;
+  aspect-ratio: 16 / 9;
+  /* Кадр 16:9 во всю ширину не помещается по высоте на широком мониторе:
+     ширину задаёт то, что осталось под видео на экране. */
+  /* От ВИДИМОЙ высоты (`--vph`), а не от 100dvh: клавиатура в WKWebView
+     полный экран не уменьшает, кадр оставался огромным и наезжал на строку со
+     ссылкой — она «не реагировала», потому что клики забирал плеер. */
+  width: min(100%, calc((var(--vph, 100dvh) - 210px) * 16 / 9));
+  min-height: 0;
+  margin-inline: auto;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: linear-gradient(150deg, #2A1418, #4A2028 55%, #7A2E3C);
+  display: grid;
+  place-items: center;
+}
+.player iframe, .player__video { width: 100%; height: 100%; border: 0; display: block; }
+.player__video { background: #000; object-fit: contain; }
+.player__empty {
+  display: grid;
+  place-items: center;
+  gap: 14px;
+  color: rgba(255, 255, 255, .8);
+  font: 600 15px 'Onest';
+  text-align: center;
+  padding: 0 24px;
+}
+
+/* ── пульт для плееров, которые не принимают команды ─────────────────────── */
+
+.manual {
+  grid-area: manual;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.manual__note { flex: 1; min-width: 180px; font-size: 13px; color: var(--ink-soft); }
+
+.player { position: relative; }
+.countdown {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font: 800 clamp(64px, 12vw, 160px)/1 'Unbounded', sans-serif;
+  color: #fff;
+  background: rgba(21, 13, 15, .72);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+.countdown--pause { font-size: clamp(36px, 7vw, 88px); }
+
+/* ── голос ───────────────────────────────────────────────────────────────── */
+/*
+ * Кнопка звонка стоит в шапке, рядом с кодом и темой: она не занимает высоту,
+ * поэтому раскладка комнаты от неё не зависит вовсе. Прежняя полоса от Flutter
+ * жила ПОД страницей, красилась темой приложения и отрезала 84 точки уже после
+ * загрузки — оба изъяна снимаются самим местом.
+ */
+.voice { display: flex; align-items: center; gap: 6px; flex: none; }
+.voice__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font: 700 13px 'Onest';
+  /* Цифры не пляшут на каждой секунде. */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.voice__dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+@media (prefers-reduced-motion: no-preference) {
+  .voice__dot { animation: voice-pulse 1.8s ease-in-out infinite; }
+}
+@keyframes voice-pulse { 0%, 100% { opacity: 1 } 50% { opacity: .3 } }
+
+.voice__btn--hang { background: var(--accent-deep); color: var(--on-accent); border: 0; }
+.voice__btn--hang:hover { background: color-mix(in srgb, var(--accent-deep) 88%, var(--ink)); }
+
+/* Выключенный микрофон читается формой значка, а не только цветом. */
+#voiceMic .i-mic-off, #voiceMic[aria-pressed="false"] .i-mic-on { display: none; }
+#voiceMic[aria-pressed="false"] .i-mic-off { display: block; }
+#voiceMic[aria-pressed="false"] { color: var(--ink-soft); }
+
+/* ── строка источника и поле сообщения ───────────────────────────────────── */
+
+.source { grid-area: source; display: flex; gap: 10px; min-width: 0; }
+.source__input {
+  /* width: 0 обязателен: у поля есть собственная ширина в 20 знаков, и без
+     обнуления она распирает колонку шире экрана телефона. */
+  flex: 1;
+  width: 0;
+  min-width: 0;
+  min-height: 52px;
+  padding: 0 20px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font: 400 15px 'Onest';
+  outline: none;
+}
+.source__input:focus { border-color: var(--accent-deep); }
+
+.composer { grid-area: composer; display: flex; gap: 8px; min-width: 0; }
+.input--flat { flex: 1; width: 0; min-width: 0; min-height: 52px; }
+
+.btn--compact { min-height: 52px; padding: 0 24px; font-size: 15px; gap: 9px; }
+.btn--icon { min-height: 52px; width: 52px; padding: 0; flex: none; }
+#copy svg { flex: none; }
+
+/* ── чат ─────────────────────────────────────────────────────────────────── */
+
+.side {
+  grid-area: chat;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-warm);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.side__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 16px 18px 8px;
+}
+.side__head h2 { font-size: 16px; font-weight: 700; }
+.viewers { font: 600 12.5px 'Onest'; color: var(--ink-soft); }
+
+.chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* Пустой чат объясняет, что делать, вместо того чтобы молчать. */
+.chat:empty::before {
+  content: attr(data-empty);
+  margin: auto;
+  max-width: 22ch;
+  text-align: center;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.msg {
+  max-width: 88%;
+  padding: 10px 14px;
+  border-radius: 20px 20px 20px 6px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  font-size: 14.5px;
+  word-break: break-word;
+}
+.msg--mine {
+  align-self: flex-end;
+  border-radius: 20px 20px 6px 20px;
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+.msg--system {
+  align-self: center;
+  background: transparent;
+  border: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+.msg__who { display: block; font: 600 11.5px 'Onest'; opacity: .65; margin-bottom: 2px; }
+
+/* ── телефон ─────────────────────────────────────────────────────────────── */
+
+/* Одна колонка — не только на телефоне, но и на любом экране выше своей
+   ширины: портретный монитор (1080×1920) и планшет книжно собирали кадр, чат
+   и строку ввода в полосу посреди экрана, а сверху и снизу оставалась пустота
+   в две трети высоты. Замерено рендером на 34 размерах. */
+@media (max-width: 900px), (max-aspect-ratio: 3 / 4) {
+  .top--room { padding: 10px 12px; gap: 8px; }
+  .room-code__cap, .status-line { display: none; }
+  .room-code b { font-size: 15px; }
+  /* На телефоне в шапке место только под значок: слово «Togetherly» уступает
+     место коду комнаты, знак и приписка остаются. */
+  #copy { width: 46px; padding: 0; }
+  #copy span { display: none; }
+  /* Во время разговора в шапке живут ещё три кнопки и счётчик времени, поэтому
+     место уступают подпись бренда и «скопировать»: ссылку зовущий отправляет
+     до звонка, а код комнаты важнее названия сайта. Без этого кнопка темы
+     уезжала за правый край экрана. */
+  .room-body.calling .brand__name,
+  .room-body.calling .brand__sub,
+  .room-body.calling #copy,
+  .room-body.calling #share { display: none; }
+  .voice__state { height: 40px; padding: 0 11px; font-size: 12.5px; }
+  /* Круглые кнопки шапки ужимаются до предела касания: их тут до пяти. */
+  .top--room .btn--icon { width: 44px; }
+  .room-body.calling .top--room .btn--compact,
+  .room-body.calling .top--room .theme-btn { min-height: 40px; height: 40px; }
+  .room-body.calling .top--room .btn--icon,
+  .room-body.calling .top--room .theme-btn { width: 40px; }
+  /* В приложении у шапки ещё «назад» и «поделиться», и ряд просил 429 точек
+     на любом телефоне: «свернуть» уезжала за правый край (07.10.2026).
+     «Скопировать» тут лишняя — «поделиться» открывает системный лист, в нём
+     есть копирование. Круглые кнопки — 40 точек, как в разговоре. Во время
+     звонка уходит и код: пара уже в комнате, а строку занимают счётчик,
+     микрофон и отбой. Стережёт tests/room-app-header.test.js. */
+  .app-chrome #copy { display: none; }
+  .app-chrome .top--room { gap: 6px; padding-inline: 10px; }
+  .app-chrome .top--room .btn--icon,
+  .app-chrome .top--room .theme-btn { width: 40px; min-height: 40px; height: 40px; }
+  .app-chrome.calling .room-code { display: none; }
+
+  .stage-wrap {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      'player'
+      'manual'
+      'source'
+      'chat'
+      'composer';
+    align-content: stretch;
+    gap: 10px;
+    padding: 12px;
+  }
+  .side { max-height: calc(var(--vph, 100dvh) * 0.34); }
+  .player {
+    width: 100%;
+    border-radius: 18px;
+    /* Кадру достаётся не больше половины видимого: остальное нужно строке со
+       ссылкой, чату и полю сообщения. Без предела он выдавливал их за экран. */
+    max-height: calc(var(--vph, 100dvh) * 0.42);
+  }
+  /* Строка ссылки и поле сообщения выше кадра по слою: даже если раскладка
+     где-то не сойдётся, клик достанется полю, а не плееру. */
+  .source, .composer { position: relative; z-index: 2; }
+  .side { border-radius: 22px; }
+  .composer { padding-bottom: env(safe-area-inset-bottom); }
+  /* 16px — порог, ниже которого Safari на iPhone зумит страницу при фокусе.
+     После такого зума раскладка съезжает, поле уходит вбок, и человек видит
+     мигающий курсор непонятно где вместо своей строки ввода. */
+  .source__input, .composer .input { font-size: 16px; }
+
+  /* Строка ссылки занимает свою строку целиком, кнопки уходят под неё.
+     Пока всё стояло в один ряд, полю доставалось то, что осталось от двух
+     иконок и кнопки «Включить»: 42 точки на iPhone SE, 77 на mini, 110 на
+     пятнадцатом. В таком поле не видно ни подсказки, ни вставленного адреса —
+     отсюда жалоба «ссылки не вставляются». Замерено рендером на всех вьюпортах
+     от 320×568 до 440×956. */
+  .source { flex-wrap: wrap; }
+  .source__input {
+    flex: 1 0 100%;
+    width: auto;
+    order: -1;
+  }
+  /* Кнопка забирает остаток ряда, иконки остаются квадратными. */
+  .source .btn--compact:not(.btn--icon) { flex: 1; }
+}
+
+/* На самых узких (iPhone SE, 320) во время разговора не помещается и код
+   комнаты: строку занимают счётчик, микрофон, отбой и тема. Прятать его тут
+   безопасно — голос бывает только в приложении, а там код стоит в шапке
+   самого приложения. */
+@media (max-width: 360px) {
+  .room-body.calling .room-code { display: none; }
+}
+/* 320 точек (iPhone SE) в приложении: шесть элементов в ряд сходятся только
+   с зазором в 4 точки и кодом помельче. */
+@media (max-width: 340px) {
+  .app-chrome .top--room { gap: 4px; padding-inline: 8px; }
+  .app-chrome .room-code b { font-size: 12.5px; }
+}
+
+/* Высокий портретный экран (монитор боком, планшет книжно): чат растёт до
+   строки ввода. Потолок в треть высоты нужен телефону, где место делят кадр,
+   строка ссылки и клавиатура, а на полутора тысячах точек он оставлял снизу
+   пустое поле в четверть экрана. */
+@media (max-aspect-ratio: 3 / 4) and (min-height: 1000px) {
+  .side { max-height: none; }
+  .player { max-height: calc(var(--vph, 100dvh) * 0.36); }
+}
+
+/* ── когда открыта клавиатура ─────────────────────────────────────────────── */
+/* Кадр ужимается сильнее обычного: место нужно строке ввода и хотя бы паре
+   строк чата, иначе человек печатает вслепую. Класс ставит room.js по фокусу. */
+.room-body.typing .player { max-height: calc(var(--vph, 100dvh) * 0.28); }
+.room-body.typing .side { min-height: 0; }
+
+/* ── кино: кадр во всю площадь, чат поверх ────────────────────────────────── */
+/*
+ * Полноэкранный режим самого плеера отдаёт экран площадке целиком, и чат туда
+ * не положить — «нету чата при просмотре на весь экран». Поэтому разворачиваем
+ * своими силами: кадр занимает всю площадь страницы, а чат ложится поверх
+ * снизу, полупрозрачной полосой, и его видно, не выходя из просмотра.
+ */
+.room-body.cinema .top--room { display: none; }
+/* В приложении шапка одна — эта: без логотипа, с «назад» слева. Логотип на
+   узком экране сжимался до «TY wa», и рядом стояла вторая шапка приложения. */
+.app-chrome .top--room .brand { display: none; }
+.app-chrome .top--room #back { margin-right: auto; }
+/* Свёрнутая шапка: её место отдаётся плееру и чату, вернуть — круглой
+   кнопкой в правом верхнем углу поверх комнаты. */
+.room-body.top-folded .top--room { display: none; }
+.unfold {
+  position: fixed; z-index: 30;
+  top: calc(env(safe-area-inset-top, 0px) + 8px); right: calc(env(safe-area-inset-right, 0px) + 10px);
+  width: 40px; height: 40px; border-radius: 50%; border: 0; display: grid; place-items: center;
+  background: color-mix(in srgb, var(--card) 86%, transparent); color: var(--ink);
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.unfold[hidden] { display: none; }
+.room-body.cinema .unfold { display: none; }
+.room-body.cinema .stage-wrap {
+  padding: 0;
+  gap: 0;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: 'player';
+}
+.room-body.cinema .player {
+  width: 100%;
+  max-height: none;
+  height: 100%;
+  aspect-ratio: auto;
+  border-radius: 0;
+}
+.room-body.cinema .manual { display: none; }
+/* Строка ссылки в этом режиме ни к чему, а вот выйти из него нужно — поэтому
+   от неё остаётся одна кнопка, поверх кадра. */
+.room-body.cinema .source {
+  grid-area: player;
+  align-self: start;
+  justify-self: end;
+  z-index: 4;
+  margin: 10px;
+  background: none;
+}
+.room-body.cinema .source__input,
+.room-body.cinema #pick,
+.room-body.cinema #apply { display: none; }
+.room-body.cinema .side {
+  grid-area: player;
+  align-self: end;
+  z-index: 3;
+  max-height: 42%;
+  margin: 0 10px 74px;
+  background: color-mix(in srgb, var(--bg-warm) 82%, transparent);
+  backdrop-filter: blur(8px);
+}
+.room-body.cinema .composer {
+  grid-area: player;
+  align-self: end;
+  z-index: 3;
+  margin: 0 10px 12px;
+}
+#cinema { flex: none; }
+.room-body.cinema #cinema { position: fixed; top: 10px; right: 10px; z-index: 4; }
+
+
+/* ── чат убран ────────────────────────────────────────────────────────────── */
+/*
+ * «При просмотре видео мешает чат», «не убирается чат во время просмотра»
+ * (28–29.08.2026). В режиме «кино» переписка лежит поверх кадра, и это удобно
+ * ровно до тех пор, пока смотрят фильм молча. Кнопка убирает и переписку, и
+ * поле ввода; сама остаётся на месте — иначе вернуть чат будет нечем.
+ */
+.room-body.chat-off .side,
+.room-body.chat-off .composer { display: none; }
+.room-body.chat-off .stage-wrap {
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: 'player';
+}
+#chatToggle { flex: none; }
+
+/* ── чат в полноэкранном режиме ───────────────────────────────────────────── */
+/*
+ * «Когда полноэкранный режим открываешь на телефоне, строка для ввода и
+ * отправки сообщения залезает на само видео и не убирается» (06.10.2026, уже
+ * не первый раз). Переписка и поле лежали на нижней половине кадра насовсем,
+ * а кнопка, которая их убирала, была прозрачной в верхней полосе плеера.
+ *
+ * Теперь кадр чистый: чат свёрнут в круглую кнопку справа внизу со счётчиком,
+ * пришедшая реплика всплывает слева и уходит сама. Кнопка разворачивает чат
+ * (`cin-chat`), а room.js сворачивает его обратно, когда в нём ничего не
+ * делают и поле пустое. Кнопка «скрыть чат» в этом режиме не нужна.
+ */
+.room-body.cinema:not(.cin-chat) .side,
+.room-body.cinema:not(.cin-chat) .composer { display: none; }
+.room-body.cinema #chatToggle { display: none; }
+/* Развёрнутый кнопкой чат виден и у того, кто раньше убрал его насовсем. */
+.room-body.cinema.cin-chat .side,
+.room-body.cinema.cin-chat .composer { display: flex; }
+/* Выход из режима: на кадре кнопка без подложки терялась в полосе плеера. */
+.room-body.cinema #cinema {
+  width: 44px; height: 44px; border: 0;
+  background: color-mix(in srgb, #000 58%, transparent); color: #fff;
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+}
+.cin-fab, .cin-toast { display: none; }
+.room-body.cinema:not(.cin-chat) .cin-fab {
+  display: grid; place-items: center;
+  position: fixed; z-index: 5;
+  right: calc(env(safe-area-inset-right, 0px) + 12px);
+  bottom: calc(var(--app-bottom, env(safe-area-inset-bottom, 0px)) + 12px);
+  width: 52px; height: 52px; border-radius: 50%; border: 0; padding: 0;
+  background: color-mix(in srgb, #000 58%, transparent); color: #fff;
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.cin-fab__n {
+  position: absolute; top: -2px; right: -2px;
+  min-width: 20px; height: 20px; padding: 0 5px; border-radius: 10px;
+  display: grid; place-items: center;
+  background: var(--accent-deep); color: var(--on-accent);
+  font: 700 11px/1 'Onest', sans-serif; font-variant-numeric: tabular-nums;
+}
+.cin-fab__n[hidden] { display: none; }
+/* Пришедшая реплика: слева от кнопки, на уровне её низа, не шире двух строк. */
+.room-body.cinema:not(.cin-chat) .cin-toast:not([hidden]) {
+  position: fixed; z-index: 5;
+  left: calc(env(safe-area-inset-left, 0px) + 12px);
+  right: calc(env(safe-area-inset-right, 0px) + 76px);
+  bottom: calc(var(--app-bottom, env(safe-area-inset-bottom, 0px)) + 12px);
+  width: fit-content; max-width: min(calc(100% - 88px), 420px);
+  margin: 0; padding: 9px 14px; border: 0; border-radius: 20px 20px 20px 6px;
+  background: color-mix(in srgb, var(--card) 90%, transparent); color: var(--ink);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  font: 500 14px/1.35 'Onest', sans-serif; text-align: left;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  overflow-wrap: anywhere; cursor: pointer;
+  animation: cin-toast .22s cubic-bezier(.2, 0, 0, 1);
+}
+.cin-toast b { font-weight: 700; margin-right: 6px; }
+/* Свои кнопки — на своей полосе, не на кадре. Плеер площадки рисует поверх
+   видео свои: на телефоне это шестерёнка и субтитры справа вверху, значок и
+   «поделиться» внизу, и наши кнопки ложились ровно на них (проверено нажатием
+   «Полноэкранный режим» в самом плеере YouTube). Лёжа полоса справа — кадр
+   16:9 по высоте экрана и так оставляет поля по бокам; стоя полоса снизу —
+   ролик там занимает треть высоты. Полоса стоит, и пока чат открыт: иначе
+   плеер перекладывался бы на каждом открытии. */
+.room-body.cinema .stage-wrap { background: #000; }
+@media (min-aspect-ratio: 1/1) {
+  .room-body.cinema .stage-wrap { padding-right: calc(env(safe-area-inset-right, 0px) + 64px); }
+  .room-body.cinema #cinema { top: calc(env(safe-area-inset-top, 0px) + 10px); right: calc(env(safe-area-inset-right, 0px) + 10px); }
+  .room-body.cinema:not(.cin-chat) .cin-fab { right: calc(env(safe-area-inset-right, 0px) + 6px); }
+  /* Реплика лежит над кадром пять секунд: касания пропускает к плееру. */
+  .room-body.cinema .cin-toast { pointer-events: none; }
+
+  /* Открытый чат лёжа — строчками на кадре (26.10.2026, «тебя не смущает
+     чат на пол-экрана?»). Панель во всю ширину закрывала нижнюю половину
+     кадра. Теперь в левом нижнем углу три последние реплики узкими плашками,
+     старшие бледнее, и узкое поле ввода под ними; правая половина кадра
+     свободна, касания по переписке уходят плееру. Стоя остаётся панель: там
+     под роликом пустое поле. */
+  .room-body.cinema.cin-chat .side {
+    justify-self: start;
+    width: min(400px, 46%);
+    max-height: none;
+    margin: 0 0 64px 12px;
+    background: none;
+    border: 0;
+    border-radius: 0;
+    -webkit-backdrop-filter: none; backdrop-filter: none;
+    overflow: visible;
+    pointer-events: none;
+  }
+  .room-body.cinema.cin-chat .side__head { display: none; }
+  .room-body.cinema.cin-chat .chat {
+    overflow: hidden;
+    padding: 0;
+    gap: 6px;
+    justify-content: flex-end;
+    align-items: flex-start;
+  }
+  .room-body.cinema.cin-chat .chat:empty::before { content: none; }
+  .room-body.cinema.cin-chat .chat > :not(:nth-last-child(-n+3)) { display: none; }
+  .room-body.cinema.cin-chat .chat > :nth-last-child(3) { opacity: .6; }
+  .room-body.cinema.cin-chat .chat > :nth-last-child(2) { opacity: .8; }
+  .room-body.cinema.cin-chat .msg,
+  .room-body.cinema.cin-chat .msg--mine {
+    align-self: flex-start;
+    max-width: 100%;
+    padding: 6px 12px;
+    border: 0;
+    border-radius: 16px;
+    background: rgba(21, 13, 15, .72);
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+    color: #FFF1EF;
+    font-size: 13.5px;
+    line-height: 1.35;
+  }
+  .room-body.cinema.cin-chat .msg__who {
+    display: inline; margin: 0 6px 0 0;
+    font-weight: 700; font-size: 13.5px; opacity: 1; color: #FF8E9A;
+  }
+  .room-body.cinema.cin-chat .msg--mine .msg__who { color: #FFF1EF; }
+  .room-body.cinema.cin-chat .msg--system { color: #BFA0A3; background: rgba(21, 13, 15, .6); }
+  .room-body.cinema.cin-chat .composer {
+    justify-self: start;
+    width: min(400px, 46%);
+    margin: 0 0 12px 12px;
+  }
+}
+@media (max-aspect-ratio: 1/1) {
+  .room-body.cinema .stage-wrap { padding-bottom: calc(var(--app-bottom, env(safe-area-inset-bottom, 0px)) + 72px); }
+  .room-body.cinema #cinema {
+    top: auto; right: calc(env(safe-area-inset-right, 0px) + 76px);
+    bottom: calc(var(--app-bottom, env(safe-area-inset-bottom, 0px)) + 16px);
+  }
+  .room-body.cinema:not(.cin-chat) .cin-toast:not([hidden]) {
+    right: calc(env(safe-area-inset-right, 0px) + 132px);
+    max-width: calc(100% - 144px);
+    bottom: calc(var(--app-bottom, env(safe-area-inset-bottom, 0px)) + 10px);
+  }
+}
+@keyframes cin-toast { from { opacity: 0; transform: translateY(8px); } }
+@media (prefers-reduced-motion: reduce) { .cin-toast { animation: none !important; } }
+
+/* ── телефон лёжа ─────────────────────────────────────────────────────────── */
+/*
+ * В альбомной ориентации одна колонка не годится: кадр сплющивается, а чат
+ * уезжает вниз — «при повороте горизонтально не очень удобно смотреть». Ставим
+ * кадр слева во всю высоту, чат узкой колонкой справа.
+ */
+/* Телефон лёжа. `min-width` тут обязателен: в портрете открытая клавиатура
+   сжимает окно по высоте, ширина становится больше высоты, и браузер честно
+   переключает `orientation` в landscape. Человек начинал печатать — и раскладка
+   разъезжалась на две колонки, «будто сижу не с телефона, а с пк» (жалоба
+   14.08.2026). Настоящий телефон лёжа шире 540 пикселей даже у iPhone SE,
+   а портрет с клавиатурой остаётся узким. */
+@media (max-width: 950px) and (orientation: landscape) and (min-width: 540px) {
+  .top--room { padding: 6px 10px; }
+  .stage-wrap {
+    grid-template-columns: minmax(0, 1fr) minmax(180px, 34%);
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'player chat'
+      'source composer';
+    align-content: stretch;
+    gap: 8px;
+    padding: 8px;
+  }
+  .player { max-height: none; height: 100%; width: auto; margin-inline: 0; }
+  .source__input, .input--flat, .btn--compact, .btn--icon { min-height: 44px; }
+  .side__head { padding: 10px 12px 4px; }
+}
+
+/* ── плашка для телефона ─────────────────────────────────────────────────── */
+/*
+ * На узком экране строка статуса в шапке скрыта, а сказать человеку, почему
+ * ролик не включился, нужно. Плашка лежит поверх верха плеера и ничего не
+ * сдвигает: раскладку комнаты стерегут room-screen-sizes и room-webview-resize.
+ * Касания пропускает насквозь: в окне ниже 400 точек (выехала полоса звонка)
+ * она ложится на строку ссылки, а нажатие должно дойти до неё. Уходит сама.
+ */
+.note {
+  position: fixed;
+  top: calc(var(--vpt, 0px) + 72px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(calc(100% - 32px), 480px);
+  z-index: 40;
+  margin: 0;
+  padding: 12px 16px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--card);
+  color: var(--ink);
+  font: 500 14px/1.4 'Onest';
+  text-align: center;
+  text-wrap: pretty;
+  pointer-events: none;
+}
+.note[hidden] { display: none; }
+
+/* ── экран у двери ───────────────────────────────────────────────────────── */
+/*
+ * Закрывает комнату целиком, пока сервер не пустил: отказ по коду пары, чужой
+ * аккаунт, набранный руками код. Высоту берём видимую (--vph): на айфоне
+ * клавиатура иначе закрыла бы поля почты и пароля. Карточка той же пластики,
+ * что лендинг: радиус 28, поля и кнопки-пилюли, без теней.
+ */
+.gate {
+  position: fixed;
+  top: var(--vpt, 0px);
+  left: 0;
+  right: 0;
+  height: var(--vph, 100dvh);
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  overflow-y: auto;
+  background: var(--bg);
+}
+.gate[hidden] { display: none; }
+.gate__card {
+  width: min(100%, 420px);
+  display: grid;
+  gap: 14px;
+  padding: 28px 24px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  text-align: center;
+}
+.gate__mark {
+  justify-self: center;
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+}
+.gate__search { display: none; }
+.gate[data-mode="missing"] .gate__search { display: block; }
+.gate[data-mode="missing"] .gate__lock { display: none; }
+.gate__title {
+  margin: 0;
+  font: 700 21px/1.25 'Unbounded';
+  color: var(--ink);
+  text-wrap: balance;
+}
+.gate__text {
+  margin: 0 0 4px;
+  font: 400 15px/1.45 'Onest';
+  color: var(--ink-soft);
+  text-wrap: pretty;
+  overflow-wrap: anywhere;
+}
+.gate__form { display: grid; gap: 10px; }
+.gate__form[hidden], .gate__or[hidden], .gate__provs[hidden],
+.gate__actions[hidden], .gate__actions .btn[hidden] { display: none; }
+.gate__form .input { width: 100%; min-height: 52px; font-size: 16px; }
+.gate__form .btn, .gate__actions .btn { width: 100%; min-height: 52px; }
+.gate__or {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font: 600 13px 'Onest';
+  color: var(--ink-soft);
+}
+.gate__or::before, .gate__or::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.gate__provs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.gate__provs .btn { min-height: 48px; padding: 0 10px; gap: 8px; font-size: 14px; }
+.gate__msg { margin: 0; font: 600 14px/1.4 'Onest'; color: var(--ink-soft); }
+.gate__msg:empty { display: none; }
+.gate__msg.is-bad { color: var(--accent-deep); }
+.gate__actions { display: grid; gap: 8px; }
+.gate__home {
+  justify-self: center;
+  padding: 8px 12px;
+  font: 600 14px 'Onest';
+  color: var(--ink-soft);
+}
+/* Узкий телефон: три названия в ряд не помещаются, а одинокая кнопка на
+   второй строке читается как отдельный способ. Оставляем знаки — их узнают. */
+@media (max-width: 380px) {
+  .gate { padding: 12px; }
+  .gate__card { padding: 22px 18px 18px; }
+  .gate__provs .btn span { display: none; }
+}

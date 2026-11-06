@@ -1,0 +1,409 @@
+﻿package com.togetherly.love
+
+import android.appwidget.AppWidgetManager
+import android.content.Context
+import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Shader
+import android.net.Uri
+import android.util.Log
+import android.view.View
+import android.widget.RemoteViews
+import es.antonborri.home_widget.HomeWidgetLaunchIntent
+import es.antonborri.home_widget.HomeWidgetProvider
+
+class LoveWidgetProvider : HomeWidgetProvider() {
+
+    companion object {
+        const val ACTION_PLAY_ANIM = "com.togetherly.love.PLAY_PAIR_ANIM"
+    }
+
+    override fun onReceive(context: Context, intent: android.content.Intent) {
+        if (intent.action == ACTION_PLAY_ANIM) {
+            val widgetData = es.antonborri.home_widget.HomeWidgetPlugin.getData(context)
+            val path = widgetData.getString(WidgetAnimPlayer.KEY_PATH, null)
+            val manifest = widgetData.getString(WidgetAnimPlayer.KEY_MANIFEST, null)
+            if (!WidgetAnimPlayer.ready(path, manifest)) return
+            val manager = AppWidgetManager.getInstance(context)
+            val ids = manager.getAppWidgetIds(
+                android.content.ComponentName(context, LoveWidgetProvider::class.java)
+            )
+            if (ids.isEmpty()) return
+            // goAsync даёт приёмнику около десяти секунд живого времени — на
+            // четыре секунды показа хватает, и не нужен ни сервис, ни
+            // уведомление в шторке.
+            val finish = goAsync()
+            Thread {
+                try {
+                    WidgetAnimPlayer.play(
+                        context = context,
+                        widgetIds = ids,
+                        path = path!!,
+                        manifest = manifest!!,
+                        imageViewId = R.id.my_bg_photo,
+                    ) {
+                        buildViews(
+                            context,
+                            widgetData,
+                            WidgetGroupHelper.getOrBind(
+                                context, "pair", ids.first(), "love"),
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e("LoveWidgetProvider", "anim failed", e)
+                } finally {
+                    finish.finish()
+                }
+            }.start()
+            return
+        }
+        super.onReceive(context, intent)
+    }
+
+    override fun onUpdate(
+        context: Context,
+        appWidgetManager: AppWidgetManager,
+        appWidgetIds: IntArray,
+        widgetData: SharedPreferences,
+    ) {
+        appWidgetIds.forEach { widgetId ->
+            val views = try {
+                buildViews(
+                    context,
+                    widgetData,
+                    WidgetGroupHelper.getOrBind(context, "pair", widgetId, "love"),
+                )
+            } catch (e: Exception) {
+                Log.e("LoveWidgetProvider", "onUpdate error", e)
+                return@forEach
+            }
+            appWidgetManager.updateAppWidget(widgetId, views)
+        }
+    }
+
+    // Виджет сняли со стола — привязка к паре ему больше не нужна: иначе
+    // записи копятся, а новый экземпляр с тем же номером получил бы чужую связь.
+    override fun onDeleted(context: Context, appWidgetIds: IntArray) {
+        super.onDeleted(context, appWidgetIds)
+        WidgetGroupHelper.clearBindings(context, "pair", appWidgetIds)
+    }
+
+    // Пара, к которой привязан ЭТОТ экземпляр виджета.
+    //
+    // До 04.09.2026 парный виджет читал общие ключи без пары в имени: один
+    // набор на все связи, и на столе оказывалась та пара, чья синхронизация
+    // прошла последней. Остальные виджеты давно живут по паре — теперь и этот.
+    private fun buildViews(
+        context: Context,
+        widgetData: SharedPreferences,
+        groupId: String,
+    ): RemoteViews {
+        // Пока приложение не разложило ключи по паре (свежая установка сборки,
+        // ещё не было ни одного захода), читаем старые общие — иначе виджет
+        // опустеет до первого открытия приложения.
+        val byPair = groupId.isNotEmpty() &&
+            widgetData.getString("love_${groupId}_ready", null) == "1"
+        fun key(name: String) = if (byPair) "love_${groupId}_$name" else name
+
+        return RemoteViews(context.packageName, R.layout.love_widget).apply {
+
+            // Живое фото (короткое видео или гифка) приезжает раскадровкой:
+            // один webp с кадрами плюс манифест. Готовит его сервер, здесь мы
+            // только показываем — см. WidgetAnimPlayer.
+            val animPath = widgetData.getString(WidgetAnimPlayer.KEY_PATH, null)
+            val animManifest = widgetData.getString(WidgetAnimPlayer.KEY_MANIFEST, null)
+            val animReady = WidgetAnimPlayer.ready(animPath, animManifest)
+
+            // Тап: у живого фото он проигрывает кадры, у обычного открывает
+            // настройки виджета в приложении (вкладка «Виджеты», карточка
+            // «Парный виджет»). Двух целей на одном виджете не делаем: лончер
+            // отдаёт нажатие всему виджету целиком, и вторая цель не сработает.
+            val pendingIntent = if (animReady) {
+                android.app.PendingIntent.getBroadcast(
+                    context,
+                    1,
+                    android.content.Intent(context, LoveWidgetProvider::class.java)
+                        .setAction(ACTION_PLAY_ANIM),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+                        android.app.PendingIntent.FLAG_IMMUTABLE,
+                )
+            } else {
+                HomeWidgetLaunchIntent.getActivity(
+                    context,
+                    MainActivity::class.java,
+                    Uri.parse("loveapp://widgets/pair")
+                )
+            }
+            setOnClickPendingIntent(R.id.widget_root, pendingIntent)
+
+            // ═══════════ Моя сторона ═══════════
+            val myStatus = widgetData.getString(key("my_status"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+            val myMessage = widgetData.getString(key("my_message"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+            val myMusicTitle = widgetData.getString(key("my_music_title"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+            val myMusicArtist = widgetData.getString(key("my_music_artist"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+
+            setTextViewText(R.id.my_status, myStatus)
+            setTextViewText(R.id.my_message, myMessage)
+            setTextViewText(
+                R.id.my_music, when {
+                    myMusicTitle.isNotEmpty() && myMusicArtist.isNotEmpty() ->
+                        "\u266A $myMusicTitle \u2014 $myMusicArtist"
+                    myMusicTitle.isNotEmpty() -> "\u266A $myMusicTitle"
+                    else -> ""
+                }
+            )
+
+            // ── Эмодзи настроения ──
+            val myEmojiPath = widgetData.getString(key("my_mood_emoji_path"), null)
+                .takeIf { !it.isNullOrEmpty() }
+            val myEmojiBitmap = loadScaledBitmap(myEmojiPath, 64, withAlpha = true)
+            if (myEmojiBitmap != null) {
+                setImageViewBitmap(R.id.my_mood_emoji, getCircularEmoji(myEmojiBitmap))
+                setViewVisibility(R.id.my_mood_emoji, View.VISIBLE)
+                setViewVisibility(R.id.my_mood_text, View.GONE)
+            } else {
+                val myMoodLabel = widgetData.getString(key("my_mood"), null)
+                    .takeIf { !it.isNullOrEmpty() } ?: ""
+                setViewVisibility(R.id.my_mood_emoji, View.GONE)
+                setViewVisibility(R.id.my_mood_text, if (myMoodLabel.isNotEmpty()) View.VISIBLE else View.GONE)
+                if (myMoodLabel.isNotEmpty()) setTextViewText(R.id.my_mood_text, myMoodLabel)
+            }
+
+            // ── Фото как фон + лёгкое затемнение ──
+            val myPhotoPath = widgetData.getString(key("my_photo_path"), null)
+                .takeIf { !it.isNullOrEmpty() }
+            // У живого фото фоном стоит первый кадр: в покое виджет выглядит
+            // как обычная фотография, движение начинается по нажатию.
+            val myBgBitmap = if (animReady) {
+                WidgetAnimPlayer.firstFrame(animPath!!, animManifest!!)
+                    ?: loadScaledBitmap(myPhotoPath, 220)
+            } else {
+                loadScaledBitmap(myPhotoPath, 220)
+            }
+            // Цвет подписи считаем по самой фотографии: на светлом кадре
+            // белые буквы пропадали (жалоба от @Vidming). Способ тот же, что и
+            // у текста в чате — контраст по WCAG.
+            val myInk = WidgetContrast.inkFor(myBgBitmap)
+            if (myBgBitmap != null) {
+                setImageViewBitmap(R.id.my_bg_photo, myBgBitmap)
+                setViewVisibility(R.id.my_bg_photo, View.VISIBLE)
+                setViewVisibility(R.id.my_overlay, View.VISIBLE)
+                setInt(R.id.my_overlay, "setBackgroundColor", myInk.veil)
+            } else {
+                setViewVisibility(R.id.my_bg_photo, View.GONE)
+                setViewVisibility(R.id.my_overlay, View.GONE)
+            }
+            setTextColor(R.id.my_status, myInk.primary)
+            setTextColor(R.id.my_message, myInk.secondary)
+            setTextColor(R.id.my_music, myInk.tertiary)
+
+            // ── Круглая аватарка ──
+            val myAvatarPath = widgetData.getString(key("my_avatar_path"), null)
+                .takeIf { !it.isNullOrEmpty() }
+            val myAvatarBitmap = loadScaledBitmap(myAvatarPath, 96)
+            if (myAvatarBitmap != null) {
+                setImageViewBitmap(R.id.my_avatar, getCircularBitmap(myAvatarBitmap))
+                setViewVisibility(R.id.my_avatar, View.VISIBLE)
+            } else {
+                setViewVisibility(R.id.my_avatar, View.GONE)
+            }
+
+            applyHint(
+                context, widgetData,
+                PairWidgetHint.decide(
+                    mine = true,
+                    photoPath = myPhotoPath,
+                    photoShown = myBgBitmap != null,
+                    hasMood = myEmojiBitmap != null ||
+                        !widgetData.getString(key("my_mood"), null).isNullOrEmpty(),
+                    hasText = myStatus.isNotEmpty() || myMessage.isNotEmpty() ||
+                        myMusicTitle.isNotEmpty(),
+                ),
+                R.id.my_center, R.id.my_hint, R.id.my_hint_icon,
+                R.id.my_hint_title, R.id.my_hint_sub,
+            )
+
+            // ═══════════ Сторона партнёра ═══════════
+            val partnerStatus = widgetData.getString(key("partner_status"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+            val partnerMessage = widgetData.getString(key("partner_message"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+            val partnerMusicTitle = widgetData.getString(key("partner_music_title"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+            val partnerMusicArtist = widgetData.getString(key("partner_music_artist"), null)
+                .takeIf { !it.isNullOrEmpty() } ?: ""
+
+            setTextViewText(R.id.partner_status, partnerStatus)
+            setTextViewText(R.id.partner_message, partnerMessage)
+            setTextViewText(
+                R.id.partner_music, when {
+                    partnerMusicTitle.isNotEmpty() && partnerMusicArtist.isNotEmpty() ->
+                        "\u266A $partnerMusicTitle \u2014 $partnerMusicArtist"
+                    partnerMusicTitle.isNotEmpty() -> "\u266A $partnerMusicTitle"
+                    else -> ""
+                }
+            )
+
+            // ── Эмодзи настроения партнёра ──
+            val partnerEmojiPath = widgetData.getString(key("partner_mood_emoji_path"), null)
+                .takeIf { !it.isNullOrEmpty() }
+            val partnerEmojiBitmap = loadScaledBitmap(partnerEmojiPath, 64, withAlpha = true)
+            if (partnerEmojiBitmap != null) {
+                setImageViewBitmap(R.id.partner_mood_emoji, getCircularEmoji(partnerEmojiBitmap))
+                setViewVisibility(R.id.partner_mood_emoji, View.VISIBLE)
+                setViewVisibility(R.id.partner_mood_text, View.GONE)
+            } else {
+                val partnerMoodLabel = widgetData.getString(key("partner_mood"), null)
+                    .takeIf { !it.isNullOrEmpty() } ?: ""
+                setViewVisibility(R.id.partner_mood_emoji, View.GONE)
+                setViewVisibility(R.id.partner_mood_text, if (partnerMoodLabel.isNotEmpty()) View.VISIBLE else View.GONE)
+                if (partnerMoodLabel.isNotEmpty()) setTextViewText(R.id.partner_mood_text, partnerMoodLabel)
+            }
+
+            // ── Фото партнёра как фон + лёгкое затемнение ──
+            val partnerPhotoPath = widgetData.getString(key("partner_photo_path"), null)
+                .takeIf { !it.isNullOrEmpty() }
+            val partnerBgBitmap = loadScaledBitmap(partnerPhotoPath, 220)
+            val partnerInk = WidgetContrast.inkFor(partnerBgBitmap)
+            if (partnerBgBitmap != null) {
+                setImageViewBitmap(R.id.partner_bg_photo, partnerBgBitmap)
+                setViewVisibility(R.id.partner_bg_photo, View.VISIBLE)
+                setViewVisibility(R.id.partner_overlay, View.VISIBLE)
+                setInt(R.id.partner_overlay, "setBackgroundColor", partnerInk.veil)
+            } else {
+                setViewVisibility(R.id.partner_bg_photo, View.GONE)
+                setViewVisibility(R.id.partner_overlay, View.GONE)
+            }
+            setTextColor(R.id.partner_status, partnerInk.primary)
+            setTextColor(R.id.partner_message, partnerInk.secondary)
+            setTextColor(R.id.partner_music, partnerInk.tertiary)
+
+            // ── Круглая аватарка партнёра ──
+            val partnerAvatarPath = widgetData.getString(key("partner_avatar_path"), null)
+                .takeIf { !it.isNullOrEmpty() }
+            val partnerAvatarBitmap = loadScaledBitmap(partnerAvatarPath, 96)
+            if (partnerAvatarBitmap != null) {
+                setImageViewBitmap(R.id.partner_avatar, getCircularBitmap(partnerAvatarBitmap))
+                setViewVisibility(R.id.partner_avatar, View.VISIBLE)
+            } else {
+                setViewVisibility(R.id.partner_avatar, View.GONE)
+            }
+
+            applyHint(
+                context, widgetData,
+                PairWidgetHint.decide(
+                    mine = false,
+                    photoPath = partnerPhotoPath,
+                    photoShown = partnerBgBitmap != null,
+                    hasMood = partnerEmojiBitmap != null ||
+                        !widgetData.getString(key("partner_mood"), null).isNullOrEmpty(),
+                    hasText = partnerStatus.isNotEmpty() ||
+                        partnerMessage.isNotEmpty() || partnerMusicTitle.isNotEmpty(),
+                ),
+                R.id.partner_center, R.id.partner_hint, R.id.partner_hint_icon,
+                R.id.partner_hint_title, R.id.partner_hint_sub,
+            )
+        }
+    }
+
+    /** Подсказка вместо центра половины: фото не дошло или половина пуста. */
+    private fun RemoteViews.applyHint(
+        context: Context,
+        data: SharedPreferences,
+        hint: PairWidgetHint,
+        centerId: Int,
+        hintId: Int,
+        iconId: Int,
+        titleId: Int,
+        subId: Int,
+    ) {
+        if (hint == PairWidgetHint.NONE) {
+            setViewVisibility(hintId, View.GONE)
+            setViewVisibility(centerId, View.VISIBLE)
+            return
+        }
+        setViewVisibility(centerId, View.GONE)
+        setViewVisibility(hintId, View.VISIBLE)
+        setImageViewResource(iconId, hint.iconRes)
+        setTextViewText(titleId, hint.title(context, data))
+        setTextViewText(subId, hint.sub(context, data))
+    }
+
+    private fun getCircularEmoji(bitmap: Bitmap): Bitmap {
+        val size = minOf(bitmap.width, bitmap.height)
+        val scaled = if (bitmap.width != size || bitmap.height != size)
+            Bitmap.createScaledBitmap(bitmap, size, size, true) else bitmap
+        val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        val shader = BitmapShader(scaled, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.shader = shader }
+        canvas.drawCircle(size / 2f, size / 2f, size / 2f, paint)
+        return output
+    }
+
+    private fun getCircularBitmap(bitmap: Bitmap): Bitmap {
+        val size = minOf(bitmap.width, bitmap.height)
+        val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        val paint = Paint().apply { isAntiAlias = true }
+        val srcRect = Rect(
+            (bitmap.width - size) / 2,
+            (bitmap.height - size) / 2,
+            (bitmap.width + size) / 2,
+            (bitmap.height + size) / 2
+        )
+        val dstRectF = RectF(0f, 0f, size.toFloat(), size.toFloat())
+        val radius = size / 2f
+
+        canvas.drawARGB(0, 0, 0, 0)
+        canvas.drawRoundRect(dstRectF, radius, radius, paint)
+        paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+        canvas.drawBitmap(bitmap, srcRect, dstRectF, paint)
+        paint.xfermode = null
+        paint.style = Paint.Style.STROKE
+        paint.color = Color.WHITE
+        paint.strokeWidth = size * 0.05f
+        canvas.drawCircle(radius, radius, radius - paint.strokeWidth / 2f, paint)
+        return output
+    }
+
+    private fun loadScaledBitmap(path: String?, maxSizePx: Int, withAlpha: Boolean = false): Bitmap? {
+        if (path.isNullOrEmpty()) return null
+        val file = java.io.File(path)
+        if (!file.exists()) return null
+
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, opts)
+        if (opts.outWidth <= 0 || opts.outHeight <= 0) return null
+
+        var sampleSize = 1
+        var w = opts.outWidth
+        var h = opts.outHeight
+        while (w / 2 >= maxSizePx || h / 2 >= maxSizePx) {
+            sampleSize *= 2; w /= 2; h /= 2
+        }
+
+        return try {
+            BitmapFactory.decodeFile(path, BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inDither = !withAlpha
+                inScaled = false
+                inPreferredConfig = if (withAlpha) Bitmap.Config.ARGB_8888 else Bitmap.Config.RGB_565
+            })
+        } catch (e: Throwable) { null }
+    }
+}

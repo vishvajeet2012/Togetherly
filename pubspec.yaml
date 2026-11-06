@@ -1,0 +1,225 @@
+name: love_app
+description: "Togetherly — a private space for couples with shared memories, mood tracking, timers, drawings, and widgets."
+publish_to: "none"
+
+version: 1.41.0+265
+
+environment:
+  sdk: ^3.10.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Системные части интерфейса (выбор даты, меню копирования, подписи кнопок
+  # диалогов) переводит не наш словарь, а делегаты Flutter. Без этого пакета они
+  # остаются английскими на любом выбранном языке.
+  flutter_localizations:
+    sdk: flutter
+
+  characters: ^1.4.0 # графемы для безопасной работы с эмодзи (utils/safe_text)
+  shared_preferences: ^2.3.4
+  crypto: ^3.0.7 # SHA-256 для PIN секретных воспоминаний (secret_pin_service)
+  # Нативный вход через Apple: системный диалог вместо веб-страницы.
+  # Через браузер вход отказывал у части людей — SFSafariViewController не мог
+  # загрузить appleid.apple.com (77 обрывов против 33 входов за сутки).
+  sign_in_with_apple: ^6.1.4
+  google_sign_in: ^6.2.2
+  sentry_flutter: ^9.0.0
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^7.1.4
+  share_plus: ^10.1.3
+  app_links: ^6.3.3
+  image_picker: ^1.1.2
+  image_picker_android: ^0.8.12
+  image_picker_platform_interface: ^2.10.0
+  image_cropper: ^12.2.1
+  # Свои темы Togetherly+: ручной пикер цвета (HSV-колесо и HEX).
+  # Цвета из фотографии считает material_color_utilities — тем же
+  # квантователем, которым Android берёт палитру из обоев; отдельный
+  # palette_generator для этого не нужен, он к тому же заброшен.
+  flutter_colorpicker: ^1.1.0
+  # Книга пары: воспоминания за выбранные даты одним PDF.
+  pdf: ^3.11.1
+  # Версию пиннит сам Flutter, и на разных каналах она разная: SDK 3.38.5
+  # в CI держит 0.11.1, свежий локальный — 0.13.0. Жёсткое ^0.13.0 роняло
+  # `flutter pub get` в прогоне на «version solving failed». Нам нужны
+  # только Hct и QuantizerCelebi, они одинаковы в обеих.
+  material_color_utilities: ">=0.11.1 <0.14.0"
+  flutter_local_notifications: ^21.0.0
+  file_picker: ^8.0.7
+  # geolocator_android до 5.0.2 ронял приложение на прошивках без сервисов
+  # Google (test/geolocator_without_gms_test.dart). Выше 5.0.2 не пускать:
+  # с 5.0.3 плагин тянет Android Gradle Plugin 9, а проект на 8.11.
+  geolocator: ^14.0.2
+  geolocator_android: 5.0.2
+  geocoding: ^3.0.0
+  path_provider: ^2.1.5
+  just_audio: ^0.9.42
+  # Сессия звука iPhone: звук сундука не играет поверх чужой музыки.
+  audio_session: ^0.1.25
+  # Запись голосовых: 7.x требует Flutter 3.44, у нас 3.41 — держим 6.x.
+  record: ^6.2.1
+  # Голосовая связь в комнате совместного просмотра (WebRTC между двумя).
+  # Не ниже 1.6.0: до неё FlutterRTCDesktopCapturer.m звал приватный селектор
+  # RPSystemBroadcastPickerView.buttonPressed:, и App Store резал бинарь
+  # (ITMS-90338, реджект 7 августа).
+  flutter_webrtc: ^1.6.0
+  url_launcher: ^6.3.1
+  http: ^1.2.0
+  intl: ^0.20.2 # версию диктует flutter_localizations
+  flutter_svg: ^2.0.9
+  home_widget: ^0.9.0
+  cached_network_image: ^3.4.1
+  # Транзитивно тянется cached_network_image; объявляем явно — нужен прямой доступ
+  # к CacheManager для долгоживущего (невытесняемого) кэша офлайн-просмотра медиа.
+  flutter_cache_manager: ^3.3.0
+  # Своя папка для этого кэша (media_view_cache.dart): интерфейс FileSystem
+  # пакета отдаёт File из package:file.
+  file: ^7.0.1
+  path: ^1.9.1
+  fl_chart: ^1.2.0
+  archive: ^4.0.9
+  flutter_image_compress: ^2.3.0
+  video_compress: ^3.1.2
+  flutter_animate: ^4.5.0
+  material3_expressive_loading_indicator: ^0.1.2 # M3 Expressive морфинг-лоадер (кнопка нового кода)
+  material_new_shapes: ^1.0.0 # аутентичные формы M3 (RoundedPolygon.toPath → клипперы/бордеры)
+  flutter_map: ^8.3.2
+  latlong2: ^0.10.1
+  # Векторная подложка «Где мы» в цветах темы (стиль собирается из ColorScheme).
+  # Бета 9.x — последняя ветка под flutter_map 8 без flutter_gpu.
+  vector_map_tiles: 9.0.0-beta.13
+  vector_tile_renderer: ^6.1.0 # тема карты собирается из стиля в коде
+  exif: ^3.3.0
+  # 10.x обязателен: 9.x грузил плеер как данные с baseUrl youtube-nocookie.com
+  # и не передавал `origin` вовсе, поэтому YouTube отвечал ошибкой 153 и не
+  # играл НИ ОДНОГО ролика (жалоба 1 августа). Движок 10.x переписан на
+  # youtube_player_iframe, а тот явно проставляет origin и widget_referrer.
+  youtube_player_flutter: ^10.0.1
+  # Свой, не транзитивный: 10.x ушёл с flutter_inappwebview на webview_flutter,
+  # а мы напрямую зовём InAppWebViewController.getCurrentWebViewPackage()
+  # (версия WebView в телеметрию отказов co-watch плеера).
+  # Бета, а не 6.1.5: в стабильной InAppWebView.swift резолвит приватный класс
+  # PGHostedWindow через NSClassFromString, из-за чего Apple завернула сборку
+  # (ITMS-90338, реджект 7 августа). Убрано только в ветке 6.2.0-beta.
+  flutter_inappwebview: ^6.2.0-beta.3
+  timezone: ^0.11.0
+  package_info_plus: ^8.0.0
+  device_info_plus: ^11.1.0
+  gal: ^2.3.0
+  video_player: ^2.9.2
+  # Экраны на 90 и 120 Гц: Android по умолчанию отдаёт приложению 60.
+  flutter_displaymode: ^0.6.0
+  in_app_update: ^4.2.3
+  google_mobile_ads: ^5.2.0
+  # 8.6: письмо РСЯ 17.10.2026 «обновите SDK до 8.6.0». Нативный SDK плагин
+  # тянет той же версии (iOS YandexMobileAds ~> 8.6.0, Android mobileads 8.6.0).
+  yandex_mobileads: ^8.6.0
+  # app_tracking_transparency убран: приложение не отслеживает пользователей,
+  # реклама неперсональная (App Privacy → Tracking = None). См. main.dart.
+  in_app_purchase: ^3.3.0
+  connectivity_plus: ^7.1.1
+  flutter_rustore_billing: ^9.0.0
+  pocketbase: ^0.24.0
+  # Realtime через Centrifugo (замена встроенного SSE PB): один WS на приложение,
+  # приватные каналы pair/user/loc с JWT от PB. См. services/centrifugo_service.dart.
+  centrifuge: ^0.20.0
+  flutter_foreground_task: ^9.2.2
+  # Живучий фолбэк обновления виджетов: периодическая фоновая задача (мин. 15 мин),
+  # переживает убийство процесса и Doze на агрессивных OEM (Xiaomi/Samsung), где
+  # foreground-сервис с realtime-сокетом усыпляют. См.
+  # services/widget_background_refresh_service.dart.
+  workmanager: ^0.9.0+3
+  # Офлайн-кэш (offline-first): чистый Dart NoSQL-стор документов — кладём
+  # JSON-записи PB как есть, без нативного кода (сборки iOS/RuStore не трогаем).
+  sembast: ^3.7.0
+  encrypt: ^5.0.3
+  flutter_secure_storage: ^10.3.1
+  visibility_detector: ^0.4.0+2
+  image: ^4.8.0
+  camera: ^0.12.0+2
+  sensors_plus: ^7.1.1
+
+dev_dependencies:
+  integration_test:
+    sdk: flutter
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1
+  qr: ^3.0.2
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  # Иконка приложения — рисунок 512x512 (кроп исходника из
+  # docs/branding/raw/app-icon-source.png, делает tool/gen_main_icon.py).
+  # Файл лежит вне assets намеренно: в сборку едет только webp-превью.
+  image_path: "docs/branding/app-icon-512.png"
+  min_sdk_android: 21
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/new emodji/
+    - assets/images/mood_packs/pink/
+    - assets/images/mood_packs/bunny/
+    - assets/images/widget/
+    - assets/images/mascots/
+    - assets/images/gif/
+    - assets/images/icons/
+    - assets/images/gifts/
+    - assets/images/achievements/
+    - assets/images/frames/
+    - assets/images/themes/
+    - assets/images/ailments/
+    - assets/images/reactions/
+    - assets/images/reels/
+    - assets/sounds/
+    - assets/images/logo/
+    - assets/icons/
+    - assets/mascots/
+    # Раскраски вдвоём: контур с прозрачным фоном (ложится поверх мазков) и
+    # превью для каталога.
+    - assets/coloring/
+    # Карта «имя символа → кодпоинт» для выбора значка таймера. Лежит файлом, а
+    # не константой в коде: 4334 записи в Dart раздували бы сборку исходника,
+    # а нужны они только на экране выбора.
+    - assets/symbols/material_symbols.json
+    # Карта «Где мы»: базовый стиль подложки и контуры суши для глобуса
+    # (tool/gen_map_assets.py).
+    - assets/map/
+
+
+  # Unbounded (заголовки/числа) + Onest (текст) — шрифты M3-экрана «Профиль»
+  # в стиле Kadr. Веса задаются через FontWeight поверх одного начертания.
+  #
+  # MaterialSymbolsRounded — полный набор значков Google (4381 штука) для
+  # выбора символа таймера. Взят из пакета material_symbols_icons и
+  # зафиксирован по осям (wght 400, FILL 0, GRAD 0, opsz 24): переменный файл
+  # весит 15 МБ, статический — 1,7 МБ. Пакетом не подключаем намеренно: символ
+  # выбирается по имени из базы, а при динамическом IconData Flutter отключает
+  # tree-shaking и тянет в сборку все три начертания.
+  fonts:
+    - family: Unbounded
+      fonts:
+        - asset: assets/fonts/Unbounded.ttf
+    - family: Onest
+      fonts:
+        - asset: assets/fonts/Onest.ttf
+    - family: MaterialSymbolsRounded
+      fonts:
+        - asset: assets/fonts/MaterialSymbolsRounded.ttf
+
+dependency_overrides:
+  # vector_tile_renderer 6.1 держит vector_tile ^2 (protobuf ^3), а centrifuge
+  # требует protobuf >=5. vector_tile 4 — тот же декодер на protobuf 6.
+  vector_tile: ^4.0.0
+  # Копия 1.2.0-beta.3 с одной правкой: браузер регистрируется с политикой
+  # жестов DoNotBlockGesture. Без неё на iOS 26 после рекламы перед комнатой
+  # касания в комнату не доходят (обращения 226, 229). Обновляя плагин,
+  # перенести правку в InAppWebViewFlutterPlugin.swift.
+  flutter_inappwebview_ios:
+    path: third_party/flutter_inappwebview_ios

@@ -1,0 +1,376 @@
+import SwiftUI
+import WidgetKit
+import ImageIO
+import os
+import UIKit
+
+// MARK: - App Group
+
+/// Общая «песочница» между приложением Flutter и виджетами.
+/// ВАЖНО: это значение должно совпадать с:
+///   • HomeWidget.setAppGroupId(...) во Flutter (lib/main.dart);
+///   • App Group в Runner.entitlements / RunnerDebug.entitlements;
+///   • App Group в TogetherlyWidget.entitlements;
+///   • App Group, заведённым в Apple Developer → Identifiers → App Groups.
+/// Плагин home_widget на iOS пишет данные в UserDefaults(suiteName: appGroupId)
+/// ключами «как есть» — теми же, что в Dart-коде saveWidgetData('key', ...).
+enum AppGroup {
+    static let id = "group.com.togetherly.love"
+    static var defaults: UserDefaults? { UserDefaults(suiteName: id) }
+}
+
+// MARK: - Чтение значений из App Group
+
+/// Тонкая обёртка над UserDefaults общей группы: единый доступ к ключам,
+/// которые пишет Flutter (см. lib/services/home_widget_service.dart и
+/// lib/services/widget_service.dart).
+struct Store {
+    private let d = AppGroup.defaults
+
+    func string(_ key: String, _ fallback: String = "") -> String {
+        d?.string(forKey: key) ?? fallback
+    }
+
+    /// То же, но без подстановки: nil означает «ключа нет вовсе» — виджет
+    /// поставлен сборкой, которая его ещё не писала. Пустая строка при этом
+    /// остаётся значащей: так приложение просит ничего не рисовать.
+    func stringOrNil(_ key: String) -> String? { d?.string(forKey: key) }
+
+    /// home_widget пишет числа как через saveWidgetData<int>, так и строками
+    /// (saveWidgetData<String>(n.toString())). Читаем устойчиво к обоим вариантам.
+    func int(_ key: String, _ fallback: Int = 0) -> Int {
+        guard let obj = d?.object(forKey: key) else { return fallback }
+        if let n = obj as? Int { return n }
+        if let n = obj as? NSNumber { return n.intValue }
+        if let s = obj as? String { return Int(s) ?? fallback }
+        return fallback
+    }
+
+    func bool01(_ key: String) -> Bool { string(key) == "1" }
+
+    /// Загружает изображение по абсолютному пути из контейнера App Group
+    /// (туда фото копирует AppDelegate.copyToAppGroup). Путь лежит в значении
+    /// ключа [key]; пустой путь / отсутствующий файл → nil.
+    func uiImage(_ key: String, maxSide: CGFloat = WidgetImage.maxSide) -> UIImage? {
+        let path = string(key)
+        guard !path.isEmpty else { return nil }
+        return WidgetImage.load(path, maxSide: maxSide)
+    }
+
+    /// Возвращает groupId активной группы для конкретного семейства виджетов.
+    /// Flutter пишет указатель «<type>_latest_group», а сами данные лежат под
+    /// «<type>_<groupId>_<field>». 'solo'/'' — соло-режим (sentinel из Dart).
+    func latestGroup(_ pointerKey: String) -> String {
+        let g = string(pointerKey)
+        return g.isEmpty ? "solo" : g
+    }
+}
+
+// MARK: - Темы / цвета
+
+/// Палитра акцентов приложения (см. timer_<g>_petal_theme: 0..4).
+enum Palette {
+    static let accents: [Color] = [
+        Color(hex: 0xFF7E8B), // 0 pink
+        Color(hex: 0x9C77FF), // 1 purple
+        Color(hex: 0x5AA9FF), // 2 blue
+        Color(hex: 0xFF9D5C), // 3 orange
+        Color(hex: 0x57C99A), // 4 green
+    ]
+
+    static func accent(_ index: Int) -> Color {
+        guard index >= 0 && index < accents.count else { return accents[0] }
+        return accents[index]
+    }
+
+    static let cardBackground = Color(hex: 0xFFFFFF)
+    static let cardBackgroundSoft = Color(hex: 0xFFF3F0)
+    static let title = Color(hex: 0x2A2A2A)
+    static let body = Color(hex: 0x555555)
+    static let muted = Color(hex: 0x999999)
+}
+
+extension Color {
+    /// Цвет из 0xRRGGBB.
+    init(hex: UInt32) {
+        let r = Double((hex >> 16) & 0xFF) / 255.0
+        let g = Double((hex >> 8) & 0xFF) / 255.0
+        let b = Double(hex & 0xFF) / 255.0
+        self.init(.sRGB, red: r, green: g, blue: b, opacity: 1)
+    }
+
+    /// Цвет из строки «#RRGGBB» / «RRGGBB» / «0xRRGGBB». Пусто/ошибка → fallback.
+    init(css: String, fallback: Color) {
+        var s = css.trimmingCharacters(in: .whitespaces)
+        s = s.replacingOccurrences(of: "#", with: "")
+             .replacingOccurrences(of: "0x", with: "")
+             .replacingOccurrences(of: "0X", with: "")
+        if s.count == 8 { s = String(s.suffix(6)) } // ARGB → RGB
+        guard s.count == 6, let v = UInt32(s, radix: 16) else {
+            self = fallback
+            return
+        }
+        self.init(hex: v)
+    }
+}
+
+// MARK: - Общая «карточка»
+
+/// Единый фон-карточка под все виджеты — мягкий градиент в тон акценту.
+struct WidgetCard<Content: View>: View {
+    var accent: Color
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Palette.cardBackground, accent.opacity(0.10)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            content()
+                .padding(14)
+        }
+    }
+}
+
+// MARK: - Помощники дат/чисел
+
+enum TimeMath {
+    /// Разбивает интервал (в секундах) на годы/месяцы/дни/часы/минуты/секунды
+    /// приблизительно (для «лепесткового» циферблата достаточно).
+    static func breakdown(fromEpochMs ms: Int) -> (y: Int, mo: Int, d: Int, h: Int, mi: Int, s: Int) {
+        guard ms > 0 else { return (0, 0, 0, 0, 0, 0) }
+        let start = Date(timeIntervalSince1970: Double(ms) / 1000.0)
+        let now = Date()
+        let comps = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: min(start, now), to: max(start, now)
+        )
+        return (
+            comps.year ?? 0, comps.month ?? 0, comps.day ?? 0,
+            comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0
+        )
+    }
+
+    /// Целых дней между датой старта (мс) и сейчас (по модулю).
+    static func days(fromEpochMs ms: Int) -> Int {
+        guard ms > 0 else { return 0 }
+        let start = Date(timeIntervalSince1970: Double(ms) / 1000.0)
+        let secs = abs(Date().timeIntervalSince(start))
+        return Int(secs / 86400)
+    }
+}
+
+// MARK: - Чтение картинок с оглядкой на память
+
+/// Расширению система отводит около 30 МБ на всё, а `UIImage(contentsOfFile:)`
+/// разжимает файл целиком: снимок с камеры на 4000×3000 съедает под пятьдесят,
+/// и расширение убивают до того, как оно нарисует хоть что-то. Человек видит
+/// серый прямоугольник и считает виджет сломанным.
+///
+/// Поэтому картинка читается через ImageIO с ограничением по большей стороне: в
+/// память попадает уже уменьшенный кадр. Приложение с 18.08.2026 и само кладёт
+/// в контейнер ужатые файлы, но снимки, положенные прежними сборками, лежат на
+/// столах у людей и никуда не денутся.
+enum WidgetImage {
+    /// Больше виджету не нужно: самый крупный на iPad около 780 точек, на
+    /// iPhone — 360; остальное запас на плотность экрана.
+    static let maxSide: CGFloat = 1200
+
+    /// Предел для аватарки. Её рисуют кружком в сорок-шестьдесят точек, а с
+    /// общим пределом она разжималась в 1200×1200 — почти шесть мегабайт на
+    /// каждую. В виджете настроения таких четыре, и вместе с фоном это уже
+    /// больше памяти, чем отводят расширению: оно умирает, и человек видит
+    /// пустой прямоугольник. Ту же меру приняли для парного виджета
+    /// (LoveWidgetImage) после разбора 07.09.2026 — здесь она была упущена.
+    static let avatar: CGFloat = 200
+
+    /// [logAs] — под каким именем записать в журнал отрисовки. Пусто — молча.
+    static func load(
+        _ path: String,
+        maxSide: CGFloat = WidgetImage.maxSide,
+        logAs widget: String = "",
+        family: String = ""
+    ) -> UIImage? {
+        // Пишем ДО разжатия: если процесс убьют на нём, в журнале останется
+        // начало без признака `decoded` — это и есть подпись нехватки памяти.
+        if !widget.isEmpty {
+            var facts = WidgetRenderLog.fileFacts(path)
+            facts["start"] = "1"
+            facts["mem"] = String(WidgetRenderLog.availableMemoryMB())
+            WidgetRenderLog.write(family: family, widget: widget, fields: facts)
+        }
+        let url = URL(fileURLWithPath: path)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            if !widget.isEmpty {
+                WidgetRenderLog.write(
+                    family: family,
+                    widget: widget,
+                    fields: ["decoded": "0", "reason": "no-source"]
+                )
+            }
+            return nil
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxSide,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(
+            source, 0, options as CFDictionary
+        ) else {
+            // Формат не по зубам ImageIO — читаем как раньше: лучше рискнуть
+            // памятью, чем показать пустоту.
+            let fallback = UIImage(contentsOfFile: path)
+            if !widget.isEmpty {
+                WidgetRenderLog.write(
+                    family: family,
+                    widget: widget,
+                    fields: [
+                        "decoded": fallback == nil ? "0" : "1",
+                        "reason": "no-thumb",
+                        "mem": String(WidgetRenderLog.availableMemoryMB()),
+                    ]
+                )
+            }
+            return fallback
+        }
+        if !widget.isEmpty {
+            WidgetRenderLog.write(
+                family: family,
+                widget: widget,
+                fields: [
+                    "decoded": "1",
+                    "px": "\(cg.width)x\(cg.height)",
+                    "mem": String(WidgetRenderLog.availableMemoryMB()),
+                ]
+            )
+        }
+        return UIImage(cgImage: cg)
+    }
+}
+
+// MARK: - Отметка «виджет стоит на экране»
+
+/// Приложение закрывает по ней шаг «поставить виджет» в первых действиях
+/// пары. Кнопки «добавить на рабочий стол» на iPhone нет, виджет ставят с
+/// рабочего стола, и до 16.10.2026 шаг не закрывался ни у кого (обращение
+/// 268): приложение узнавало о виджете только по своей кнопке.
+///
+/// Таймлайн система просит только у поставленного виджета, галерея обходится
+/// снимком, поэтому отметка ставится в `getTimeline` и только вне превью.
+enum WidgetPresence {
+    /// Совпадает с `kWidgetOnScreenKey` в lib/services/home_widget_service.dart.
+    static let key = "widget_on_screen_at"
+
+    static func mark() {
+        AppGroup.defaults?.set(String(Int(Date().timeIntervalSince1970)), forKey: key)
+    }
+}
+
+// MARK: - Журнал отрисовки виджета
+
+/// Виджет живёт отдельным процессом, и в наш Bugsink пишет приложение, а не он.
+/// Поэтому расширение оставляет короткие записи в общем контейнере, а приложение
+/// при запуске забирает их и отправляет вместе со сводкой (см.
+/// `lib/services/widget_render_log.dart`).
+///
+/// Ради этого журнал и заведён 18.08.2026: квадрат 1×1 не показывал фотографию,
+/// а средний и большой показывали ту же самую. Данные в контейнере при этом
+/// лежали на месте, то есть ломается что-то внутри расширения, куда снаружи не
+/// заглянуть.
+///
+/// Строка: `время|размер|виджет|ключ=значение;ключ=значение`. Запись, у которой
+/// есть `start`, но нет `decoded`, означает, что процесс убили посередине — это
+/// и есть подпись нехватки памяти (расширению дают около 30 МБ).
+enum WidgetRenderLog {
+    static let key = "widget_render_log"
+
+    /// Больше не храним: журнал читается приложением и чистится, а раздувать
+    /// общий контейнер строками незачем.
+    private static let maxLines = 40
+
+    /// Сколько памяти осталось процессу, в мегабайтах. По ней сразу видно,
+    /// упёрлись мы в потолок расширения или нет.
+    static func availableMemoryMB() -> Int {
+        Int(os_proc_available_memory()) / (1024 * 1024)
+    }
+
+    static func familyName(_ family: WidgetFamily) -> String {
+        switch family {
+        case .systemSmall: return "small"
+        case .systemMedium: return "medium"
+        case .systemLarge: return "large"
+        case .systemExtraLarge: return "xlarge"
+        case .accessoryCircular: return "circular"
+        case .accessoryRectangular: return "rect"
+        case .accessoryInline: return "inline"
+        @unknown default: return "other"
+        }
+    }
+
+    /// Дописать запись. Пишем сразу: если процесс убьют на следующей строке,
+    /// в контейнере останется начало — по нему и станет ясно, где оборвалось.
+    static func write(family: String, widget: String, fields: [String: String]) {
+        guard let d = AppGroup.defaults else { return }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let body = fields
+            .map { "\($0.key)=\($0.value)" }
+            .sorted()
+            .joined(separator: ";")
+        let line = "\(stamp)|\(family)|\(widget)|\(body)"
+
+        var lines = (d.string(forKey: key) ?? "")
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+        lines.append(line)
+        if lines.count > maxLines {
+            lines = Array(lines.suffix(maxLines))
+        }
+        d.set(lines.joined(separator: "\n"), forKey: key)
+    }
+
+    /// Что известно про файл, ещё не разжимая его: есть ли он и сколько весит.
+    static func fileFacts(_ path: String) -> [String: String] {
+        if path.isEmpty { return ["path": "0"] }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else {
+            return ["path": "1", "missing": "1"]
+        }
+        var facts = ["path": "1", "missing": "0"]
+        if let attrs = try? fm.attributesOfItem(atPath: path),
+           let bytes = attrs[.size] as? NSNumber {
+            facts["bytes"] = String(bytes.intValue)
+        }
+        return facts
+    }
+}
+
+// MARK: - Склонения
+
+// Жили в TogetherWidget.swift, пока «Вместе» считал вехи сам. Он больше не
+// считает — подписи ему собирает приложение на языке человека, — а вот
+// «Обратный отсчёт» и «Кольцо года» по-прежнему считают дни в расширении и
+// без этих форм обойтись не могут.
+
+/// «день / дня / дней» — в русском без этого цифра выглядит машинной.
+func daysWord(_ n: Int) -> String {
+    let a = n % 100
+    let b = n % 10
+    if (11...19).contains(a) { return "дней" }
+    if b == 1 { return "день" }
+    if (2...4).contains(b) { return "дня" }
+    return "дней"
+}
+
+/// «год / года / лет».
+func yearsWord(_ n: Int) -> String {
+    let a = n % 100
+    let b = n % 10
+    if (11...19).contains(a) { return "лет" }
+    if b == 1 { return "год" }
+    if (2...4).contains(b) { return "года" }
+    return "лет"
+}

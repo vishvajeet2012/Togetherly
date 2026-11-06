@@ -1,0 +1,3349 @@
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import '../utils/couple_days.dart';
+import '../utils/safe_text.dart';
+import '../widgets/avatar_widget.dart';
+import '../widgets/common/app_dialog.dart';
+import '../widgets/storage_image.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:share_plus/share_plus.dart';
+import '../utils/share_origin.dart';
+import '../models/pair_data.dart';
+import '../models/connection.dart';
+import '../models/profile_icon.dart';
+import '../models/user_data.dart';
+import '../services/chat_service.dart';
+import '../services/deep_link_service.dart';
+import '../widgets/qr/qr_viewfinder.dart';
+import '../widgets/waiting/waiting_card.dart';
+import '../widgets/waiting/waiting_setup_sheet.dart';
+import '../services/pb_data_service.dart';
+import '../services/pb_auth_service.dart';
+import '../services/presence_service.dart';
+import '../services/locale_service.dart';
+import '../services/nickname_service.dart';
+import '../services/timer_service.dart';
+import '../theme/app_theme.dart';
+import '../theme/profile_theme.dart';
+import '../widgets/connect_expressive.dart';
+import 'package:material3_expressive_loading_indicator/material3_expressive_loading_indicator.dart';
+import 'chat_screen.dart';
+import 'login_screen.dart';
+import 'home/widgets/relationship_type_dialog.dart';
+import '../widgets/app_sheet.dart';
+import '../models/widget_data.dart';
+import '../widgets/common/plus_badge.dart';
+import '../widgets/common/stable_stream_builder.dart';
+import '../widgets/unfold/unfold_route.dart';
+import '../utils/invite_code.dart';
+import '../widgets/common/badge_image.dart';
+import '../widgets/common/guide_mascot.dart';
+import '../services/mascot_guide_service.dart';
+
+class ConnectPartnerScreen extends StatefulWidget {
+  final PairData pairData;
+  final AppTheme theme;
+  final UserData? userData;
+  // Загруженный TimerService из home: «дней вместе» берём из его системного
+  // таймера — тот же источник, что виджет и колесо (TimerService не синглтон,
+  // свой new даёт пустой инстанс → 0/фолбэк).
+  final TimerService? timerService;
+  const ConnectPartnerScreen({
+    super.key,
+    required this.pairData,
+    required this.theme,
+    this.userData,
+    this.timerService,
+  });
+
+  @override
+  State<ConnectPartnerScreen> createState() => _ConnectPartnerScreenState();
+}
+
+class _ConnectPartnerScreenState extends State<ConnectPartnerScreen>
+    with SingleTickerProviderStateMixin {
+  Color get primary => widget.theme.primary;
+  Color get primaryLight => widget.theme.primaryLight;
+  final _codeController = TextEditingController();
+  bool _showCodeInput = false;
+  bool _codeError = false;
+  // Re-entrancy guard: без него быстрый повторный тап по варианту в диалоге
+  // «создать подключение» плодил по несколько пустых подключений (сетевой
+  // await генерации кода держал диалог открытым).
+  bool _creatingConnection = false;
+  // Идёт генерация нового кода (крутим лоадер + цикл «дешифратора»).
+  bool _generating = false;
+  // Приём кода уже в работе — второй запрос тем же кодом не отправляем.
+  bool _submitting = false;
+  // Копировать → галочка на ~1.3с.
+  bool _copied = false;
+  // Направление свайпа карусели (для slide-перехода активной группы).
+  int _carDir = 1;
+  // Выбранная форма аватарки на партнёра (локально; тап меняет, морф анимирует).
+  Map<String, int> _shapeIdx = {};
+  late AnimationController _pulseController;
+  StreamSubscription? _deepLinkSub;
+  /// Опрос статуса заявки на второе место (пока её не подтвердили).
+  Timer? _approvalTimer;
+
+  // Онлайн-статус партнёра — живой PB-презенс (heartbeat+TTL). Бейдж — разовая
+  // загрузка из профиля (дедуп по _badgeLoadedUids).
+  final Map<String, bool> _partnerOnlineStatus = {};
+
+  /// Есть ли у участника Togetherly+. Берём из его карточки `widget_data`:
+  /// правила `users` чужую запись не отдают, а флаг туда проставляет сервер
+  /// (`widget_plus.pb.js`), поэтому подделать значок нельзя.
+  final Map<String, bool> _partnerPlus = {};
+  final Set<String> _plusLoadedUids = {};
+  final Map<String, String?> _partnerBadges = {};
+  final Map<String, StreamSubscription<bool>> _presenceSubs = {};
+  final Set<String> _badgeLoadedUids = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadShapes();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+
+    _deepLinkSub = DeepLinkService().inviteCodeStream.listen((code) {
+      if (mounted) {
+        // Код пришёл живым событием, буфер ему больше не нужен: иначе следующее
+        // открытие вкладки приняло бы тот же код второй раз.
+        DeepLinkService().consumePendingInviteCode();
+        // acceptCode handles creating/joining group automatically
+        _codeController.text = code;
+        _showCodeInput = true;
+        setState(() {});
+        _submitCode();
+      }
+    });
+
+    // Экран смонтировался on-demand — на холодном старте deep-link уже мог
+    // отдать код в broadcast-стрим до нашей подписки. Забираем буфер.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final buffered = DeepLinkService().consumePendingInviteCode();
+      if (buffered != null && buffered.isNotEmpty) {
+        _codeController.text = buffered;
+        _showCodeInput = true;
+        setState(() {});
+        _submitCode();
+      }
+    });
+
+    // Подписываемся на присутствие партнёров
+    _subscribeToPartnerPresence();
+    // Переподписываемся при изменении состава группы
+    widget.pairData.addListener(_onPairDataChanged);
+
+    // Пустой код перевыпускаем (генерация не удалась при запуске без сети), а
+    // непустой сверяем с сервером. Сборки до 24 июля рисовали код на устройстве
+    // сами, когда сервер молчал: на экране он выглядит живым, а партнёру
+    // отвечает «Код не найден», и понять это со стороны невозможно.
+    if (!widget.pairData.isPaired) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        // Код на экране появится только после ответа сервера (см.
+        // `_shownCode`), поэтому по завершении перерисовываемся сами.
+        final check = widget.pairData.inviteCode.isEmpty
+            ? widget.pairData.regenerateCode()
+            : widget.pairData.ensureInviteCodeIsReal();
+        check.then((_) {
+          if (mounted) setState(() {});
+        });
+      });
+    }
+  }
+
+  void _onPairDataChanged() {
+    _subscribeToPartnerPresence();
+  }
+
+  void _subscribeToPartnerPresence() {
+    final partners = widget.pairData.partners;
+    final newUids = partners.map((p) => p.uid).toSet();
+
+    // Чистим состояние для вышедших участников.
+    final removed = _presenceSubs.keys.toSet().difference(newUids);
+    for (final uid in removed) {
+      _presenceSubs.remove(uid)?.cancel();
+      _badgeLoadedUids.remove(uid);
+      _partnerOnlineStatus.remove(uid);
+      _partnerBadges.remove(uid);
+      _plusLoadedUids.remove(uid);
+      _partnerPlus.remove(uid);
+    }
+
+    for (final member in partners) {
+      if (member.uid.isEmpty) continue;
+      // Онлайн-статус — живой PB-презенс (heartbeat+TTL).
+      if (!_presenceSubs.containsKey(member.uid)) {
+        _presenceSubs[member.uid] =
+            PresenceService().watchOnline(member.uid).listen((online) {
+          if (mounted) {
+            setState(() => _partnerOnlineStatus[member.uid] = online);
+          }
+        });
+      }
+      // Togetherly+ — разово из карточки виджета партнёра.
+      if (!_plusLoadedUids.contains(member.uid)) {
+        _plusLoadedUids.add(member.uid);
+        PbDataService()
+            .loadWidget(widget.pairData.pairId, member.uid)
+            .then((rec) {
+          if (!mounted || rec == null) return;
+          final has = WidgetData.fromPb(rec).plus;
+          if (has) setState(() => _partnerPlus[member.uid] = true);
+        });
+      }
+      // Бейдж — разово из профиля PB.
+      if (!_badgeLoadedUids.contains(member.uid)) {
+        _badgeLoadedUids.add(member.uid);
+        PbDataService().loadPartnerCard(member.uid).then((p) {
+          if (!mounted || p == null) return;
+          setState(() => _partnerBadges[member.uid] = p['badge'] as String?);
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _codeController.dispose();
+    _pulseController.dispose();
+    _deepLinkSub?.cancel();
+    _approvalTimer?.cancel();
+    widget.pairData.removeListener(_onPairDataChanged);
+    for (final sub in _presenceSubs.values) {
+      sub.cancel();
+    }
+    _presenceSubs.clear();
+    _badgeLoadedUids.clear();
+    super.dispose();
+  }
+
+  PairData get pair => widget.pairData;
+
+  /// Код, который экран вправе показать и раздать.
+  ///
+  /// Без пары — только подтверждённый сервером в этом запуске: код из памяти
+  /// телефона мог умереть на сервере (его сменили с другого устройства,
+  /// аккаунт потерял сессию), и партнёр слышал «Код не найден» 27 раз подряд
+  /// (TPNQGP, 23.09.2026). У пары код групповой, его перевыпускает сама пара.
+  String get _shownCode =>
+      pair.isPaired ? pair.inviteCode : pair.shareableInviteCode;
+
+  bool get _sessionLost =>
+      !pair.isPaired && pair.inviteCodeState == InviteCodeState.sessionLost;
+
+  /// Сессия умерла: ведём на вход, как делает запуск приложения с мёртвым
+  /// токеном. Вход с `isReturningUser` локальные данные не стирает.
+  void _signInAgain() {
+    final userData = widget.userData;
+    if (userData == null) return;
+    Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => LoginScreen(userData: userData)),
+      (_) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Theme(
+      data: ProfileTheme.themeFor(widget.theme),
+      child: Column(
+        children: [
+          const SizedBox(height: 8),
+          _buildGroupTabs(),
+          Expanded(
+            // Пара с пустым местом: партнёра ещё нет, но пара уже есть. Ей
+            // нужен свой экран — кого ждём, сколько осталось и код второго
+            // места, — а не карточка партнёра с пустотой вместо человека.
+            child: pair.isPaired
+                ? (pair.waitingMode
+                    ? _buildWaitingContent()
+                    : _buildConnectedContent())
+                : _buildInviteContent(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// «Ждём подтверждения» — так это выглядит у того, кто ввёл код второго места.
+  /// Пока хозяйка пары не нажала «это он», группа ему не видна вовсе, поэтому
+  /// статус спрашиваем отдельным роутом по таймеру.
+  Widget _waitingApprovalCard(ColorScheme cs) {
+    final s = LocaleService.current;
+    _ensureApprovalPolling();
+    return Container(
+      margin: const EdgeInsets.only(top: 4),
+      padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
+      decoration: BoxDecoration(
+        color: cs.tertiaryContainer,
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 26,
+            height: 26,
+            child: CircularProgressIndicator(
+              strokeWidth: 2.6,
+              color: cs.onTertiaryContainer,
+            ),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  s.waitingPendingTitle,
+                  style: TextStyle(
+                    fontFamily: ProfileTheme.displayFont,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: cs.onTertiaryContainer,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  pair.awaitingOwnerName.isEmpty
+                      ? s.waitingPendingHint
+                      : '${pair.awaitingOwnerName}: ${s.waitingPendingHint}',
+                  style: TextStyle(
+                    fontFamily: ProfileTheme.bodyFont,
+                    fontSize: 12.5,
+                    height: 1.3,
+                    color: cs.onTertiaryContainer,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Опрос статуса заявки. Раз в пять секунд: подтверждение — событие редкое,
+  /// но ждут его, глядя в экран, и минутная задержка читалась бы как поломка.
+  void _ensureApprovalPolling() {
+    if (_approvalTimer != null) return;
+    _approvalTimer = Timer.periodic(const Duration(seconds: 5), (t) async {
+      if (!mounted || !pair.awaitingApproval) {
+        t.cancel();
+        _approvalTimer = null;
+        return;
+      }
+      final status = await pair.checkWaitingClaim();
+      if (!mounted) return;
+      if (status == 'approved') {
+        t.cancel();
+        _approvalTimer = null;
+        _showSnack(LocaleService.current.waitingApproved);
+        setState(() {});
+      } else if (status == 'rejected' || status == 'gone') {
+        t.cancel();
+        _approvalTimer = null;
+        _showSnack(LocaleService.current.waitingRejected);
+        setState(() {});
+      }
+    });
+  }
+
+  /// Экран пары, где второе место ждёт своего человека.
+  Widget _buildWaitingContent() {
+    return ListView(
+      padding: const EdgeInsets.only(top: 8, bottom: 120),
+      children: [
+        WaitingCard(pair: pair, theme: widget.theme),
+      ],
+    );
+  }
+
+  /// Кнопка «жду человека» на экране приглашения: пара заводится на одного.
+  Widget _buildWaitingEntry() {
+    final cs = Theme.of(context).colorScheme;
+    final s = LocaleService.current;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onTap: () async {
+          final created = await WaitingSetupSheet.show(
+            context,
+            pair: pair,
+            theme: widget.theme,
+          );
+          if (created == true && mounted) setState(() {});
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+          decoration: BoxDecoration(
+            color: cs.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(24),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.hourglass_top_rounded, color: cs.primary),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      s.waitingSetupTitle,
+                      style: TextStyle(
+                        fontFamily: ProfileTheme.displayFont,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: cs.onSurface,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      s.waitingSetupHint,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontFamily: ProfileTheme.bodyFont,
+                        fontSize: 12.5,
+                        height: 1.3,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(Icons.chevron_right_rounded, color: cs.onSurfaceVariant),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  GROUP TABS — horizontal scrollable chips
+  // ═══════════════════════════════════════════════════
+  Widget _buildGroupTabs() {
+    final cs = Theme.of(context).colorScheme;
+    final mgr = pair.manager;
+    final conns = mgr.connections.where((c) => !c.isSolo).toList();
+    final isSolo = mgr.isSoloMode;
+    final n = conns.length;
+
+    int activeIdx = -1;
+    if (!isSolo) {
+      for (int i = 0; i < n; i++) {
+        if (mgr.connections.indexOf(conns[i]) == mgr.activeConnectionIndex) {
+          activeIdx = i;
+          break;
+        }
+      }
+    }
+    if (activeIdx < 0 && n > 0) activeIdx = 0;
+
+    final Connection? active = n > 0 ? conns[activeIdx] : null;
+    // Кольцо: при 2+ группах слева и справа ВСЕГДА кто-то есть (по кругу),
+    // крайний слева уходит в центр, последний становится левым соседом.
+    final Connection? prev = n >= 2 ? conns[(activeIdx - 1 + n) % n] : null;
+    final Connection? next = n >= 2 ? conns[(activeIdx + 1) % n] : null;
+
+    Future<void> activate(int rawIdx, int dir) async {
+      if (n == 0) return;
+      final idx = ((rawIdx % n) + n) % n; // круговой индекс (бесконечная прокрутка)
+      if (idx == activeIdx && !isSolo) return;
+      if (mounted) setState(() => _carDir = dir);
+      final mi = mgr.connections.indexOf(conns[idx]);
+      await mgr.switchToConnection(mi);
+      if (!mounted) return;
+      _resetCodeInput();
+      setState(() {});
+    }
+
+    return SizedBox(
+      height: 64,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 18),
+        child: Row(
+          children: [
+            _soloBtn(cs, isSolo),
+            const SizedBox(width: 6),
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onHorizontalDragEnd: (d) {
+                  final v = d.primaryVelocity ?? 0;
+                  if (v < -60) {
+                    activate(activeIdx + 1, 1);
+                  } else if (v > 60) {
+                    activate(activeIdx - 1, -1);
+                  }
+                },
+                child: Row(
+                  children: [
+                    _peekSlot(prev, cs, () => activate(activeIdx - 1, -1)),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: isSolo ? () => activate(activeIdx, 1) : null,
+                        // Удержание открывает СПИСОК действий, а не сразу
+                        // удаление. Раньше зажатая пилюля вела прямо в «удалить
+                        // подключение», и человек, разбираясь с каруселью, за
+                        // одиннадцать секунд снёс три живые пары — 102
+                        // сообщения и 53 воспоминания в одной из них (разбор 15
+                        // августа 2026). Он был уверен, что ничего не удалял:
+                        // ни жест, ни лист не говорили, какую пару уносят.
+                        onLongPress: () {
+                          if (mgr.connections.length > 1 && active != null) {
+                            _showConnectionActions(active);
+                          }
+                        },
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 420),
+                          switchInCurve: Curves.easeOutCubic,
+                          switchOutCurve: Curves.easeInCubic,
+                          transitionBuilder: _carouselTransition,
+                          child: KeyedSubtree(
+                            key: ValueKey(
+                                'center-$isSolo-${active?.id ?? 'none'}'),
+                            child: _centerPill(active, cs, isSolo),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    _peekSlot(next, cs, () => activate(activeIdx + 1, 1)),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            _addBtn(cs),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _carouselTransition(Widget child, Animation<double> anim) {
+    final slide = Tween<Offset>(
+      begin: Offset(0.16 * _carDir, 0),
+      end: Offset.zero,
+    ).animate(anim);
+    return FadeTransition(
+      opacity: anim,
+      child: SlideTransition(position: slide, child: child),
+    );
+  }
+
+  Widget _soloBtn(ColorScheme cs, bool active) {
+    return GestureDetector(
+      onTap: () async {
+        await pair.manager.switchToSolo();
+        if (!mounted) return;
+        _resetCodeInput();
+        setState(() {});
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 350),
+        curve: Curves.easeOutCubic,
+        width: 52,
+        height: 52,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: active ? cs.secondaryContainer : cs.surfaceContainerHigh,
+        ),
+        child: Icon(Icons.person_rounded,
+            size: 21,
+            color: active ? cs.onSecondaryContainer : cs.onSurfaceVariant),
+      ),
+    );
+  }
+
+  Widget _addBtn(ColorScheme cs) {
+    return GestureDetector(
+      onTap: _showAddGroupDialog,
+      child: Container(
+        width: 52,
+        height: 52,
+        decoration: BoxDecoration(
+            shape: BoxShape.circle, color: cs.surfaceContainerHigh),
+        child: Icon(Icons.add_rounded, size: 21, color: cs.onSurfaceVariant),
+      ),
+    );
+  }
+
+  // Узкий сосед-круг (44): аватар/буква пары или точка «ждём». Тап → в центр.
+  Widget _peekSlot(Connection? c, ColorScheme cs, VoidCallback onTap) {
+    if (c == null) return const SizedBox(width: 44, height: 52);
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 420),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: _carouselTransition,
+        child: KeyedSubtree(
+          key: ValueKey('peek-${c.id}'),
+          child: _peekCircle(c, cs),
+        ),
+      ),
+    );
+  }
+
+  Widget _peekCircle(Connection c, ColorScheme cs) {
+    final initial = (c.isPaired ? c.partnerName : '?').firstGraphemeUpper('?');
+    final photo =
+        (c.isPaired && c.partners.isNotEmpty) ? c.partners.first.avatar : '';
+    return Container(
+      width: 44,
+      height: 44,
+      decoration:
+          BoxDecoration(shape: BoxShape.circle, color: cs.surfaceContainerHigh),
+      clipBehavior: Clip.antiAlias,
+      alignment: Alignment.center,
+      child: !c.isPaired
+          ? Container(
+              width: 9,
+              height: 9,
+              decoration:
+                  BoxDecoration(color: cs.primary, shape: BoxShape.circle))
+          : (photo.isNotEmpty
+              ? StorageImage(
+                  imageUrl: photo,
+                  fit: BoxFit.cover,
+                  errorWidget: (a, b, e) => _letterBox(initial, cs))
+              : _letterBox(initial, cs)),
+    );
+  }
+
+  // Центральная активная пилюля: имя целиком; влезает — по центру, длинное —
+  // бегущей строкой (телесуфлёр). Точка статуса слева.
+  Widget _centerPill(Connection? c, ColorScheme cs, bool isSolo) {
+    if (c == null) return const SizedBox(width: double.infinity, height: 52);
+    final name = c.isPaired
+        ? (c.partnerCount > 1
+              ? '${c.partners.first.name} +${c.partnerCount - 1}'
+              : c.partnerName)
+        : LocaleService.current.waiting;
+    final highlighted = !isSolo;
+    final bg = highlighted ? cs.secondaryContainer : cs.surfaceContainerHigh;
+    final fg = highlighted ? cs.onSecondaryContainer : cs.onSurfaceVariant;
+    final nameStyle = TextStyle(
+        fontFamily: 'Onest',
+        fontSize: 15,
+        fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+        color: fg);
+    final dot = Container(
+        width: 8,
+        height: 8,
+        decoration: BoxDecoration(
+            color: c.isPaired ? const Color(0xFF16A34A) : cs.primary,
+            shape: BoxShape.circle));
+    return SizedBox(
+      width: double.infinity,
+      height: 52,
+      child: Container(
+        decoration:
+            BoxDecoration(color: bg, borderRadius: BorderRadius.circular(26)),
+        clipBehavior: Clip.antiAlias,
+        child: LayoutBuilder(
+          builder: (context, box) {
+            const hPad = 14.0, dotGap = 8.0;
+            final avail = box.maxWidth - hPad * 2 - 8 - dotGap;
+            final tp = TextPainter(
+              text: TextSpan(text: name, style: nameStyle),
+              maxLines: 1,
+              textDirection: TextDirection.ltr,
+            )..layout();
+            final fits = tp.width <= avail;
+            return Padding(
+              padding: const EdgeInsets.symmetric(horizontal: hPad),
+              child: fits
+                  ? Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        dot,
+                        const SizedBox(width: dotGap),
+                        Flexible(
+                            child: Text(name,
+                                maxLines: 1,
+                                softWrap: false,
+                                style: nameStyle)),
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        dot,
+                        const SizedBox(width: dotGap),
+                        Expanded(child: MarqueeText(name, style: nameStyle)),
+                      ],
+                    ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _letterBox(String initial, ColorScheme cs) {
+    return Center(
+      child: Text(initial,
+          style: TextStyle(
+              fontFamily: 'Unbounded',
+              fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+              fontSize: 18,
+              color: cs.primary)),
+    );
+  }
+
+  void _resetCodeInput() {
+    _codeController.clear();
+    _showCodeInput = false;
+    _codeError = false;
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  CONNECTED — partner linked
+  // ═══════════════════════════════════════════════════
+  Widget _buildConnectedContent() {
+    return Theme(
+      data: ProfileTheme.themeFor(widget.theme),
+      child: Builder(
+        builder: (context) {
+          final cs = Theme.of(context).colorScheme;
+          return SingleChildScrollView(
+            physics: const BouncingScrollPhysics(),
+            padding: EdgeInsets.fromLTRB(
+                20, 10, 20, MediaQuery.of(context).padding.bottom + 100),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _connectedHero(cs),
+                const SizedBox(height: 14),
+                _chatTile(cs),
+                const SizedBox(height: 14),
+                _connectedActions(cs),
+                const SizedBox(height: 14),
+                _disconnectButton(cs),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  // Hero «Подключён» — бенто «Ступени»: «печенька» без подложки + счётчик дней
+  // слева; имя-герой + онлайн/тип справа; снизу полоса годовщины. Колонны ровны
+  // по высоте (214), аватар — сама фигура, без плитки за ней.
+  Widget _connectedHero(ColorScheme cs) {
+    final partner = pair.partners.isNotEmpty ? pair.partners.first : null;
+    final title = partner != null
+        ? pair.displayNameOf(partner)
+        : LocaleService.current.waiting;
+    final online =
+        partner != null && (_partnerOnlineStatus[partner.uid] ?? false);
+    // «Дней вместе» — по общей формуле `coupleDaysTogether`: самая ранняя из
+    // даты системного таймера (её человек правит колесом), даты коннекта и
+    // годовщины из профиля. Раньше экран смотрел только в таймер и расходился
+    // с профилем у тех, кто ввёл одну годовщину.
+    final relTimer =
+        widget.timerService?.systemTimer ?? widget.timerService?.defaultTimer;
+    final days = coupleDaysTogether(
+          timerStart: relTimer?.startDate,
+          groupStart: pair.startDate,
+          anniversary: pair.anniversaryDate,
+        ) ??
+        pair.daysInLove;
+
+    // Годовщина: ближайшее наступление (месяц/день) от сегодня.
+    int? annivDays;
+    final av = pair.anniversaryDate;
+    if (av != null) {
+      final now = DateTime.now();
+      final today = DateTime(now.year, now.month, now.day);
+      var next = DateTime(now.year, av.month, av.day);
+      if (next.isBefore(today)) next = DateTime(now.year + 1, av.month, av.day);
+      annivDays = next.difference(today).inDays;
+    }
+
+    return Column(
+      children: [
+        SizedBox(
+          height: 214,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 116,
+                child: Column(
+                  children: [
+                    _heroAvatar(92, partner?.uid ?? '',
+                        partner?.avatar ?? '', partner?.name ?? '?', cs),
+                    const SizedBox(height: 12),
+                    Expanded(
+                      child: _statTile(cs, '$days',
+                          LocaleService.current.daysTogetherStat,
+                          bg: cs.tertiaryContainer, fg: cs.onTertiaryContainer),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  children: [
+                    Expanded(child: _nameTile(cs, title, partner?.uid)),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      height: 46,
+                      child: _chipTile(
+                        cs,
+                        leading: Container(
+                            width: 10,
+                            height: 10,
+                            decoration: BoxDecoration(
+                                color: online
+                                    ? const Color(0xFF16A34A)
+                                    : cs.onSurfaceVariant,
+                                shape: BoxShape.circle)),
+                        text: online
+                            ? LocaleService.current.online
+                            : LocaleService.current.offline,
+                        bg: cs.surfaceContainerHigh,
+                        fg: cs.onSurface,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      height: 46,
+                      child: _chipTile(
+                        cs,
+                        leading: Icon(
+                            relIconForType(pair.relationshipType,
+                                customEmoji: pair.relationshipEmoji),
+                            size: 16,
+                            color: cs.onPrimaryContainer),
+                        text: pair.relationshipLabel,
+                        bg: cs.primaryContainer,
+                        fg: cs.onPrimaryContainer,
+                        onTap: () => showRelationshipTypeSheet(context, pair: pair, theme: widget.theme, onChanged: () { if (mounted) setState(() {}); }),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (annivDays != null) ...[
+          const SizedBox(height: 12),
+          _anniversaryStrip(cs, annivDays),
+        ],
+      ],
+    );
+  }
+
+  // «Печенька» с фото партнёра, без подложки — сама фигура.
+  // Смена данных ВНУТРИ неподвижного блока: проявление + лёгкий зум (как код).
+  Widget _swap(Object k, Widget child) => AnimatedSwitcher(
+        duration: const Duration(milliseconds: 300),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeIn,
+        transitionBuilder: (c, a) => FadeTransition(
+          opacity: a,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.94, end: 1.0).animate(a),
+            child: c,
+          ),
+        ),
+        child: KeyedSubtree(key: ValueKey(k), child: child),
+      );
+
+  // Аватар в уникальной форме партнёра (по uid); при смене формы — морф.
+  int _shapeIndexFor(String uid) =>
+      _shapeIdx[uid] ?? defaultShapeIndexForUid(uid);
+
+  Future<void> _loadShapes() async {
+    final prefs = await SharedPreferences.getInstance();
+    final map = <String, int>{};
+    for (final k in prefs.getKeys()) {
+      if (k.startsWith('avatar_shape_')) {
+        final v = prefs.getInt(k);
+        if (v != null) map[k.substring('avatar_shape_'.length)] = v;
+      }
+    }
+    if (mounted && map.isNotEmpty) setState(() => _shapeIdx = map);
+  }
+
+  // Тап по аватарке → следующая форма (морф). Выбор сохраняется локально.
+  void _cycleShape(String uid) {
+    if (uid.isEmpty) return;
+    final next = (_shapeIndexFor(uid) + 1) % kAvatarShapes.length;
+    setState(() => _shapeIdx = {..._shapeIdx, uid: next});
+    SharedPreferences.getInstance()
+        .then((p) => p.setInt('avatar_shape_$uid', next));
+  }
+
+  Widget _heroAvatar(
+      double size, String uid, String photo, String name, ColorScheme cs) {
+    final idx = _shapeIndexFor(uid);
+    return Center(
+      child: PressableScale(
+        onTap: uid.isEmpty ? null : () => _cycleShape(uid),
+        child: FramedAvatar(
+          uid: uid,
+          size: size,
+          child: MorphAvatar(
+          size: size,
+          shapeKey: '$uid-$idx',
+          shape: kAvatarShapes[idx],
+          child: photo.isNotEmpty
+              ? StorageImage(
+                  imageUrl: photo,
+                  fit: BoxFit.cover,
+                  errorWidget: (c, u, e) => _heroInitial(name, cs))
+              : _heroInitial(name, cs),
+        ),
+        ),
+      ),
+    );
+  }
+
+  Widget _statTile(ColorScheme cs, String number, String caption,
+      {required Color bg, required Color fg}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration:
+          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(28)),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _swap(
+            'stat-$number',
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(number,
+                  maxLines: 1,
+                  style: TextStyle(
+                      fontFamily: 'Unbounded',
+                      fontWeight: FontWeight.w800,
+        fontVariations: const [FontVariation('wght', 800)],
+                      fontSize: 36,
+                      height: 0.95,
+                      letterSpacing: -1.5,
+                      color: fg)),
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(caption,
+              maxLines: 2,
+              style: TextStyle(
+                  fontFamily: 'Onest',
+                  fontWeight: FontWeight.w600,
+        fontVariations: const [FontVariation('wght', 600)],
+                  fontSize: 12,
+                  height: 1.1,
+                  color: fg)),
+        ],
+      ),
+    );
+  }
+
+  Widget _nameTile(ColorScheme cs, String title, String? badgeUid) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(20, 16, 14, 16),
+      decoration: BoxDecoration(
+          color: cs.secondaryContainer,
+          borderRadius: BorderRadius.circular(28)),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          // Верхняя строка занята: слева «Plus», справа карандаш. Имя стоит
+          // ниже со своим значком сразу за последней буквой. Пока значок и
+          // карандаш висели по углам, длинное имя («JB SHARAN», снимок
+          // 17.08.2026) уезжало под кнопку правки, а значок отрывался от ника.
+          Padding(
+            padding: EdgeInsets.only(top: badgeUid != null ? 30 : 0),
+            child: Align(
+              alignment: Alignment.bottomLeft,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Flexible(
+                    child: _swap(
+                      'name-$title',
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.bottomLeft,
+                        child: Text(title,
+                            maxLines: 1,
+                            style: TextStyle(
+                                fontFamily: 'Unbounded',
+                                fontWeight: FontWeight.w800,
+                                fontVariations: const [FontVariation('wght', 800)],
+                                fontSize: 44,
+                                height: 1.0,
+                                letterSpacing: -1.5,
+                                color: cs.onPrimaryContainer)),
+                      ),
+                    ),
+                  ),
+                  if (badgeUid != null) ...[
+                    const SizedBox(width: 8),
+                    _badgeIcon(badgeUid),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          // Своя подпись для человека: раньше карандаш стоял в карточке
+          // участников, а её редизайн убрал с экрана — вместе с ней пропала и
+          // возможность переименовать. Возвращаем туда, где имя и показывается.
+          if (badgeUid != null)
+            Positioned(
+              top: -8,
+              right: -6,
+              child: IconButton(
+                onPressed: () => _renamePartnerByUid(badgeUid),
+                tooltip: LocaleService.current.renamePartner,
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.edit_rounded,
+                    size: 18, color: cs.onSecondaryContainer.withValues(alpha: 0.7)),
+              ),
+            ),
+          if (badgeUid != null && (_partnerPlus[badgeUid] ?? false))
+            Positioned(
+              top: 0,
+              left: 0,
+              child: PlusBadge(theme: widget.theme),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _chipTile(ColorScheme cs,
+      {required Widget leading,
+      required String text,
+      required Color bg,
+      required Color fg,
+      VoidCallback? onTap}) {
+    final tile = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      decoration:
+          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(22)),
+      child: _swap(
+        'chip-$text',
+        Row(
+          children: [
+            leading,
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(text,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontFamily: 'Onest',
+                      fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                      fontSize: 14,
+                      color: fg)),
+            ),
+          ],
+        ),
+      ),
+    );
+    return onTap == null ? tile : PressableScale(onTap: onTap, child: tile);
+  }
+
+  Widget _anniversaryStrip(ColorScheme cs, int daysUntil) {
+    final today = daysUntil == 0;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 12, 20, 12),
+      decoration: BoxDecoration(
+          color: cs.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(26)),
+      child: Row(
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+                color: cs.primary, borderRadius: BorderRadius.circular(16)),
+            child: Icon(Icons.event_rounded, size: 24, color: cs.onPrimary),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: _swap(
+              'anniv-$daysUntil',
+              today
+                  ? Text(LocaleService.current.anniversaryTodayTitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontFamily: 'Unbounded',
+                        fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                        fontSize: 15,
+                        color: cs.onSurface))
+                : Row(
+                    crossAxisAlignment: CrossAxisAlignment.baseline,
+                    textBaseline: TextBaseline.alphabetic,
+                    children: [
+                      Text('$daysUntil',
+                          style: TextStyle(
+                              fontFamily: 'Unbounded',
+                              fontWeight: FontWeight.w800,
+        fontVariations: const [FontVariation('wght', 800)],
+                              fontSize: 23,
+                              letterSpacing: -0.5,
+                              color: cs.onSurface)),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                            LocaleService.current.daysUntilAnniversary,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                fontFamily: 'Onest',
+                                fontWeight: FontWeight.w600,
+        fontVariations: const [FontVariation('wght', 600)],
+                                fontSize: 14,
+                                color: cs.onSurfaceVariant)),
+                      ),
+                    ],
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _heroInitial(String name, ColorScheme cs) {
+    return Container(
+      color: cs.primary,
+      alignment: Alignment.center,
+      child: Text(
+        name.firstGraphemeUpper('?'),
+        style: TextStyle(
+          fontFamily: 'Unbounded',
+          fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+          fontSize: 26,
+          color: cs.onPrimary,
+        ),
+      ),
+    );
+  }
+
+  Widget _membersCard(ColorScheme cs) {
+    final partners = pair.partners;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 18, 10, 12),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(28),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 2, bottom: 6),
+            child: Text(
+              LocaleService.current
+                  .membersCount(partners.length + 1)
+                  .toUpperCase(),
+              style: TextStyle(
+                fontFamily: 'Onest',
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                letterSpacing: 2,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ),
+          ...partners.map(
+            (m) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Row(
+                children: [
+                  _memberAvatar(m.avatar, m.name, 40),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                pair.displayNameOf(m).isNotEmpty
+                                    ? pair.displayNameOf(m)
+                                    : LocaleService.current.member,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontFamily: 'Onest',
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                                  color: cs.onSurface,
+                                ),
+                              ),
+                            ),
+                            _badgeIcon(m.uid),
+                          ],
+                        ),
+                        if (NicknameService.instance.get(m.uid).isNotEmpty)
+                          Text(
+                            m.name,
+                            style: TextStyle(
+                              fontFamily: 'Onest',
+        fontVariations: const [FontVariation('wght', 400)],
+                              fontSize: 11.5,
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => _showRenameDialog(m),
+                    visualDensity: VisualDensity.compact,
+                    icon: Icon(Icons.edit_rounded,
+                        size: 18, color: cs.onSurfaceVariant),
+                  ),
+                  _buildPresenceBadge(m.uid),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _connectedActions(ColorScheme cs) {
+    final canInvite = pair.canInviteMore;
+    return Row(
+      children: [
+        if (canInvite) ...[
+          Expanded(
+            child: _connectTile(
+              bg: cs.tertiaryContainer,
+              fg: cs.onTertiaryContainer,
+              icon: Icons.person_add_rounded,
+              label: LocaleService.current.inviteMore,
+              onTap: _showInviteMoreSheet,
+            ),
+          ),
+          const SizedBox(width: 12),
+        ],
+        Expanded(
+          child: _connectTile(
+            bg: cs.surfaceContainerHighest,
+            fg: cs.onSurface,
+            icon: Icons.qr_code_2_rounded,
+            label: LocaleService.current.showQr,
+            onTap: _showQRDialog,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _disconnectButton(ColorScheme cs) {
+    return PressableScale(
+      onTap: _showUnpairDialog,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: BoxDecoration(
+          color: cs.error,
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.link_off_rounded, color: cs.onError, size: 20),
+            const SizedBox(width: 10),
+            Text(
+              LocaleService.current.disconnect,
+              style: TextStyle(
+                fontFamily: 'Onest',
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                color: cs.onError,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  INVITE — connect partner (unpaired)
+  // ═══════════════════════════════════════════════════
+  Future<void> _handleRegenerate() async {
+    if (_generating) return;
+    setState(() => _generating = true);
+    await pair.regenerateCode();
+    if (!mounted) return;
+    setState(() => _generating = false);
+    // Сервер не выдал код — хвалиться нечем.
+    if (_shownCode.isNotEmpty) {
+      _showSnack(LocaleService.current.newCodeGenerated);
+    }
+  }
+
+  void _handleCopy() {
+    final code = _shownCode;
+    if (code.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: code));
+    _showSnack(LocaleService.current.codeCopied);
+    setState(() => _copied = true);
+    Future.delayed(const Duration(milliseconds: 1300), () {
+      if (mounted) setState(() => _copied = false);
+    });
+  }
+
+  Future<void> _handleShare() async {
+    final code = _shownCode;
+    if (code.isEmpty) return;
+    final origin = shareOriginFromContext(context);
+    await Share.share(
+      LocaleService.current.shareInviteText(code, pair.inviteLink),
+      subject: LocaleService.current.loveAppInvitation,
+      sharePositionOrigin: origin,
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  INVITE — M3 Expressive
+  // ═══════════════════════════════════════════════════
+  Widget _buildInviteContent() {
+    return Theme(
+      data: ProfileTheme.themeFor(widget.theme),
+      child: Builder(
+        builder: (context) {
+          final cs = Theme.of(context).colorScheme;
+          final loading = _generating || _shownCode.isEmpty;
+          return SingleChildScrollView(
+            physics: const BouncingScrollPhysics(),
+            padding: EdgeInsets.fromLTRB(
+                20, 10, 20, MediaQuery.of(context).padding.bottom + 100),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _heroCode(cs, loading),
+                const SizedBox(height: 14),
+                _actionsRow(cs),
+                const SizedBox(height: 14),
+                _chatTile(cs, locked: true),
+                const SizedBox(height: 14),
+                _connectTiles(cs),
+                const SizedBox(height: 14),
+                _enterCodeCard(cs),
+                const SizedBox(height: 14),
+                // Он в армии, на вахте, в экспедиции — приложение ему поставить
+                // некуда. Пара заводится на одного, второе место ждёт.
+                _buildWaitingEntry(),
+                // Заявку подтверждают в этом же экране, но она приходит уже
+                // после создания пары, поэтому карточка живёт в режиме ожидания.
+                if (pair.awaitingApproval) _waitingApprovalCard(cs),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _heroCode(ColorScheme cs, bool loading) {
+    final myInitial =
+        (widget.userData?.displayName ?? '').firstGraphemeUpper('Я');
+    return Container(
+      padding: const EdgeInsets.fromLTRB(24, 26, 24, 30),
+      decoration: BoxDecoration(
+        // Не `primaryContainer`: у тем, нарисованных руками, он равен фону
+        // страницы, и карточка кода пропадала совсем (разница по цвету ΔE 0,0
+        // у Фиолетовой). `surfaceContainerHighest` — единственная поверхность,
+        // которую видно во всех палитрах: худший случай ΔE 4,3.
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(40),
+      ),
+      child: Column(
+        children: [
+          // С гидом вместо пустого места партнёра — облачко ждёт, пока код введут
+          if (MascotGuideService.instance.on)
+            const GuideMascot('wait', side: 112)
+          else
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CookieAvatar(
+                size: 64,
+                color: cs.primary,
+                onColor: cs.onPrimary,
+                initial: myInitial,
+              ),
+              Transform.translate(
+                offset: const Offset(-14, 0),
+                child: DashedRing(
+                  size: 64,
+                  color: cs.onPrimaryContainer.withValues(alpha: 0.42),
+                  child: Icon(Icons.add_rounded,
+                      size: 26,
+                      color: cs.onPrimaryContainer.withValues(alpha: 0.55)),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text(
+            LocaleService.current.yourInviteCode.toUpperCase(),
+            style: TextStyle(
+              fontFamily: 'Onest',
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+              letterSpacing: 2.4,
+              color: cs.onPrimaryContainer.withValues(alpha: 0.66),
+            ),
+          ),
+          const SizedBox(height: 14),
+          if (_sessionLost)
+            _sessionLostNotice(cs)
+          else
+            AnimatedInviteCode(
+              code: _shownCode,
+              loading: loading,
+              color: cs.onPrimaryContainer,
+              fontSize: 52,
+            ),
+          const SizedBox(height: 18),
+          GestureDetector(
+            onTap: () => showRelationshipTypeSheet(context, pair: pair, theme: widget.theme, onChanged: () { if (mounted) setState(() {}); }),
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+              decoration: BoxDecoration(
+                color: cs.onPrimaryContainer.withValues(alpha: 0.10),
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Значок, а не эмодзи: тот красится системой и в тёмной теме
+                  // светится ярче самой подписи.
+                  Icon(
+                    relIconForType(pair.relationshipType,
+                        customEmoji: pair.relationshipEmoji),
+                    size: 17,
+                    color: cs.onPrimaryContainer,
+                  ),
+                  const SizedBox(width: 7),
+                  Text(
+                    pair.relationshipLabel,
+                    style: TextStyle(
+                      fontFamily: 'Onest',
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                      color: cs.onPrimaryContainer,
+                    ),
+                  ),
+                  const SizedBox(width: 3),
+                  Icon(Icons.expand_more_rounded,
+                      size: 18,
+                      color: cs.onPrimaryContainer.withValues(alpha: 0.6)),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Вместо кода, когда сессии нет: код из памяти мог умереть на сервере, а
+  /// проверить его или выпустить новый без входа нельзя.
+  Widget _sessionLostNotice(ColorScheme cs) {
+    final s = LocaleService.current;
+    return Column(
+      children: [
+        Text(
+          s.inviteSessionLost,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontFamily: 'Onest',
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            fontVariations: const [FontVariation('wght', 600)],
+            height: 1.35,
+            color: cs.onPrimaryContainer,
+          ),
+        ),
+        if (widget.userData != null) ...[
+          const SizedBox(height: 14),
+          FilledButton(
+            onPressed: _signInAgain,
+            child: Text(s.inviteSignInAgain),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _actionsRow(ColorScheme cs) {
+    final hasCode = _shownCode.isNotEmpty;
+    return Row(
+      children: [
+        Expanded(
+          child: FilledButton.icon(
+            onPressed: hasCode ? _handleCopy : null,
+            icon: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              transitionBuilder: (c, a) => ScaleTransition(scale: a, child: c),
+              child: Icon(
+                _copied ? Icons.check_rounded : Icons.copy_rounded,
+                key: ValueKey(_copied),
+                size: 20,
+              ),
+            ),
+            label: Text(LocaleService.current.copy),
+          ),
+        ),
+        const SizedBox(width: 10),
+        _circleButton(
+          cs: cs,
+          onTap: hasCode ? _handleShare : null,
+          child: Icon(Icons.ios_share_rounded,
+              size: 22, color: cs.onSecondaryContainer),
+        ),
+        const SizedBox(width: 10),
+        _circleButton(
+          cs: cs,
+          // Без сессии сервер код не выдаст: кнопка только крутила бы вхолостую.
+          onTap: (_generating || _sessionLost) ? null : _handleRegenerate,
+          child: _generating
+              ? ExpressiveLoadingIndicator(
+                  color: cs.primary,
+                  constraints:
+                      const BoxConstraints.tightFor(width: 28, height: 28),
+                )
+              : Icon(Icons.refresh_rounded,
+                  size: 22, color: cs.onSecondaryContainer),
+        ),
+      ],
+    );
+  }
+
+  Widget _circleButton({
+    required ColorScheme cs,
+    required Widget child,
+    required VoidCallback? onTap,
+  }) {
+    return Material(
+      color: cs.secondaryContainer,
+      shape: const CircleBorder(),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: SizedBox(width: 56, height: 56, child: Center(child: child)),
+      ),
+    );
+  }
+
+  /// Плитка чата. [locked] — пары ещё нет: чат в этом состоянии открывался, но
+  /// сообщение из него не уходило («Не удалось отправить»), а в шапке вместо
+  /// имени партнёра стояла пустая пилюля. Теперь плитка приглушена и говорит,
+  /// чего ждать, — как приглушённые кнопки одиночки на главной.
+  Widget _chatTile(ColorScheme cs, {bool locked = false}) {
+    if (locked) {
+      return _chatTileBody(cs, locked: true, onTap: _explainChatNeedsPartner);
+    }
+    // Чат вырастает из своей плитки и складывается обратно в неё.
+    return UnfoldSource(
+      fill: cs.secondaryContainer,
+      radius: 28,
+      builder: (_, tile) => _chatTileBody(cs,
+          locked: false, onTap: () => _openChat(from: tile)),
+    );
+  }
+
+  Widget _chatTileBody(
+    ColorScheme cs, {
+    required bool locked,
+    required VoidCallback onTap,
+  }) {
+    return PressableScale(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: locked ? cs.surfaceContainerHigh : cs.secondaryContainer,
+          borderRadius: BorderRadius.circular(28),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: locked ? cs.surfaceContainerHighest : cs.primary,
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: Icon(
+                locked
+                    ? Icons.chat_bubble_outline_rounded
+                    : Icons.chat_bubble_rounded,
+                color: locked ? cs.onSurfaceVariant : cs.onPrimary,
+                size: 24,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    LocaleService.current.chatTitle,
+                    style: TextStyle(
+                      fontFamily: 'Unbounded',
+                      fontWeight: FontWeight.w700,
+                      fontVariations: const [FontVariation('wght', 700)],
+                      fontSize: 17,
+                      color: locked
+                          ? cs.onSurfaceVariant
+                          : cs.onSecondaryContainer,
+                    ),
+                  ),
+                  if (locked) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      LocaleService.current.chatWaitsForPartner,
+                      style: TextStyle(
+                        fontFamily: 'Onest',
+                        fontSize: 12.5,
+                        height: 1.25,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            if (!locked)
+              StableStreamBuilder<bool>(
+                create: () =>
+                    ChatService.instance.watchHasUnread(widget.pairData.pairId),
+                keys: [widget.pairData.pairId],
+                builder: (context, snap) {
+                  if (snap.data != true) return const SizedBox.shrink();
+                  return Container(
+                    margin: const EdgeInsets.only(right: 8),
+                    width: 10,
+                    height: 10,
+                    decoration:
+                        BoxDecoration(color: cs.primary, shape: BoxShape.circle),
+                  );
+                },
+              ),
+            Icon(
+              locked ? Icons.lock_outline_rounded : Icons.arrow_forward_rounded,
+              size: 22,
+              color: (locked ? cs.onSurfaceVariant : cs.onSecondaryContainer)
+                  .withValues(alpha: 0.5),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Тап по закрытой плитке: короткое объяснение, а не пустой чат.
+  void _explainChatNeedsPartner() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(LocaleService.current.chatWaitsForPartner),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Widget _connectTiles(ColorScheme cs) {
+    return Row(
+      children: [
+        Expanded(
+          child: _connectTile(
+            bg: cs.tertiaryContainer,
+            fg: cs.onTertiaryContainer,
+            icon: Icons.qr_code_2_rounded,
+            label: LocaleService.current.showQr,
+            onTap: _showQRDialog,
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: _connectTile(
+            bg: cs.surfaceContainerHighest,
+            fg: cs.onSurface,
+            icon: Icons.qr_code_scanner_rounded,
+            label: LocaleService.current.scanQr,
+            onTap: _openQRScanner,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _connectTile({
+    required Color bg,
+    required Color fg,
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return PressableScale(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(18, 20, 18, 18),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(30),
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: fg.withValues(alpha: 0.12),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, color: fg, size: 27),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              label,
+              style: TextStyle(
+                fontFamily: 'Onest',
+                fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                fontSize: 15,
+                color: fg,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _enterCodeCard(ColorScheme cs) {
+    final open = _showCodeInput;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeOutCubic,
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(open ? 28 : 999),
+      ),
+      padding: EdgeInsets.all(open ? 18 : 12),
+      child: Column(
+        children: [
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _showCodeInput = !_showCodeInput),
+            child: Row(
+              children: [
+                Container(
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    color: cs.tertiaryContainer,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: Icon(Icons.keyboard_rounded,
+                      color: cs.onTertiaryContainer, size: 24),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Text(
+                    LocaleService.current.haveACode,
+                    style: TextStyle(
+                      fontFamily: 'Onest',
+                      fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                      fontSize: 15.5,
+                      color: cs.onSurface,
+                    ),
+                  ),
+                ),
+                AnimatedRotation(
+                  turns: open ? 0.5 : 0,
+                  duration: const Duration(milliseconds: 240),
+                  child: Icon(Icons.expand_more_rounded,
+                      color: cs.onSurfaceVariant, size: 26),
+                ),
+              ],
+            ),
+          ),
+          if (open) ...[
+            const SizedBox(height: 16),
+            _buildCodeInput(),
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: _submitCode,
+                child: Text(LocaleService.current.connectPartnerBtn),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Бейдж онлайн/офлайн статуса для партнёра
+  Widget _buildPresenceBadge(String uid) {
+    final isOnline = _partnerOnlineStatus[uid] ?? false;
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 300),
+      child: Container(
+        key: ValueKey(isOnline),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: isOnline
+              ? const Color(0xFF4ADE80).withOpacity(0.12)
+              : widget.theme.surfaceMuted,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 6,
+              height: 6,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: isOnline
+                    ? const Color(0xFF16A34A)
+                    : widget.theme.textMuted,
+              ),
+            ),
+            const SizedBox(width: 4),
+            Text(
+              isOnline
+                  ? LocaleService.current.online
+                  : LocaleService.current.offline,
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                color: isOnline
+                    ? const Color(0xFF16A34A)
+                    : widget.theme.textMuted,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _badgeIcon(String uid) {
+    final badge = _partnerBadges[uid];
+    if (badge == null || badge.isEmpty) return const SizedBox.shrink();
+    final icon = ProfileIcon.byId(badge);
+    return GestureDetector(
+      onTap: icon == null ? null : () => _showBadgeInfo(icon),
+      child: BadgeImage(badge, side: 38),
+    );
+  }
+
+  void _showBadgeInfo(ProfileIcon icon) {
+    final cs = ProfileTheme.themeFor(widget.theme).colorScheme;
+    showAppSheet<void>(
+      context,
+      builder: (ctx) => SheetScaffold(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  BadgeImage(icon.id, side: 40),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      icon.name,
+                      style: TextStyle(
+                        fontFamily: 'Unbounded',
+                        fontSize: 19,
+                        fontWeight: FontWeight.w700,
+                        fontVariations: const [FontVariation('wght', 700)],
+                        letterSpacing: -0.3,
+                        color: cs.onSurface,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Text(
+                icon.description,
+                style: TextStyle(
+                  fontFamily: 'Onest',
+                  fontSize: 15,
+                  height: 1.4,
+                  color: cs.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 22),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: cs.primary,
+                    foregroundColor: cs.onPrimary,
+                    shape: const StadiumBorder(),
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                  ),
+                  child: Text(
+                    LocaleService.current.ok,
+                    style: const TextStyle(
+                        fontSize: 15, fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _memberAvatar(String url, String name, double size) {
+    final initial = name.firstGraphemeUpper('?');
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: widget.theme.isDark ? widget.theme.cardBorder : Colors.white,
+          width: 2,
+        ),
+      ),
+      child: ClipOval(
+        child: url.isNotEmpty
+            ? StorageImage(
+                imageUrl: url,
+                fit: BoxFit.cover,
+                errorWidget: (context, url, error) => Container(
+                  color: primary.withOpacity(0.15),
+                  child: Center(
+                    child: Text(
+                      initial,
+                      style: TextStyle(
+                        fontSize: size * 0.4,
+                        fontWeight: FontWeight.w700,
+                        color: primary,
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            : Container(
+                color: primary.withOpacity(0.15),
+                child: Center(
+                  child: Text(
+                    initial,
+                    style: TextStyle(
+                      fontSize: size * 0.4,
+                      fontWeight: FontWeight.w700,
+                      color: primary,
+                    ),
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+
+  void _showInviteMoreSheet() {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      backgroundColor: widget.theme.cardSurface,
+      builder: (_) => Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: widget.theme.divider,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              LocaleService.current.inviteMoreMembers,
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w800,
+                color: widget.theme.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              LocaleService.current.membersOfMax(
+                pair.members.length,
+                pair.maxMembers,
+              ),
+              style: TextStyle(fontSize: 13, color: widget.theme.textMuted),
+            ),
+            const SizedBox(height: 24),
+            _buildCodeCells(
+              code: pair.inviteCode,
+              color: primary,
+              cellWidth: 42,
+              cellHeight: 52,
+              fontSize: 22,
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: _outlineButton(
+                    icon: Icons.copy_rounded,
+                    label: LocaleService.current.copy,
+                    onTap: () {
+                      Clipboard.setData(ClipboardData(text: pair.inviteCode));
+                      Navigator.pop(context);
+                      _showSnack(LocaleService.current.codeCopied);
+                    },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: SizedBox(
+                    height: 44,
+                    child: ElevatedButton.icon(
+                      onPressed: () async {
+                        // origin считаем ДО Navigator.pop — иначе контекст
+                        // диалога уже мёртв и на iPad popover не откроется.
+                        final origin = shareOriginFromContext(context);
+                        if (pair.inviteLink.isEmpty) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                LocaleService.current.inviteCodeNotReady,
+                              ),
+                            ),
+                          );
+                          return;
+                        }
+                        Navigator.pop(context);
+                        await Share.share(
+                          LocaleService.current.shareGroupInviteText(
+                            pair.inviteCode,
+                            pair.inviteLink,
+                          ),
+                          subject: LocaleService.current.groupInvitation,
+                          sharePositionOrigin: origin,
+                        );
+                      },
+                      icon: const Icon(Icons.share_rounded, size: 16),
+                      label: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Text(
+                          LocaleService.current.share,
+                          maxLines: 1,
+                          softWrap: false,
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: primary,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: MediaQuery.of(context).padding.bottom + 16),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  UI HELPERS
+  // ═══════════════════════════════════════════════════
+
+  String _getConnectedSuccessMessage() {
+    final s = LocaleService.current;
+    switch (pair.relationshipType) {
+      case RelationshipType.couple:
+        return s.connectedWithCouple(pair.partnerName);
+      case RelationshipType.married:
+        return s.marriedTo(pair.partnerName);
+      case RelationshipType.friends:
+        return s.friendsWith(pair.partnerName);
+      case RelationshipType.buddies:
+        return s.buddiesWith(pair.partnerName);
+      case RelationshipType.custom:
+        return s.customRelWith(pair.relationshipLabel, pair.partnerName);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  JOIN ANOTHER GROUP (in connected view)
+  // ═══════════════════════════════════════════════════
+  Widget _buildJoinAnotherGroupCard() {
+    return _glassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF3B82F6).withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(
+                  Icons.group_add_rounded,
+                  color: Color(0xFF3B82F6),
+                  size: 20,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      LocaleService.current.joinAnotherGroup,
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: widget.theme.textPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      LocaleService.current.enterCodeScanQr,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: widget.theme.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          // ── Quick actions: Scan QR and Enter Code ──
+          Row(
+            children: [
+              Expanded(
+                child: _outlineButton(
+                  icon: Icons.qr_code_scanner_rounded,
+                  label: LocaleService.current.scanQr,
+                  onTap: _openQRScanner,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: GestureDetector(
+                  onTap: () => setState(() => _showCodeInput = !_showCodeInput),
+                  child: Container(
+                    height: 44,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: _showCodeInput ? primary : widget.theme.divider,
+                      ),
+                      color: _showCodeInput ? primary.withOpacity(0.05) : null,
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.keyboard_rounded,
+                          size: 16,
+                          color: _showCodeInput
+                              ? primary
+                              : widget.theme.textSecondary,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          LocaleService.current.enterCode,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: _showCodeInput
+                                ? primary
+                                : widget.theme.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_showCodeInput) ...[
+            const SizedBox(height: 16),
+            TextField(
+              controller: _codeController,
+              textCapitalization: TextCapitalization.characters,
+              maxLength: 6,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 8,
+                color: primary,
+              ),
+              decoration: InputDecoration(
+                counterText: '',
+                hintText: '------',
+                hintStyle: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 8,
+                  color: widget.theme.textMuted,
+                ),
+                filled: true,
+                fillColor: primary.withOpacity(0.04),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  borderSide: BorderSide(
+                    color: _codeError
+                        ? Colors.red.shade300
+                        : primary.withOpacity(0.15),
+                  ),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  borderSide: BorderSide(
+                    color: _codeError
+                        ? Colors.red.shade300
+                        : primary.withOpacity(0.15),
+                  ),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  borderSide: BorderSide(color: primary, width: 2),
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  vertical: 16,
+                  horizontal: 20,
+                ),
+              ),
+              onChanged: (_) {
+                if (_codeError) setState(() => _codeError = false);
+              },
+            ),
+            if (_codeError)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  LocaleService.current.invalidCodeTryAgain,
+                  style: TextStyle(fontSize: 12, color: Colors.red.shade400),
+                ),
+              ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton(
+                onPressed: _submitCode,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: primary,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  elevation: 0,
+                ),
+                child: Text(
+                  LocaleService.current.joinGroup,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _glassCard({required Widget child}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: widget.theme.isDark
+            ? widget.theme.cardSurface
+            : const Color(0xC7FFFFFF),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: widget.theme.isDark
+              ? widget.theme.cardBorder
+              : const Color(0x99FFFFFF),
+        ),
+      ),
+      child: child,
+    );
+  }
+
+  Widget _outlineButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        height: 44,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: widget.theme.divider),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 16, color: widget.theme.textSecondary),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: widget.theme.textSecondary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  THEMED HELPERS
+  // ═══════════════════════════════════════════════════
+
+  Widget _themedCard({required Widget child}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: widget.theme.cardSurface,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: widget.theme.cardBorder, width: 0.5),
+      ),
+      child: child,
+    );
+  }
+
+  /// Показывает 6 ячеек с символами кода. Если код пустой — пульсирующий
+  /// скелетон (код ещё генерируется на сервере).
+  Widget _buildCodeCells({
+    required String code,
+    required Color color,
+    double cellWidth = 40,
+    double cellHeight = 50,
+    double fontSize = 20,
+  }) {
+    if (code.isEmpty) {
+      return AnimatedBuilder(
+        animation: _pulseController,
+        builder: (context, _) {
+          final alpha = 0.04 + _pulseController.value * 0.09;
+          return Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: List.generate(6, (_) {
+              return Container(
+                width: cellWidth,
+                height: cellHeight,
+                margin: const EdgeInsets.symmetric(horizontal: 3),
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: alpha),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: color.withValues(alpha: (alpha * 2).clamp(0.0, 1.0)),
+                  ),
+                ),
+              );
+            }),
+          );
+        },
+      );
+    }
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: code.split('').map((ch) {
+        return Container(
+          width: cellWidth,
+          height: cellHeight,
+          margin: const EdgeInsets.symmetric(horizontal: 3),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.06),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: color.withValues(alpha: 0.12)),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            ch,
+            style: TextStyle(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w800,
+              color: color,
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  void _openChat({UnfoldSourceState? from}) {
+    // Пары ещё нет — чат пуст и сообщение из него не уходит: `ChatService.send`
+    // выходит на пустом `groupId`, и человек получает «Не удалось отправить»
+    // вместо объяснения.
+    if (pair.pairId.isEmpty) return;
+    Navigator.push(
+      context,
+      unfoldFrom<void>(
+        from,
+        (_) => ChatScreen(
+          pairData: widget.pairData,
+          theme: widget.theme,
+          userData: widget.userData,
+          myDisplayName: widget.userData?.displayName ??
+              (PbAuthService().currentProfile()?['displayName'] as String?) ??
+              'Me',
+          timerStart: widget.timerService?.systemTimer?.startDate,
+        ),
+      ),
+    ).then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  Widget _buildChatButton() {
+    return GestureDetector(
+      onTap: _openChat,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: widget.theme.heroGradient,
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          children: [
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                const Icon(Icons.chat_bubble_rounded,
+                    color: Colors.white, size: 24),
+                // Красная точка непрочитанных
+                Positioned(
+                  right: -3,
+                  top: -3,
+                  child: StableStreamBuilder<bool>(
+                    create: () => ChatService.instance
+                        .watchHasUnread(widget.pairData.pairId),
+                    keys: [widget.pairData.pairId],
+                    builder: (context, snap) {
+                      if (snap.data != true) return const SizedBox.shrink();
+                      return Container(
+                        width: 11,
+                        height: 11,
+                        decoration: BoxDecoration(
+                          color: Colors.redAccent,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 1.5),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                LocaleService.current.chatTitle,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            const Icon(Icons.arrow_forward_ios_rounded,
+                color: Colors.white70, size: 16),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _actionTile({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        height: 72,
+        decoration: BoxDecoration(
+          color: widget.theme.cardSurface,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: widget.theme.cardBorder, width: 0.5),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 22, color: primary),
+            const SizedBox(height: 6),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: widget.theme.textSecondary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCodeInput() {
+    return TextField(
+      controller: _codeController,
+      textCapitalization: TextCapitalization.characters,
+      maxLength: 6,
+      textAlign: TextAlign.center,
+      style: TextStyle(
+        fontSize: 22,
+        fontWeight: FontWeight.w800,
+        letterSpacing: 8,
+        color: primary,
+      ),
+      decoration: InputDecoration(
+        counterText: '',
+        hintText: '------',
+        hintStyle: TextStyle(
+          fontSize: 22,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 8,
+          color: widget.theme.textMuted,
+        ),
+        filled: true,
+        fillColor: primary.withOpacity(0.04),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(
+            color: _codeError ? Colors.red.shade300 : primary.withOpacity(0.12),
+          ),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(
+            color: _codeError ? Colors.red.shade300 : primary.withOpacity(0.12),
+          ),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: primary, width: 2),
+        ),
+        contentPadding: const EdgeInsets.symmetric(
+          vertical: 14,
+          horizontal: 20,
+        ),
+      ),
+      onChanged: (_) {
+        if (_codeError) setState(() => _codeError = false);
+      },
+    );
+  }
+
+  Widget _avatarFallback(String name, double size) {
+    final initial = name.firstGraphemeUpper('?');
+    return Container(
+      width: size,
+      height: size,
+      color: widget.theme.cardSurface,
+      child: Center(
+        child: Text(
+          initial,
+          style: TextStyle(
+            fontSize: size * 0.4,
+            fontWeight: FontWeight.w700,
+            color: primary,
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  ACTIONS
+  // ═══════════════════════════════════════════════════
+
+  Future<void> _submitCode() async {
+    // Один код — один запрос. Diplink присылает его дважды (поток
+    // DeepLinkService плюс буфер, забираемый после первого кадра), а кнопку
+    // успевают нажать второй раз, пока идёт первый запрос. В журнале сервера это
+    // видно как три-пять одинаковых приёмов в пределах полусекунды: первый
+    // собирал пару, остальные натыкались на уже использованный код, и их ошибка
+    // ложилась поверх успеха — человек читал «Код не найден» при собранной паре.
+    if (_submitting) return;
+    _submitting = true;
+    try {
+      await _submitCodeOnce();
+    } finally {
+      _submitting = false;
+    }
+  }
+
+  Future<void> _submitCodeOnce() async {
+    final code = normalizeInviteCode(_codeController.text);
+    if (pair.isSelfCode(code)) {
+      setState(() => _codeError = true);
+      _showSnack(LocaleService.current.cantInviteSelf);
+      return;
+    }
+    final ok = await pair.acceptCode(code);
+    // После await экран мог уйти (при успешном коннекте приложение само
+    // переключается с этого экрана) → setState на размонтированном State падает
+    // (_element! == null внутри setState).
+    if (!mounted) return;
+    if (ok) {
+      setState(() {});
+      _showSnack('\u{1F389} ${_getConnectedSuccessMessage()}');
+    } else {
+      setState(() => _codeError = true);
+      // Показываем реальную причину (истёкшая сессия, свой код, группа полна),
+      // а не всегда «код не найден» — иначе диагностировать нечего.
+      final msg = pair.lastAcceptMessage;
+      _showSnack((msg != null && msg.isNotEmpty)
+          ? msg
+          : LocaleService.current.codeNotFound);
+    }
+  }
+
+  void _showSnack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        margin: const EdgeInsets.fromLTRB(24, 0, 24, 100),
+        backgroundColor: Colors.grey.shade800,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  DIALOGS
+  // ═══════════════════════════════════════════════════
+
+  void _showQRDialog() {
+    // Без кода показывать нечего: QR кодирует ссылку, а она без кода ведёт в
+    // 404 (жалоба «партнёр не может перейти», 20.08.2026). Код выдаёт сервер,
+    // и до ответа поле пустое — тогда просто ждём.
+    final shownCode = _shownCode;
+    if (shownCode.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(_sessionLost
+              ? LocaleService.current.inviteSessionLost
+              : LocaleService.current.inviteCodeNotReady),
+        ),
+      );
+      return;
+    }
+    final random = Random();
+    final isRickroll = random.nextInt(100) < 10;
+    final qrData = isRickroll
+        ? 'https://youtu.be/dQw4w9WgXcQ?si=owAivsztmdCvvm6v'
+        // QR кодирует прямой deep link (loveapp://invite/CODE): скан камерой
+        // открывает приложение сразу. Внутренний сканнер тоже парсит '/invite/'.
+        : pair.inviteDeepLink;
+    final cs = ProfileTheme.themeFor(widget.theme).colorScheme;
+    final s = LocaleService.current;
+    showModalSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: false,
+      backgroundColor: cs.surfaceContainerLow,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(36)),
+      ),
+      builder: (sheetCtx) => SafeArea(
+        top: false,
+        // На маленьком экране код с кнопками ниже края листа: листаются.
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(24, 14, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              sheetHandle(cs),
+              sheetHeader(cs, s.scanToConnect),
+              // QR: круглые модули и глаза в цвете темы; светлая подложка +
+              // отступ (quiet zone) и коррекция M — чтобы стилизация не мешала
+              // скану.
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(28),
+                  ),
+                  child: QrImageView(
+                    data: qrData,
+                    version: QrVersions.auto,
+                    size: 232,
+                    backgroundColor: Colors.white,
+                    errorCorrectionLevel: QrErrorCorrectLevel.M,
+                    padding: EdgeInsets.zero,
+                    eyeStyle: QrEyeStyle(
+                      eyeShape: QrEyeShape.circle,
+                      color: cs.primary,
+                    ),
+                    dataModuleStyle: QrDataModuleStyle(
+                      dataModuleShape: QrDataModuleShape.circle,
+                      color: cs.primary,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                shownCode,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontFamily: 'Unbounded',
+                  fontSize: 24,
+                  fontWeight: FontWeight.w800,
+        fontVariations: const [FontVariation('wght', 800)],
+                  color: cs.primary,
+                  letterSpacing: 6,
+                ),
+              ),
+              const SizedBox(height: 24),
+              Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 54,
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          // iPad: origin ДО await, иначе share-лист не откроется.
+                          final origin = shareOriginFromContext(context);
+                          if (pair.inviteLink.isEmpty) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text(s.inviteCodeNotReady)),
+                            );
+                            return;
+                          }
+                          await Share.share(
+                            s.joinMeLinkText(pair.inviteLink),
+                            subject: s.loveAppInvitation,
+                            sharePositionOrigin: origin,
+                          );
+                        },
+                        icon: const Icon(Icons.share_rounded, size: 20),
+                        label: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(s.share, maxLines: 1, softWrap: false),
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: cs.primary,
+                          side: BorderSide(color: cs.outlineVariant),
+                          shape: const StadiumBorder(),
+                          textStyle: const TextStyle(
+                              fontFamily: 'Onest',
+                              fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                              fontSize: 15),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: SizedBox(
+                      height: 54,
+                      child: FilledButton(
+                        onPressed: () => Navigator.of(sheetCtx).pop(),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: cs.primary,
+                          foregroundColor: cs.onPrimary,
+                          shape: const StadiumBorder(),
+                          textStyle: const TextStyle(
+                              fontFamily: 'Onest',
+                              fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                              fontSize: 15),
+                        ),
+                        child: Text(s.done),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openQRScanner() async {
+    final code = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const QRScannerScreen(),
+        settings: const RouteSettings(name: '/qr_scanner'),
+      ),
+    );
+
+    if (code != null && mounted) {
+      _codeController.text = code;
+      _showCodeInput = true;
+      setState(() {});
+      _submitCode();
+    }
+  }
+
+  void _showAddGroupDialog() {
+    final allCustomTypes = <String, Map<String, String>>{};
+    for (final conn in pair.manager.connections) {
+      for (final ct in conn.customRelationshipTypes) {
+        final id = ct['id'] ?? '';
+        if (id.isNotEmpty && !allCustomTypes.containsKey(id)) {
+          allCustomTypes[id] = ct;
+        }
+      }
+    }
+    final cs = ProfileTheme.themeFor(widget.theme).colorScheme;
+    final s = LocaleService.current;
+    showModalSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: false,
+      backgroundColor: cs.surfaceContainerLow,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(36)),
+      ),
+      builder: (sheetCtx) {
+        Future<void> create(RelationshipType type,
+            {String customLabel = '', String customEmoji = ''}) async {
+          if (_creatingConnection) return;
+          _creatingConnection = true;
+          Navigator.of(sheetCtx).pop();
+          _resetCodeInput();
+          try {
+            await pair.manager.addNewConnection(
+                type: type, customLabel: customLabel, customEmoji: customEmoji);
+            if (!mounted) return;
+            setState(() {});
+            _showSnack(s.newConnectionAdded);
+          } finally {
+            _creatingConnection = false;
+          }
+        }
+
+        return SafeArea(
+          top: false,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(sheetCtx).size.height * 0.85),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  sheetHandle(cs),
+                  sheetHeader(
+                      cs, s.addNewConnection, s.chooseTypeForConnection),
+                  typeSheetOption(
+                      cs: cs,
+                      icon: Icons.favorite_rounded,
+                      title: s.inLoveStatus,
+                      subtitle: s.perfectForCouples,
+                      onTap: () => create(RelationshipType.couple)),
+                  typeSheetOption(
+                      cs: cs,
+                      icon: Icons.diamond_rounded,
+                      title: s.married,
+                      subtitle: s.forMarriedPartners,
+                      onTap: () => create(RelationshipType.married)),
+                  typeSheetOption(
+                      cs: cs,
+                      icon: Icons.handshake_rounded,
+                      title: s.friends,
+                      subtitle: s.connectWithBestFriend,
+                      onTap: () => create(RelationshipType.friends)),
+                  typeSheetOption(
+                      cs: cs,
+                      icon: Icons.groups_rounded,
+                      title: s.bestBuddies,
+                      subtitle: s.forInseparableCompanions,
+                      onTap: () => create(RelationshipType.buddies)),
+                  ...allCustomTypes.values.map((ct) => typeSheetOption(
+                      cs: cs,
+                      icon: relIconForEmoji(ct['emoji'] ?? ''),
+                      title: ct['label'] ?? s.custom,
+                      subtitle: s.yourCustomType,
+                      onTap: () => create(RelationshipType.custom,
+                          customLabel: ct['label'] ?? '',
+                          customEmoji: ct['emoji'] ?? ''))),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Открыть подпись по идентификатору — плитка имени знает только его.
+  Future<void> _renamePartnerByUid(String uid) async {
+    final member = pair.partners.where((m) => m.uid == uid).firstOrNull;
+    if (member == null) return;
+    await _showRenameDialog(member);
+  }
+
+  Future<void> _showRenameDialog(GroupMember member) async {
+    final current = NicknameService.instance.get(member.uid);
+    final name = await AppDialog.prompt(
+      context,
+      title: LocaleService.current.renamePartner,
+      label: LocaleService.current.renamePartnerHint,
+      hint: member.name,
+      initial: current,
+      confirmLabel: LocaleService.current.save,
+      maxLength: 30,
+    );
+    if (name == null) return;
+    await pair.setNickname(member.uid, name);
+    if (mounted) setState(() {});
+  }
+
+  /// Что можно сделать со связью: переименовать партнёра или расстаться.
+  ///
+  /// Появился потому, что удаление висело прямо на удержании пилюли: зажал —
+  /// и следующим касанием пары нет. Теперь удержание открывает список, а
+  /// удаление остаётся вторым шагом с именем того, кого теряешь.
+  Future<void> _showConnectionActions(Connection conn) async {
+    final cs = ProfileTheme.themeFor(widget.theme).colorScheme;
+    final s = LocaleService.current;
+    final partner = conn.partners.firstOrNull;
+    final name = partner == null
+        ? s.waiting
+        : NicknameService.instance.resolve(partner.uid, partner.name);
+
+    await showAppSheet<void>(
+      context,
+      builder: (sheetCtx) => SheetScaffold(
+        title: name,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (partner != null)
+                ListTile(
+                  shape: const StadiumBorder(),
+                  leading: CircleAvatar(
+                    backgroundColor: cs.secondaryContainer,
+                    child: Icon(Icons.edit_rounded,
+                        size: 20, color: cs.onSecondaryContainer),
+                  ),
+                  title: Text(
+                    s.renamePartner,
+                    style: TextStyle(
+                      fontFamily: 'Onest',
+                      fontSize: 15.5,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurface,
+                    ),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    _showRenameDialog(partner);
+                  },
+                ),
+              ListTile(
+                shape: const StadiumBorder(),
+                leading: CircleAvatar(
+                  backgroundColor: cs.errorContainer,
+                  child: Icon(Icons.link_off_rounded,
+                      size: 20, color: cs.onErrorContainer),
+                ),
+                title: Text(
+                  s.deleteConnectionAction,
+                  style: TextStyle(
+                    fontFamily: 'Onest',
+                    fontSize: 15.5,
+                    fontWeight: FontWeight.w600,
+                    color: cs.error,
+                  ),
+                ),
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  _confirmDeleteConnection(conn.id, name: name);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _confirmDeleteConnection(String connectionId, {String name = ''}) {
+    final cs = ProfileTheme.themeFor(widget.theme).colorScheme;
+    showModalSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: false,
+      backgroundColor: cs.surfaceContainerLow,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(36)),
+      ),
+      builder: (sheetCtx) {
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 14, 24, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 26),
+                    decoration: BoxDecoration(
+                        color: cs.onSurfaceVariant.withValues(alpha: 0.35),
+                        borderRadius: BorderRadius.circular(2)),
+                  ),
+                ),
+                Center(
+                  child: Container(
+                    width: 78,
+                    height: 78,
+                    decoration: BoxDecoration(
+                        color: cs.errorContainer, shape: BoxShape.circle),
+                    child: Icon(Icons.link_off_rounded,
+                        size: 38, color: cs.onErrorContainer),
+                  ),
+                ),
+                const SizedBox(height: 22),
+                Text(
+                  name.isEmpty
+                      ? LocaleService.current.deleteConnection
+                      : LocaleService.current.deleteConnectionWith
+                          .replaceAll('{name}', name),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      fontFamily: 'Unbounded',
+                      fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                      fontSize: 23,
+                      height: 1.15,
+                      color: cs.onSurface),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  LocaleService.current.deleteConnectionDesc,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      fontFamily: 'Onest',
+        fontVariations: const [FontVariation('wght', 400)],
+                      fontSize: 15,
+                      height: 1.42,
+                      color: cs.onSurfaceVariant),
+                ),
+                const SizedBox(height: 28),
+                SizedBox(
+                  height: 56,
+                  child: FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: cs.error,
+                      foregroundColor: cs.onError,
+                      shape: const StadiumBorder(),
+                      textStyle: const TextStyle(
+                          fontFamily: 'Onest',
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],),
+                    ),
+                    // Закрываем ДО сетевого removeConnection: после pop кнопки
+                    // нет — двойной тап и лишний pop нижнего экрана невозможны.
+                    onPressed: () async {
+                      Navigator.of(sheetCtx).pop();
+                      await pair.manager.removeConnection(connectionId);
+                      if (!mounted) return;
+                      _resetCodeInput();
+                      setState(() {});
+                      _showSnack(LocaleService.current.connectionRemoved);
+                    },
+                    child: Text(LocaleService.current.delete),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  height: 56,
+                  child: TextButton(
+                    style: TextButton.styleFrom(
+                      foregroundColor: cs.onSurfaceVariant,
+                      shape: const StadiumBorder(),
+                      textStyle: const TextStyle(
+                          fontFamily: 'Onest',
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+        fontVariations: const [FontVariation('wght', 600)],),
+                    ),
+                    onPressed: () => Navigator.of(sheetCtx).pop(),
+                    child: Text(LocaleService.current.cancel),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showUnpairDialog() async {
+    final ok = await AppDialog.confirm(
+      context,
+      title: LocaleService.current.disconnectQuestion,
+      message: LocaleService.current.disconnectDesc,
+      confirmLabel: LocaleService.current.disconnect,
+      destructive: true,
+    );
+    if (!ok || !mounted) return;
+    pair.unpair();
+    setState(() {});
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// QR Scanner Screen
+// ═══════════════════════════════════════════════════
+class QRScannerScreen extends StatefulWidget {
+  const QRScannerScreen({super.key});
+
+  @override
+  State<QRScannerScreen> createState() => _QRScannerScreenState();
+}
+
+class _QRScannerScreenState extends State<QRScannerScreen> {
+  bool _codeDetected = false;
+
+  /// Камера не поднялась: нет разрешения, занята другим приложением, нет самой
+  /// камеры. Показываем понятное окно вместо чёрного экрана.
+  bool _cameraFailed = false;
+
+
+  /// Строка из кода: сканер отдаёт либо шесть символов, либо ссылку-приглашение.
+  void _onScanned(String raw) {
+    if (_codeDetected) return;
+    var code = raw;
+    if (raw.contains('/invite/')) {
+      code = raw.split('/invite/').last;
+    }
+    if (code.length != 6) return;
+    _codeDetected = true;
+    Navigator.pop(context, code.toUpperCase());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Сканер чёрный: окно перехода под ним тоже должно быть чёрным.
+    UnfoldTint.claim(context, Colors.black);
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.close, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text(
+          LocaleService.current.scanPartnersQr,
+          style: const TextStyle(color: Colors.white),
+        ),
+      ),
+      body: _framed(_scanner()),
+    );
+  }
+
+  /// Камера плюс окно наведения. Рамка одна на оба движка: читают они одну и
+  /// ту же область кадра, и человеку разница между ними видна быть не должна.
+  Widget _framed(Widget camera) {
+    if (_cameraFailed) return _unavailable();
+    return Stack(
+      fit: StackFit.expand,
+      children: [camera, const QrViewfinder()],
+    );
+  }
+
+  Widget _unavailable() {
+    final s = LocaleService.current;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.qr_code_scanner_rounded,
+                size: 56, color: Colors.white54),
+            const SizedBox(height: 18),
+            Text(
+              s.qrScannerUnavailable,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontFamily: 'Unbounded',
+                fontSize: 17,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              s.qrScannerUnavailableHint,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontFamily: 'Onest',
+                fontSize: 13.5,
+                height: 1.4,
+                color: Colors.white.withValues(alpha: 0.72),
+              ),
+            ),
+            const SizedBox(height: 22),
+            FilledButton(
+              onPressed: () => Navigator.pop(context),
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.white,
+                foregroundColor: Colors.black,
+                shape: const StadiumBorder(),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 26, vertical: 14),
+              ),
+              child: Text(
+                s.qrEnterCodeManually,
+                style: const TextStyle(
+                    fontSize: 14.5, fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _scanner() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = constraints.biggest;
+        final side = size.shortestSide * kQrWindowFraction;
+        return MobileScanner(
+          // ML Kit тоже читает только окно наведения: рамка на экране одна, и
+          // вести себя оба движка обязаны одинаково.
+          scanWindow: Rect.fromCenter(
+            center: Offset(size.width / 2, size.height / 2),
+            width: side,
+            height: side,
+          ),
+          // Камера может отказать и при готовой модели: нет разрешения, занята
+          // другой программой. Показываем то же понятное окно, а не голый
+          // текст ошибки от плагина.
+          errorBuilder: (context, error) => _unavailable(),
+          onDetect: (capture) {
+            for (final barcode in capture.barcodes) {
+              final raw = barcode.rawValue;
+              if (raw != null) _onScanned(raw);
+            }
+          },
+        );
+      },
+    );
+  }
+}

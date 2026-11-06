@@ -1,0 +1,453 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../models/canvas_meta.dart';
+import '../models/draw_stroke.dart';
+import 'canvas_repository.dart';
+
+/// Persists a per-user-per-group list of [CanvasMeta] entries in SharedPreferences
+/// **and** syncs the catalogue to PocketBase when the user belongs to a group
+/// (миграция §3 — через [CanvasRepository], ноль Firebase).
+///
+/// The actual drawing strokes live in PocketBase (paired) or in-memory (solo).
+class CanvasStorageService {
+  CanvasStorageService._();
+  static final CanvasStorageService instance = CanvasStorageService._();
+
+  final CanvasRepository _canvas = CanvasRepository();
+
+  /// Active Firebase listener — cancelled in [stopListening].
+  StreamSubscription? _catalogueSub;
+
+  /// Номер правки списка холстов, растёт после каждой записи. Галерея
+  /// перечитывает список по нему: картинку холста дописывают уже после
+  /// ухода с него (TOG-39), а каталог партнёра приезжает когда угодно.
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+
+  // ── helpers ────────────────────────────────────────────────────────────────
+
+  /// Key is scoped by both uid and groupId so each connection has its own
+  /// isolated canvas list. Solo mode uses the 'solo' sentinel.
+  String _key(String uid, String groupId) =>
+      'canvases_v1_${uid}_${groupId.isEmpty ? 'solo' : groupId}';
+
+  // ── public API ─────────────────────────────────────────────────────────────
+
+  /// Returns all canvases for [uid] in [groupId], newest first.
+  ///
+  /// Пустой список остаётся пустым. Раньше сюда подсевался холст `main`
+  /// («Canvas 1»): удалишь последний — он появлялся снова, и у общего холста
+  /// со старыми штрихами, ведь штрихи удаление каталога не трогает (TOG-12).
+  /// Галерея с пустым списком показывает «Новый холст».
+  Future<List<CanvasMeta>> getCanvases(String uid,
+      {String groupId = ''}) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_key(uid, groupId));
+      if (raw == null) return [];
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      return decoded
+          .map((e) => CanvasMeta.fromJson(Map<String, dynamic>.from(e as Map)))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Creates a new canvas entry (prepended to the list) and returns it.
+  /// When [groupId] is non-empty the canvas meta is also pushed to Firebase.
+  Future<CanvasMeta> createCanvas(
+    String uid, {
+    String? name,
+    String groupId = '',
+    int? pixelW,
+    int? pixelH,
+    double? sheetRatio,
+  }) async {
+    final canvases = await getCanvases(uid, groupId: groupId);
+    final id = 'canvas_${DateTime.now().millisecondsSinceEpoch}';
+    final meta = CanvasMeta(
+      id: id,
+      name: name ?? 'Canvas ${canvases.length + 1}',
+      createdAt: DateTime.now(),
+      updatedAt: DateTime.now(),
+      pixelW: pixelW,
+      pixelH: pixelH,
+      // Новый холст сразу с листом. У старых поле пустое — их рисунки
+      // остаются в прежней геометрии. Раскраске нужен квадрат: её контур
+      // нарисован 1:1, при другом формате половины разъедутся.
+      sheetRatio: sheetRatio ??
+          ((pixelW != null && pixelH != null) ? pixelW / pixelH : 4 / 5),
+      // Пока сервер не ответил, холст считается своим: пропажа из каталога
+      // для него ещё ничего не значит, и галерея дошлёт его сама.
+      onServer: groupId.isEmpty ? null : false,
+    );
+    await _save(uid, groupId, [meta, ...canvases]);
+
+    // Push to PocketBase so partner sees the new canvas
+    if (groupId.isNotEmpty) {
+      _track(_pushToCatalogue(uid, groupId, meta));
+      _canvas.incrementDrawings(groupId, 1);
+    }
+
+    return meta;
+  }
+
+  /// Отправить холст в каталог; принят — отметить, что сервер его видел.
+  Future<void> _pushToCatalogue(
+      String uid, String groupId, CanvasMeta meta) async {
+    final ok = await _canvas.upsertCatalogue(
+      groupId,
+      meta.id,
+      name: meta.name,
+      createdAt: meta.createdAt.millisecondsSinceEpoch,
+      updatedAt: meta.updatedAt.millisecondsSinceEpoch,
+      createdBy: uid,
+      pixelW: meta.pixelW,
+      pixelH: meta.pixelH,
+      sheetRatio: meta.sheetRatio,
+    );
+    if (ok) await _markOnServer(uid, groupId, {meta.id});
+  }
+
+  /// Отметить холсты [ids] как дошедшие до сервера. Список перечитывается:
+  /// между отправкой и ответом его могли поправить.
+  Future<void> _markOnServer(String uid, String groupId, Set<String> ids) async {
+    final canvases = await getCanvases(uid, groupId: groupId);
+    if (!canvases.any((c) => ids.contains(c.id) && c.onServer != true)) return;
+    await _save(uid, groupId, [
+      for (final c in canvases)
+        ids.contains(c.id) ? c.copyWith(onServer: true) : c,
+    ]);
+  }
+
+  /// Фоновые отправки — чтобы тест мог дождаться их конца.
+  final List<Future<void>> _background = [];
+
+  void _track(Future<void> work) {
+    _background.add(work);
+    work.whenComplete(() {
+      _background.remove(work);
+    });
+  }
+
+  /// Дождаться фоновых отправок.
+  @visibleForTesting
+  Future<void> debugIdle() async {
+    while (_background.isNotEmpty) {
+      await Future.wait(List.of(_background));
+    }
+  }
+
+  /// Забыть всё, что сервис помнит за запуск.
+  @visibleForTesting
+  void debugReset() {
+    _sheetSent.clear();
+    _background.clear();
+    stopListening();
+  }
+
+  /// Replaces the matching entry (by id) with [updated].
+  Future<void> updateCanvas(
+    String uid,
+    CanvasMeta updated, {
+    String groupId = '',
+  }) async {
+    final canvases = await getCanvases(uid, groupId: groupId);
+    final next = canvases.map((c) => c.id == updated.id ? updated : c).toList();
+    await _save(uid, groupId, next);
+
+    if (groupId.isNotEmpty) {
+      _canvas.upsertCatalogue(
+        groupId,
+        updated.id,
+        name: updated.name,
+        createdAt: updated.createdAt.millisecondsSinceEpoch,
+        updatedAt: updated.updatedAt.millisecondsSinceEpoch,
+      );
+    }
+  }
+
+  /// Rename a canvas (local + Firebase).
+  Future<void> renameCanvas(
+    String uid,
+    String canvasId,
+    String newName, {
+    String groupId = '',
+  }) async {
+    final canvases = await getCanvases(uid, groupId: groupId);
+    final idx = canvases.indexWhere((c) => c.id == canvasId);
+    if (idx < 0) return;
+    canvases[idx] = canvases[idx].copyWith(
+      name: newName,
+      updatedAt: DateTime.now(),
+    );
+    await _save(uid, groupId, canvases);
+
+    if (groupId.isNotEmpty) {
+      _canvas.renameCatalogue(groupId, canvasId, newName);
+    }
+  }
+
+  /// Stores a PNG thumbnail [bytes] for the canvas identified by [canvasId]
+  /// and bumps its [updatedAt] timestamp.
+  Future<void> updatePreview(
+    String uid,
+    String canvasId,
+    Uint8List bytes, {
+    String groupId = '',
+  }) async {
+    final canvases = await getCanvases(uid, groupId: groupId);
+    final idx = canvases.indexWhere((c) => c.id == canvasId);
+    if (idx < 0) return;
+    canvases[idx] = canvases[idx].copyWith(
+      previewBase64: base64Encode(bytes),
+      updatedAt: DateTime.now(),
+    );
+    await _save(uid, groupId, canvases);
+  }
+
+  /// Removes the canvas with [canvasId] from the list.
+  Future<void> deleteCanvas(
+    String uid,
+    String canvasId, {
+    String groupId = '',
+  }) async {
+    final canvases = await getCanvases(uid, groupId: groupId);
+    await _save(uid, groupId, canvases.where((c) => c.id != canvasId).toList());
+
+    if (groupId.isNotEmpty) {
+      _canvas.deleteCatalogue(groupId, canvasId);
+      _canvas.incrementDrawings(groupId, -1);
+    }
+  }
+
+  // ── Firebase real-time sync ───────────────────────────────────────────────
+
+  /// Start listening to the remote canvas catalogue.
+  /// Merges remote entries into the local list for this [groupId].
+  void startListening({required String uid, required String groupId}) {
+    _catalogueSub?.cancel();
+    if (groupId.isEmpty) return;
+
+    _catalogueSub = _canvas.watchCatalogue(groupId).listen(
+      (remoteList) => mergeRemoteCanvases(uid, groupId, remoteList),
+      onError: (e) => debugPrint('[Storage] catalogue error: $e'),
+    );
+  }
+
+  /// Stop the remote listener (e.g. when the gallery screen is disposed).
+  void stopListening() {
+    _catalogueSub?.cancel();
+    _catalogueSub = null;
+  }
+
+  /// Холсты, чью пропорцию листа мы уже дослали на сервер за этот запуск.
+  final Set<String> _sheetSent = <String>{};
+
+  /// Merge remote canvas entries into local storage for [groupId].
+  @visibleForTesting
+  Future<void> mergeRemoteCanvases(
+    String uid,
+    String groupId,
+    List<Map<String, dynamic>> remoteList,
+  ) async {
+    final local = await getCanvases(uid, groupId: groupId);
+    final localById = {for (final c in local) c.id: c};
+
+    bool changed = false;
+    for (final remote in remoteList) {
+      final id = remote['id'] as String;
+      final name = (remote['name'] as String?) ?? 'Canvas';
+      final createdAt = DateTime.fromMillisecondsSinceEpoch(
+        (remote['createdAt'] as num?)?.toInt() ?? 0,
+      );
+      final updatedAt = DateTime.fromMillisecondsSinceEpoch(
+        (remote['updatedAt'] as num?)?.toInt() ?? 0,
+      );
+
+      final pixelW = (remote['pixelW'] as num?)?.toInt();
+      final pixelH = (remote['pixelH'] as num?)?.toInt();
+      final sheetRatio = (remote['sheetRatio'] as num?)?.toDouble();
+
+      if (!localById.containsKey(id)) {
+        // New canvas from partner — add it locally
+        localById[id] = CanvasMeta(
+          id: id,
+          name: name,
+          createdAt: createdAt,
+          updatedAt: updatedAt,
+          pixelW: pixelW,
+          pixelH: pixelH,
+          // Лист приезжает вместе с холстом: без него рисунок партнёра
+          // растягивался на всю свободную область и плющился, потому что
+          // точки штрихов лежат в долях 0..1 от холста.
+          sheetRatio: sheetRatio,
+          onServer: true,
+        );
+        changed = true;
+      } else {
+        // Холст есть в каталоге: сервер его видел, и пропажа из каталога
+        // дальше значит удаление.
+        if (localById[id]!.onServer != true) {
+          localById[id] = localById[id]!.copyWith(onServer: true);
+          changed = true;
+        }
+        // Update name if remote is newer
+        final existing = localById[id]!;
+        if (updatedAt.isAfter(existing.updatedAt) && name != existing.name) {
+          localById[id] = existing.copyWith(name: name, updatedAt: updatedAt);
+          changed = true;
+        }
+        // Сетку и лист узнаём от партнёра один раз: у создателя они есть
+        // сразу, у второго — приезжают вместе с каталогом.
+        final e = localById[id]!;
+        final needsGrid = pixelW != null && pixelH != null && !e.isPixel;
+        final needsSheet = sheetRatio != null && sheetRatio > 0 && e.sheetRatio == null;
+
+        // Холсты, нарисованные до того, как лист начали возить на сервер,
+        // знает только их автор. Досылаем пропорцию один раз — иначе
+        // партнёр так и будет открывать их растянутыми.
+        if (sheetRatio == null && e.sheetRatio != null && groupId.isNotEmpty
+            && _sheetSent.add(id)) {
+          _canvas.upsertCatalogue(
+            groupId,
+            id,
+            name: e.name,
+            createdAt: e.createdAt.millisecondsSinceEpoch,
+            updatedAt: e.updatedAt.millisecondsSinceEpoch,
+            pixelW: e.pixelW,
+            pixelH: e.pixelH,
+            sheetRatio: e.sheetRatio,
+          );
+        }
+        if (needsGrid || needsSheet) {
+          localById[id] = CanvasMeta(
+            id: e.id,
+            name: e.name,
+            createdAt: e.createdAt,
+            updatedAt: e.updatedAt,
+            previewBase64: e.previewBase64,
+            // Своё значение главнее: пересборка меты не имеет права
+            // ронять лист, с которым холст уже нарисован.
+            pixelW: needsGrid ? pixelW : e.pixelW,
+            pixelH: needsGrid ? pixelH : e.pixelH,
+            sheetRatio: e.sheetRatio ?? sheetRatio,
+            onServer: true,
+          );
+          changed = true;
+        }
+      }
+    }
+
+    // Холсты, которые сервер видел, а в каталоге их больше нет, — удалены
+    // (партнёром или с другого телефона). Убираем и тогда, когда каталог стал
+    // пустым: раньше пустой каталог ничего не убирал, и последний удалённый
+    // холст жил у партнёра, а его галерея заводила холст снова (TOG-12).
+    // Не дошедшие до сервера остаются: их пропажа ничего не значит.
+    final remoteIds = remoteList.map((r) => r['id'] as String).toSet();
+    final toRemove = [
+      for (final c in localById.values)
+        if (!remoteIds.contains(c.id) && c.knownOnServer) c.id,
+    ];
+    for (final id in toRemove) {
+      localById.remove(id);
+      changed = true;
+    }
+
+    if (changed) {
+      final merged = localById.values.toList()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      await _save(uid, groupId, merged);
+    }
+  }
+
+  /// Дослать в каталог холсты, которые до сервера ещё не дошли.
+  ///
+  /// Только их. Раньше при первом открытии галереи за запуск сюда уходили ВСЕ
+  /// свои холсты, и холст, удалённый партнёром, заводился на сервере снова —
+  /// у обоих (TOG-12, повторено на эмуляторе: «Canvas 3» вернулся сразу после
+  /// открытия галереи). Что сервер холст видел, помнит [CanvasMeta.onServer].
+  Future<void> pushAllToFirebase(String uid, String groupId) async {
+    if (groupId.isEmpty) return;
+    final canvases = await getCanvases(uid, groupId: groupId);
+    for (final meta in canvases) {
+      if (meta.knownOnServer) continue;
+      await _pushToCatalogue(uid, groupId, meta);
+    }
+  }
+
+  // ── Local stroke persistence (solo mode) ────────────────────────────────
+
+  String _strokesKey(String uid, String groupId, String canvasId) =>
+      'strokes_v1_${uid}_${groupId.isEmpty ? 'solo' : groupId}_$canvasId';
+
+  /// Persists [strokes] locally for the given canvas (solo or paired).
+  Future<void> saveLocalStrokes(
+    String uid,
+    String canvasId,
+    List<DrawStroke> strokes, {
+    String groupId = '',
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final encoded = jsonEncode(
+        strokes.map((s) => {'id': s.id, ...s.toFirestore()}).toList(),
+      );
+      await prefs.setString(_strokesKey(uid, groupId, canvasId), encoded);
+    } catch (e) {
+      debugPrint('[Storage] saveLocalStrokes error: $e');
+    }
+  }
+
+  /// Loads persisted strokes for the given canvas. Returns empty list on error.
+  Future<List<DrawStroke>> loadLocalStrokes(
+    String uid,
+    String canvasId, {
+    String groupId = '',
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_strokesKey(uid, groupId, canvasId));
+      if (raw == null) return [];
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      return decoded.map((e) {
+        final map = Map<String, dynamic>.from(e as Map);
+        final id = map['id'] as String? ?? '';
+        return DrawStroke.fromFirestore(map, id);
+      }).toList();
+    } catch (e) {
+      debugPrint('[Storage] loadLocalStrokes error: $e');
+      return [];
+    }
+  }
+
+  /// Removes persisted strokes for the given canvas.
+  Future<void> clearLocalStrokes(
+    String uid,
+    String canvasId, {
+    String groupId = '',
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_strokesKey(uid, groupId, canvasId));
+    } catch (e) {
+      debugPrint('[Storage] clearLocalStrokes error: $e');
+    }
+  }
+
+  // ── private ────────────────────────────────────────────────────────────────
+
+  Future<void> _save(
+      String uid, String groupId, List<CanvasMeta> canvases) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _key(uid, groupId),
+      jsonEncode(canvases.map((c) => c.toJson()).toList()),
+    );
+    revision.value++;
+  }
+}

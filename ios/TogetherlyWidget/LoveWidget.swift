@@ -1,0 +1,411 @@
+import SwiftUI
+import WidgetKit
+import UIKit
+
+// MARK: - Парный виджет «Togetherly» (дизайн 1:1 с Android love_widget.xml)
+// Данные пишет lib/services/widget_service.dart (_syncToNativeWidget).
+// Картинки (эмодзи/аватар/фон-фото) зеркалятся в App Group под ios_love_*.
+
+private struct LoveSide {
+    let moodEmoji: UIImage?
+    let moodText: String
+    let status: String
+    let message: String
+    let musicTitle: String
+    let musicArtist: String
+    let avatar: UIImage?
+    let photo: UIImage?
+    /// Путь к фото, как его записало приложение. Путь есть, а картинки нет —
+    /// значит фото не дошло или не открылось.
+    let photoPath: String
+    let mine: Bool
+
+    var musicLine: String {
+        guard !musicTitle.isEmpty else { return "" }
+        return musicArtist.isEmpty ? "♪ \(musicTitle)" : "♪ \(musicTitle) — \(musicArtist)"
+    }
+
+    /// Сторона совсем без данных (нет ни настроения, ни статуса/сообщения/музыки,
+    /// ни аватара/фото). Обе пустые → виджет ещё не привязан к паре.
+    var isEmpty: Bool {
+        moodEmoji == nil && moodText.isEmpty && status.isEmpty && message.isEmpty
+            && musicTitle.isEmpty && avatar == nil && photo == nil
+    }
+
+    /// Что показать вместо пустоты. Правило то же, что у Android
+    /// (PairWidgetHint.kt): не дошедшее фото важнее настроения, «пусто» —
+    /// только когда нечего показать вовсе. Аватарка в углу не в счёт.
+    var hint: LoveHint {
+        if !photoPath.isEmpty && photo == nil { return .photoFailed }
+        if photo != nil || moodEmoji != nil || !moodText.isEmpty || !status.isEmpty
+            || !message.isEmpty || !musicTitle.isEmpty {
+            return .hidden
+        }
+        return mine ? .ownEmpty : .partnerEmpty
+    }
+}
+
+/// Подсказка на пустой половине: жалобы «виджет пустой» — самая большая
+/// группа в приёмной, а закрашенная цветом половина ничего не объясняла.
+/// Подписи на языке приложения пишет Flutter (`love_hint_<key>_title/_sub`),
+/// до первой записи стоят русские.
+enum LoveHint {
+    case hidden, photoFailed, ownEmpty, partnerEmpty
+
+    var key: String {
+        switch self {
+        case .hidden: return ""
+        case .photoFailed: return "fail"
+        case .ownEmpty: return "own"
+        case .partnerEmpty: return "partner"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .hidden: return ""
+        case .photoFailed: return "arrow.clockwise"
+        case .ownEmpty: return "photo.badge.plus"
+        case .partnerEmpty: return "heart"
+        }
+    }
+
+    var fallbackTitle: String {
+        switch self {
+        case .hidden: return ""
+        case .photoFailed: return "Фото не загрузилось"
+        case .ownEmpty: return "Добавьте фото и настроение"
+        case .partnerEmpty: return "У партнёра пока пусто"
+        }
+    }
+
+    var fallbackSub: String {
+        switch self {
+        case .hidden: return ""
+        case .photoFailed: return "Нажмите, чтобы обновить"
+        case .ownEmpty: return "Нажмите на виджет"
+        case .partnerEmpty: return "Фото и настроение появятся здесь"
+        }
+    }
+}
+
+/// Пределы разжатия для парного виджета: шесть картинок разом читает один
+/// процесс, которому система отводит около тридцати мегабайт на всё.
+///
+/// Общий предел в 1200 точек считался от самого крупного виджета на iPad, но
+/// платили за него все: два снимка по 1200×1200 в разжатом виде — это 11,5 МБ,
+/// и вместе с аватарками расширение подходило к пределу вплотную. Журнал
+/// отрисовки за двое суток (07.09.2026): каждый четвёртый заход обрывался, в
+/// записи оставалось «память 15–21 МБ» и признак `decoded` не появлялся.
+///
+/// Половина парного виджета на iPhone — около 170×190 точек, то есть 510×570
+/// пикселей при тройной плотности; 700 хватает с запасом и на iPad. Аватарка
+/// рисуется кружком в углу, эмодзи настроения — и того мельче.
+private enum LoveWidgetImage {
+    static let photo: CGFloat = 700
+    static let avatar: CGFloat = 200
+    static let emoji: CGFloat = 160
+}
+
+private func loadLove() -> (me: LoveSide, partner: LoveSide) {
+    let s = Store()
+    // ВАЖНО: ключи картинок = те, что реально пишет Flutter
+    // (widget_service.dart: my_mood_emoji_path/my_avatar_path/my_photo_path
+    // через appGroupReadablePath → путь ВНУТРИ контейнера App Group). Раньше
+    // читались несуществующие ios_love_* → эмодзи/аватар на iOS не появлялись.
+    //
+    // С 04.09.2026 у каждой пары свой набор: `love_<пара>_<поле>`, а указатель
+    // на открытую пару лежит в `love_latest_group` — так же, как у «Настроения»
+    // и «Дней вместе». Общий набор без пары в имени оставался один на все связи,
+    // и у человека с двумя парами на столе оказывалась половина одной рядом с
+    // половиной другой. Пока приложение не разложило ключи (сборка только что
+    // обновилась), читаем старые общие — иначе виджет опустеет.
+    let group = s.latestGroup("love_latest_group")
+    let byPair = group != "solo" && s.string("love_\(group)_ready") == "1"
+    func key(_ name: String) -> String {
+        byPair ? "love_\(group)_\(name)" : name
+    }
+    let me = LoveSide(
+        moodEmoji: s.uiImage(key("my_mood_emoji_path"), maxSide: LoveWidgetImage.emoji),
+        moodText: s.string(key("my_mood")),
+        status: s.string(key("my_status")),
+        message: s.string(key("my_message")),
+        musicTitle: s.string(key("my_music_title")),
+        musicArtist: s.string(key("my_music_artist")),
+        avatar: s.uiImage(key("my_avatar_path"), maxSide: LoveWidgetImage.avatar),
+        photo: s.uiImage(key("my_photo_path"), maxSide: LoveWidgetImage.photo),
+        photoPath: s.string(key("my_photo_path")),
+        mine: true
+    )
+    let partner = LoveSide(
+        moodEmoji: s.uiImage(key("partner_mood_emoji_path"), maxSide: LoveWidgetImage.emoji),
+        moodText: s.string(key("partner_mood")),
+        status: s.string(key("partner_status")),
+        message: s.string(key("partner_message")),
+        musicTitle: s.string(key("partner_music_title")),
+        musicArtist: s.string(key("partner_music_artist")),
+        avatar: s.uiImage(key("partner_avatar_path"), maxSide: LoveWidgetImage.avatar),
+        photo: s.uiImage(key("partner_photo_path"), maxSide: LoveWidgetImage.photo),
+        photoPath: s.string(key("partner_photo_path")),
+        mine: false
+    )
+    return (me, partner)
+}
+
+private struct LovePanel: View {
+    let side: LoveSide
+    let isLeft: Bool
+
+    private var hasPhoto: Bool { side.photo != nil }
+    private var statusColor: Color { hasPhoto ? Color.white : Color.black.opacity(0.8) }
+    private var messageColor: Color { hasPhoto ? Color.white.opacity(0.9) : Color.black.opacity(0.6) }
+    private var musicColor: Color { hasPhoto ? Color.white.opacity(0.85) : Color.black.opacity(0.53) }
+
+    var body: some View {
+        // Размер панели берём у GeometryReader и прибиваем фото к нему точным
+        // frame. `.frame(maxWidth: .infinity)` фото НЕ удерживает: гибкая рамка
+        // принимает ширину ребёнка, если он шире предложенной, а scaledToFill
+        // у широкого снимка как раз шире. Так левое фото забирало 257 точек из
+        // 338, а правое сжималось до 61 (снимок с iPhone 14.09.2026, стенд
+        // tool/widget_layout). GeometryReader гибок целиком, и HStack делит
+        // место поровну.
+        GeometryReader { geo in
+            panel(geo.size)
+        }
+        .clipped()
+    }
+
+    private func panel(_ size: CGSize) -> some View {
+        ZStack {
+            // Фон панели: фото или цвет.
+            if let photo = side.photo {
+                Image(uiImage: photo).resizable().tgFullColorImage()
+                    .scaledToFill()
+                    .frame(width: size.width, height: size.height)
+                    .clipped()
+                TgSurface(Color.black.opacity(0.1))
+            } else {
+                TgSurface(isLeft ? Color(hex: 0xFFCDD9) : Color(hex: 0xE8DAFF))
+            }
+
+            // Центральный контент или подсказка вместо пустоты.
+            if side.hint != .hidden {
+                LoveHintView(hint: side.hint)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+            VStack(spacing: 0) {
+                if let emoji = side.moodEmoji {
+                    Image(uiImage: emoji).resizable().tgFullColorImage()
+                        .scaledToFit().frame(width: 36, height: 36)
+                } else if !side.moodText.isEmpty {
+                    Text(side.moodText).font(.system(size: 24))
+                }
+                if !side.status.isEmpty {
+                    Text(side.status)
+                        .font(.system(size: 10)).foregroundColor(statusColor)
+                        .lineLimit(1).padding(.top, 3)
+                }
+                if !side.message.isEmpty {
+                    Text(side.message)
+                        .font(.system(size: 9)).foregroundColor(messageColor)
+                        .multilineTextAlignment(.center).lineLimit(2).padding(.top, 2)
+                }
+                if !side.musicLine.isEmpty {
+                    Text(side.musicLine)
+                        .font(.system(size: 8)).foregroundColor(musicColor)
+                        .lineLimit(1).padding(.top, 3)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            // Аватарка в нижнем углу
+            if let avatar = side.avatar {
+                VStack {
+                    Spacer()
+                    HStack {
+                        if isLeft { avatarView(avatar); Spacer() }
+                        else { Spacer(); avatarView(avatar) }
+                    }
+                }
+                // Отступ больше прежних четырёх точек: у скруглённых углов
+                // виджета кружок аватара срезался нижним краем (18.08.2026).
+                .padding(8)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+    }
+
+    private func avatarView(_ image: UIImage) -> some View {
+        Image(uiImage: image).resizable().tgFullColorImage().scaledToFit()
+            .frame(width: 22, height: 22).clipShape(Circle())
+    }
+}
+
+/// Подсказка на половине: значок на «печеньке» M3, заголовок и подпись.
+private struct LoveHintView: View {
+    let hint: LoveHint
+
+    var body: some View {
+        let s = Store()
+        let title = s.string("love_hint_\(hint.key)_title")
+        let sub = s.string("love_hint_\(hint.key)_sub")
+        VStack(spacing: 0) {
+            ZStack {
+                LoveCookieShape().fill(Color(hex: 0xFF7E8B))
+                Image(systemName: hint.symbol)
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .frame(width: 36, height: 36)
+            Text(title.isEmpty ? hint.fallbackTitle : title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(Color(hex: 0x3B2A2C))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .padding(.top, 6)
+            Text(sub.isEmpty ? hint.fallbackSub : sub)
+                .font(.system(size: 9))
+                .foregroundColor(Color(hex: 0x6B5A6E))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .padding(.top, 2)
+        }
+        .padding(.horizontal, 8)
+    }
+}
+
+/// «Печенька» M3 из девяти лепестков — та же, что widget_hint_cookie.xml.
+private struct LoveCookieShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let c = CGPoint(x: rect.midX, y: rect.midY)
+        let base = min(rect.width, rect.height) / 2 / 1.075
+        let steps = 180
+        for k in 0...steps {
+            let t = Double(k) / Double(steps) * 2 * Double.pi
+            let r = base * CGFloat(1 + 0.075 * cos(9 * t))
+            let pt = CGPoint(x: c.x + r * CGFloat(cos(t)), y: c.y + r * CGFloat(sin(t)))
+            if k == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+        }
+        p.closeSubpath()
+        return p
+    }
+}
+
+private struct LoveDivider: View {
+    var body: some View {
+        VStack(spacing: 2) {
+            Rectangle().fill(Color.black.opacity(0.2)).frame(width: 1).frame(maxHeight: .infinity)
+            Text("♥").font(.system(size: 12)).foregroundColor(Color(hex: 0xFF6B8A))
+                .widgetAccentable()
+            Rectangle().fill(Color.black.opacity(0.2)).frame(width: 1).frame(maxHeight: .infinity)
+        }
+        .frame(width: 20)
+        .frame(maxHeight: .infinity)
+        .background(TgSurface(Color.white))
+    }
+}
+
+struct LoveWidgetView: View {
+    @Environment(\.widgetFamily) private var family
+    var body: some View {
+        let data = loadLove()
+        // Журнал отрисовки: 18.08.2026 виджет стоял пустым, и по снимку было не
+        // понять, чего именно нет — данных в контейнере или сил их показать.
+        let store = Store()
+        // `let _ =`, а не голый вызов: тело вьюхи собирает ViewBuilder, и
+        // выражение типа Void он принять не может — сборка бы не прошла.
+        let _ = WidgetRenderLog.write(
+            family: WidgetRenderLog.familyName(family),
+            widget: "love",
+            fields: [
+                "keys": String(
+                    [
+                        store.string("love_widget_group_id"),
+                        store.string("my_name"),
+                        store.string("my_mood"),
+                        store.string("partner_name"),
+                        store.string("partner_mood"),
+                        store.string("my_photo_path"),
+                        store.string("partner_photo_path"),
+                    ].filter { !$0.isEmpty }.count
+                ),
+                "mem": String(WidgetRenderLog.availableMemoryMB()),
+            ]
+        )
+        // «Подключите партнёра» показываем ТОЛЬКО когда пары реально нет
+        // (love_widget_group_id пуст = не привязаны к группе). Раньше подсказка
+        // висела при любых пустых данных → удалил своё фото / нет настроения, и
+        // виджет ложно писал «Подключите партнёра», хотя пара на месте.
+        let paired = !Store().string("love_widget_group_id").isEmpty
+        if !paired && data.me.isEmpty && data.partner.isEmpty {
+            LoveEmptyState().loveContainerBackground()
+        } else {
+            HStack(spacing: 0) {
+                LovePanel(side: data.me, isLeft: true)
+                LoveDivider()
+                LovePanel(side: data.partner, isLeft: false)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .loveContainerBackground()
+        }
+    }
+}
+
+/// Пустое состояние парного виджета: мягкий градиент + подсказка подключиться.
+private struct LoveEmptyState: View {
+    var body: some View {
+        ZStack {
+            TgGradientSurface(
+                colors: [Color(hex: 0xFFCDD9), Color(hex: 0xE8DAFF)],
+                startPoint: .leading, endPoint: .trailing
+            )
+            VStack(spacing: 6) {
+                Text("💞").font(.system(size: 34))
+                Text("Подключите партнёра")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.black.opacity(0.65))
+                    .multilineTextAlignment(.center)
+                Text("Откройте приложение")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.black.opacity(0.45))
+            }
+            .padding(8)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct LoveWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: "LoveWidgetProvider", provider: RefreshProvider()) { _ in
+            LoveWidgetView().unredacted()
+        }
+        .configurationDisplayName("Парный виджет")
+        .description("Статус, настроение и музыка вас обоих.")
+        // Только прямоугольник. Разметка одна на все размеры, и в квадрате обе
+        // половины сжимались до узких полос с пустыми плашками вместо фото:
+        // на снимке с iPhone 17.08.2026 виджет читался как сломанный. Тому, у
+        // кого квадратный уже стоит на столе, система уберёт его сама.
+        .supportedFamilies([.systemMedium])
+        // Фото идут под край, как на Android. С системными полями iOS 17 сверху
+        // и снизу оставались белые полосы фона контейнера — та же рамка, что
+        // сняли у фото-виджетов 26.08.2026.
+        .contentMarginsDisabled()
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func loveContainerBackground() -> some View {
+        if #available(iOS 17.0, *) {
+            self.tgContainerBackground(Color.white)
+        } else {
+            ZStack { Color.white; self }
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+    }
+}

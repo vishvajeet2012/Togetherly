@@ -1,0 +1,1176 @@
+import 'dart:io';
+import '../widgets/storage_image.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+
+import '../utils/password_rules.dart';
+import '../utils/email_typo.dart';
+import '../dict_strings.dart' show ruEn, trKey;
+import 'package:flutter/services.dart';
+import '../utils/safe_launch.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:pocketbase/pocketbase.dart';
+import '../utils/safe_pick.dart';
+import 'package:image_cropper/image_cropper.dart';
+import '../models/user_data.dart';
+import '../theme/profile_theme.dart';
+import 'package:material3_expressive_loading_indicator/material3_expressive_loading_indicator.dart';
+import '../services/pb_auth_service.dart';
+import '../services/pb_data_service.dart';
+import '../services/pb_media_service.dart';
+import '../services/pocketbase_service.dart';
+import 'home_screen.dart';
+import 'login_screen.dart';
+import 'welcome_screen.dart';
+import '../services/locale_service.dart';
+import '../services/mascot_guide_service.dart';
+import '../services/network/server_reach.dart';
+import '../utils/auth_failure.dart';
+import '../utils/network_failure_text.dart';
+import '../theme/theme_scope.dart';
+import '../widgets/auth_widgets.dart';
+import '../widgets/common/app_dialog.dart';
+import '../widgets/common/guide_mascot.dart';
+
+
+class SetupScreen extends StatefulWidget {
+  final UserData userData;
+  const SetupScreen({super.key, required this.userData});
+
+  @override
+  State<SetupScreen> createState() => _SetupScreenState();
+}
+
+class _SetupScreenState extends State<SetupScreen>
+    with SingleTickerProviderStateMixin {
+  // Step: 0 = gender, 1 = registration
+  int _step = 0;
+  Gender? _selectedGender;
+  bool _customSelected = false;
+  final _customGenderController = TextEditingController();
+  bool _isLoading = false;
+
+  final _nameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  String _avatarUrl = '';
+  XFile? _selectedAvatarFile; // Локальный файл для загрузки после регистрации
+  bool _agreeToTerms = false;
+  bool _passwordFocused = false;
+
+  // Ссылки на юридические документы (раздаются с нашего сервера, pb_public).
+  static final Uri _termsUri = Uri.parse('https://togetherly.day/terms');
+  static final Uri _privacyUri =
+      Uri.parse('https://togetherly.day/privacy-policy');
+  final _termsRecognizer = TapGestureRecognizer();
+  final _privacyRecognizer = TapGestureRecognizer();
+
+  late AnimationController _fadeController;
+  late Animation<double> _fadeAnim;
+
+  // OAuth: PB authWithOAuth2 зависает, если закрыть окно провайдера крестиком
+  // (нет сигнала отмены). Ловим возврат в приложение и снимаем спиннер.
+  AppLifecycleListener? _lifecycle;
+  bool _oauthInFlight = false;
+
+  // Colors based on gender
+  Color get _accent {
+    if (_selectedGender == Gender.male) return const Color(0xFF7898BF);
+    return const Color(0xFFFF7E8B);
+  }
+
+  Color get _accentLight {
+    if (_selectedGender == Gender.male) return const Color(0xFFEAF2FA);
+    return const Color(0xFFFEEAF1);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _fadeController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 400),
+    );
+    _fadeAnim = CurvedAnimation(parent: _fadeController, curve: Curves.easeOut);
+    _fadeController.forward();
+    _lifecycle = AppLifecycleListener(onResume: _onOAuthResume);
+  }
+
+  @override
+  void dispose() {
+    _lifecycle?.dispose();
+    _nameController.dispose();
+    _emailController.dispose();
+    _passwordController.dispose();
+    _customGenderController.dispose();
+    _fadeController.dispose();
+    _termsRecognizer.dispose();
+    _privacyRecognizer.dispose();
+    super.dispose();
+  }
+
+  /// Вернулись из in-app браузера. Если OAuth-вход не завершился (юзер отменил) —
+  /// снимаем бесконечную загрузку. На успехе `_oauthInFlight` уже сброшен.
+  void _onOAuthResume() {
+    if (!_oauthInFlight) return;
+    Future.delayed(const Duration(milliseconds: 1500), () {
+      if (mounted && _oauthInFlight) {
+        setState(() {
+          _isLoading = false;
+          _oauthInFlight = false;
+        });
+      }
+    });
+  }
+
+  void _goToStep(int step) {
+    _fadeController.reverse().then((_) {
+      setState(() => _step = step);
+      _fadeController.forward();
+    });
+  }
+
+  /// Универсальный OAuth-вход: google / apple / yandex / vk / facebook.
+  Future<void> _oauthSignIn(String provider) =>
+      _handleOAuth(() => PbAuthService().signInWithOAuth2(provider));
+
+  /// Общий обработчик OAuth-входа (Google/Apple) через PocketBase. Есть профиль
+  /// с полом → домой; нет → дозаполняем профиль (пол из выбранного) и домой.
+  Future<void> _handleOAuth(Future<RecordModel?> Function() signIn) async {
+    setState(() => _isLoading = true);
+    _oauthInFlight = true;
+    try {
+      final auth = PbAuthService();
+      final user = await signIn();
+      _oauthInFlight = false;
+      if (user != null) {
+        // Профиль из записи users PB (camelCase — как раньше Firestore).
+        final profile = auth.currentProfile();
+
+        if (profile != null &&
+            profile['displayName'] != null &&
+            profile['gender'] != null) {
+          // Уже есть профиль — авто-вход и на главную.
+          final displayName = profile['displayName'] as String;
+          final email = profile['email'] as String? ?? '';
+          final avatarUrl = profile['avatarUrl'] as String? ?? '';
+          final genderStr = profile['gender'] as String;
+          final gender = genderStr == 'male' ? Gender.male : Gender.female;
+
+          await widget.userData.register(
+            displayName: displayName,
+            email: email,
+            gender: gender,
+            avatarUrl: avatarUrl,
+            isReturningUser: true, // не обнулять данные пары
+          );
+
+          if (!mounted) return;
+          Navigator.of(context).pushReplacement(
+            PageRouteBuilder(
+              pageBuilder: (_, _, _) => HomeScreen(userData: widget.userData),
+              transitionsBuilder: (_, animation, _, child) =>
+                  FadeTransition(opacity: animation, child: child),
+              transitionDuration: const Duration(milliseconds: 400),
+            ),
+          );
+        } else {
+          // Новый OAuth-юзер — дозаполняем профиль (пол из выбранного шага) и домой.
+          final displayName = (profile?['displayName'] as String?) ?? '';
+          final email = (profile?['email'] as String?) ?? '';
+          final avatarUrl = (profile?['avatarUrl'] as String?) ?? '';
+          final gender = _selectedGender ?? Gender.female;
+          final uid = auth.currentUid ?? '';
+
+          // Профиль в записи users PB (пол/имя/аватар).
+          if (uid.isNotEmpty) {
+            await PbDataService().updateUserProfile(uid, {
+              'displayName': displayName,
+              'gender': gender == Gender.male ? 'male' : 'female',
+              if (avatarUrl.isNotEmpty) 'avatarUrl': avatarUrl,
+            });
+          }
+
+          await widget.userData.register(
+            displayName: displayName,
+            email: email,
+            gender: gender,
+            avatarUrl: avatarUrl,
+          );
+
+          if (!mounted) return;
+          Navigator.of(context).pushReplacement(
+            PageRouteBuilder(
+              pageBuilder: (_, _, _) => HomeScreen(userData: widget.userData),
+              transitionsBuilder: (_, animation, _, child) =>
+                  FadeTransition(opacity: animation, child: child),
+              transitionDuration: const Duration(milliseconds: 400),
+            ),
+          );
+        }
+      } else {
+        if (mounted) setState(() => _isLoading = false);
+      }
+    } catch (e) {
+      _oauthInFlight = false;
+      final message = await _authErrorText(e);
+      if (mounted) {
+        setState(() => _isLoading = false);
+        _showError(message);
+      }
+    }
+  }
+
+  /// Текст ошибки входа через Google или Apple. Если запрос не дошёл до
+  /// сервера, сперва проверяем сеть (TOG-16): человек из США читал ошибку
+  /// входа через Google, хотя наш сервер закрывал его провайдер.
+  Future<String> _authErrorText(Object e) async {
+    final failure = AuthFailure.of(e);
+    if (failure.isNetwork) {
+      return networkFailureText(await ServerReach.instance.check());
+    }
+    final s = LocaleService.current;
+    return switch (failure) {
+      AuthFailure.blockedConnection => s.connectionBlocked,
+      AuthFailure.serverDown => trKey('serverSlowRetry'),
+      AuthFailure.tooManyAttempts => s.tooManyAttempts,
+      AuthFailure.providerPageFailed => s.providerPageFailed,
+      _ => s.googleLoginError(e.toString()),
+    };
+  }
+
+  Future<void> _completeSetup() async {
+    final name = _nameController.text.trim();
+    var email = _emailController.text.trim();
+    final password = _passwordController.text;
+
+    if (name.isEmpty) {
+      _showError(LocaleService.current.enterYourName);
+      return;
+    }
+    if (email.isEmpty || !email.contains('@')) {
+      _showError(LocaleService.current.enterValidEmail);
+      return;
+    }
+    // Адрес вводят руками только без входа через Google или Apple: там почту
+    // отдаёт сам сервис, и она настоящая.
+    final typoFix = PbAuthService().isLoggedIn ? null : emailTypoFix(email);
+    if (typoFix != null) {
+      final fix = await AppDialog.confirm(
+        context,
+        title: trKey('emailTypoTitle'),
+        message: trKey('emailTypoBody')
+            .replaceAll('{typed}', email)
+            .replaceAll('{fixed}', typoFix),
+        confirmLabel: trKey('emailTypoFix'),
+        cancelLabel: trKey('emailTypoKeep'),
+        icon: Icons.alternate_email_rounded,
+      );
+      if (!mounted) return;
+      if (fix) {
+        email = typoFix;
+        _emailController.text = typoFix;
+      }
+    }
+    if (_selectedGender == null) {
+      _showError(LocaleService.current.selectGender);
+      return;
+    }
+
+    setState(() => _isLoading = true);
+
+    try {
+      final auth = PbAuthService();
+
+      // Если пользователь не залогинен (ввёл данные вручную), создаём аккаунт
+      if (!auth.isLoggedIn) {
+        // Проверяем пароль только для ручной регистрации: 8 символов +
+        // заглавная буква + спецсимвол (те же правила, что индикаторы под полем).
+        final pwdOk = passwordProblems(password).isEmpty;
+        if (!pwdOk) {
+          _showError(
+            '${LocaleService.current.min8Chars}, '
+            '${LocaleService.current.oneUppercase}, '
+            '${LocaleService.current.oneSpecialChar}',
+          );
+          if (mounted) setState(() => _isLoading = false);
+          return;
+        }
+        await auth.signUpWithEmail(
+          email: email,
+          password: password,
+          displayName: name,
+        );
+      }
+
+      final userId = PocketBaseService().userId ?? '';
+
+      // Загружаем аватарку, если выбрана → media-коллекция PB (ссылка pb://).
+      String finalAvatarUrl = _avatarUrl;
+      if (_selectedAvatarFile != null && userId.isNotEmpty) {
+        final bytes = await _selectedAvatarFile!.readAsBytes();
+        final ext = _selectedAvatarFile!.path.split('.').last;
+        final uploadedUrl = await PbMediaService().uploadBytes(
+          bytes,
+          'profile.$ext',
+          uid: userId,
+          kind: 'avatar',
+        );
+        if (uploadedUrl != null) {
+          finalAvatarUrl = uploadedUrl;
+        }
+      }
+
+      // Профиль в записи users PB (пол/имя/аватар). signUpWithEmail создаёт
+      // запись с display_name; пол и аватар проставляем здесь.
+      if (userId.isNotEmpty) {
+        await PbDataService().updateUserProfile(userId, {
+          'displayName': name,
+          'gender': _genderStorageString(),
+          if (finalAvatarUrl.isNotEmpty) 'avatarUrl': finalAvatarUrl,
+        });
+      }
+
+      // Регистрируем пользователя в приложении
+      await widget.userData.register(
+        displayName: name,
+        email: email,
+        gender: _selectedGender!,
+        customGender: _customGenderValue(),
+        avatarUrl: finalAvatarUrl,
+      );
+
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        PageRouteBuilder(
+          pageBuilder: (_, __, ___) => HomeScreen(userData: widget.userData),
+          transitionsBuilder: (_, animation, __, child) =>
+              FadeTransition(opacity: animation, child: child),
+          transitionDuration: const Duration(milliseconds: 400),
+        ),
+      );
+    } catch (e) {
+      final failure = AuthFailure.of(e);
+      // Обрыв связи: нет интернета или наш сервер закрыт в этой сети (TOG-16).
+      // Раньше регистрация писала «Сервер не отвечает. Проверьте интернет.»,
+      // а после повтора и «Некорректный email».
+      final networkText = failure.isNetwork ? await _authErrorText(e) : null;
+      if (mounted) {
+        setState(() => _isLoading = false);
+        final s = LocaleService.current;
+        // Разбор один на вход и регистрацию (`AuthFailure`). Раньше причину
+        // искали подстроками в тексте исключения, и незнакомое доезжало до
+        // человека сырым — вплоть до `tls_record.cc:127` на экране.
+        switch (failure) {
+          case AuthFailure.emailTaken:
+            _showEmailExistsDialog();
+          case AuthFailure.blockedConnection:
+            _showError(s.connectionBlocked);
+          case AuthFailure.noConnection:
+          case AuthFailure.timeout:
+            _showError(networkText ?? trKey('serverSlowRetry'));
+          case AuthFailure.serverDown:
+            _showError(trKey('serverSlowRetry'));
+          case AuthFailure.tooManyAttempts:
+            _showError(s.tooManyAttempts);
+          case AuthFailure.badCredentials:
+            _showError(s.invalidEmailFormat);
+          case AuthFailure.providerPageFailed:
+            _showError(s.providerPageFailed);
+          case AuthFailure.providerUnreachable:
+            _showError(s.providerUnreachable);
+          case AuthFailure.unknown:
+            _showError(s.registrationError(e.toString()));
+        }
+      }
+    }
+  }
+
+  void _showEmailExistsDialog() {
+    AppDialog.confirm(
+      context,
+      title: LocaleService.current.accountExists,
+      message: LocaleService.current.emailAlreadyRegistered,
+      confirmLabel: LocaleService.current.login,
+      icon: Icons.account_circle_rounded,
+    ).then((ok) {
+      if (!ok || !mounted) return;
+      Navigator.of(context).pushReplacement(
+        PageRouteBuilder(
+          pageBuilder: (_, __, ___) => LoginScreen(userData: widget.userData),
+          transitionsBuilder: (_, animation, __, child) =>
+              FadeTransition(opacity: animation, child: child),
+          transitionDuration: const Duration(milliseconds: 300),
+        ),
+      );
+    });
+  }
+
+  void _showError(String msg) {
+    if (!mounted) return;
+    // maybeOf + mounted: зовётся из catch после async-гэпа, когда экран мог быть
+    // снят с дерева → ScaffoldMessenger.of даёт `!` по null. См. Bugsink TypeError.
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: Colors.red.shade400,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        margin: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+      ),
+    );
+  }
+
+  Future<void> _pickAvatar() async {
+    final picker = ImagePicker();
+    final XFile? image = await safePick(
+      () => picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 90,
+        maxWidth: 1024,
+        maxHeight: 1024,
+      ),
+    );
+
+    if (image == null || !mounted) return;
+
+    // Обрезаем до круга (аватарка). Нативный кроппер может кинуть
+    // PlatformException — это не краш, трактуем как отмену.
+    CroppedFile? croppedFile;
+    try {
+      croppedFile = await ImageCropper().cropImage(
+        sourcePath: image.path,
+        compressQuality: 90,
+        uiSettings: [
+          AndroidUiSettings(
+            cropStyle: CropStyle.circle,
+            toolbarTitle: LocaleService.current.cropAvatarTitle,
+            toolbarColor: const Color(0xFF1A1A2E),
+            toolbarWidgetColor: Colors.white,
+            statusBarColor: const Color(0xFF1A1A2E),
+            backgroundColor: const Color(0xFF0D0D1A),
+            activeControlsWidgetColor: _accent,
+            cropFrameColor: _accent,
+            cropGridColor: Colors.transparent,
+            dimmedLayerColor: const Color(0xCC0D0D1A),
+            showCropGrid: false,
+            lockAspectRatio: true,
+            initAspectRatio: CropAspectRatioPreset.square,
+            hideBottomControls: false,
+          ),
+          IOSUiSettings(
+            cropStyle: CropStyle.circle,
+            title: LocaleService.current.avatarTitle,
+            doneButtonTitle: LocaleService.current.done,
+            cancelButtonTitle: LocaleService.current.cancel,
+            aspectRatioLockEnabled: true,
+            resetAspectRatioEnabled: false,
+            rotateButtonsHidden: false,
+            hidesNavigationBar: true,
+          ),
+        ],
+      );
+    } catch (e) {
+      debugPrint('_pickAvatar: cropImage failed: $e');
+      croppedFile = null;
+    }
+
+    if (croppedFile == null || !mounted) return;
+
+    // Сохраняем локально для превью и последующей загрузки после регистрации.
+    // Путь забираем в локальную final — внутри замыкания setState промоушен
+    // nullable-локали не работает.
+    final croppedPath = croppedFile.path;
+    setState(() {
+      _selectedAvatarFile = XFile(croppedPath);
+      _avatarUrl = ''; // Очищаем URL, так как показываем локальный файл
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = context.appTheme;
+    return Scaffold(
+      resizeToAvoidBottomInset: false,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // Обоев больше нет: они лежали в Firebase Storage и отвечали 402,
+          // экран всё равно рисовал этот цвет.
+          ColoredBox(
+              color: theme.isDark ? theme.surfaceMuted : theme.bgGradient.first),
+          SafeArea(
+            child: FadeTransition(
+              opacity: _fadeAnim,
+              child: _step == 0 ? _buildGenderStep() : _buildRegistrationStep(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  STEP 1: GENDER SELECTION
+  // ═══════════════════════════════════════════════════
+  Widget _buildGenderStep() {
+    final theme = context.appTheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 36),
+      child: Column(
+        children: [
+          const SizedBox(height: 12),
+          // Back button
+          Align(
+            alignment: Alignment.centerLeft,
+            child: GestureDetector(
+              onTap: () {
+                Navigator.of(context).pushReplacement(
+                  PageRouteBuilder(
+                    pageBuilder: (_, __, ___) =>
+                        WelcomeScreen(userData: widget.userData),
+                    transitionsBuilder: (_, animation, __, child) =>
+                        FadeTransition(opacity: animation, child: child),
+                    transitionDuration: const Duration(milliseconds: 400),
+                  ),
+                );
+              },
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: theme.isDark
+                      ? theme.cardSurface
+                      : Colors.white.withOpacity(0.7),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                      color: theme.isDark
+                          ? theme.cardBorder
+                          : Colors.grey.shade200),
+                ),
+                child: Icon(
+                  Icons.arrow_back_rounded,
+                  color: theme.textSecondary,
+                  size: 20,
+                ),
+              ),
+            ),
+          ),
+          const Spacer(flex: 2),
+          // Облачко-гид переодевается под выбранный пол, без гида — значок
+          // Сцена меняется на месте, без переключателя: он выбрасывал прежнее
+          // облачко раньше, чем готово новое, и оно мигало пустотой.
+          if (MascotGuideService.instance.on)
+            GuideMascot(
+              _genderGuideArt(),
+              // Экран без прокрутки: на низком телефоне облачко поменьше
+              side: _genderGuideSide(context),
+            )
+          else
+            Container(
+              width: 72,
+              height: 72,
+              decoration: BoxDecoration(
+                color: _accentLight.withOpacity(0.8),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(Icons.wc_rounded, color: _accent, size: 36),
+            ),
+          SizedBox(height: MascotGuideService.instance.on ? 12 : 32),
+          Text(
+            LocaleService.current.whoAreYou,
+            style: TextStyle(
+              fontSize: 28,
+              fontWeight: FontWeight.w800,
+              color: theme.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            LocaleService.current.selectGenderForTheme,
+            style: TextStyle(fontSize: 15, color: theme.textMuted),
+          ),
+          const SizedBox(height: 48),
+          // Gender cards
+          _genderGrid(),
+          const Spacer(flex: 2),
+          // Continue button
+          AnimatedOpacity(
+            opacity: _genderValid ? 1.0 : 0.4,
+            duration: const Duration(milliseconds: 200),
+            child: SizedBox(
+              width: double.infinity,
+              height: 58,
+              child: ElevatedButton(
+                onPressed: _genderValid ? () => _goToStep(1) : null,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _accent,
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor:
+                      theme.isDark ? theme.divider : Colors.grey.shade300,
+                  shape: const StadiumBorder(),
+                  elevation: 0,
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      LocaleService.current.continueBtn,
+                      style: const TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    const Icon(Icons.arrow_forward_rounded, size: 20),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 36),
+        ],
+      ),
+    );
+  }
+
+  static const double _kPasswordGuideSide = 120;
+
+  double _genderGuideSide(BuildContext context) =>
+      (MediaQuery.sizeOf(context).height * 0.16).clamp(88.0, 130.0);
+
+  /// Все сцены облачка этого экрана готовятся сразу при входе: пол и пароль
+  /// переключают их мгновенно, без загрузки в момент нажатия.
+  bool _guideWarmed = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_guideWarmed || !MascotGuideService.instance.on) return;
+    _guideWarmed = true;
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    warmCatalogArt(const ['guide_look_down', 'guide_girl', 'guide_boy'], side: _genderGuideSide(context), dpr: dpr);
+    warmCatalogArt(const ['guide_look_down', 'guide_nopeek'], side: _kPasswordGuideSide, dpr: dpr);
+  }
+
+  String _genderGuideArt() {
+    if (_customSelected) return 'look_down';
+    switch (_selectedGender) {
+      case Gender.male:
+        return 'boy';
+      case Gender.female:
+        return 'girl';
+      case Gender.unspecified:
+      case null:
+        return 'look_down';
+    }
+  }
+
+  bool get _genderValid =>
+      _selectedGender != null &&
+      (!_customSelected || _customGenderController.text.trim().isNotEmpty);
+
+  String? _customGenderValue() {
+    if (!_customSelected) return null;
+    final v = _customGenderController.text.trim();
+    return v.isEmpty ? null : v;
+  }
+
+  String _genderStorageString() {
+    switch (_selectedGender) {
+      case Gender.male:
+        return 'male';
+      case Gender.female:
+        return 'female';
+      case Gender.unspecified:
+      case null:
+        return _customGenderValue() ?? 'unspecified';
+    }
+  }
+
+  /// Сетка выбора пола (M3, плоско): Мужчина / Женщина / Не хочу указывать /
+  /// Свой пол (со своим полем ввода).
+  Widget _genderGrid() {
+    final cs = ProfileTheme.themeFor(context.appTheme).colorScheme;
+    Widget tile({
+      required IconData icon,
+      required String label,
+      required bool selected,
+      required VoidCallback onTap,
+    }) {
+      return Expanded(
+        child: GestureDetector(
+          onTap: onTap,
+          behavior: HitTestBehavior.opaque,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOut,
+            padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 10),
+            decoration: BoxDecoration(
+              color: selected ? cs.primaryContainer : cs.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(26),
+            ),
+            child: Column(
+              children: [
+                Icon(icon,
+                    size: 30,
+                    color:
+                        selected ? cs.onPrimaryContainer : cs.onSurfaceVariant),
+                const SizedBox(height: 10),
+                Text(
+                  label,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: 'Onest',
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                    height: 1.1,
+                    color: selected ? cs.onPrimaryContainer : cs.onSurface,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        Row(children: [
+          tile(
+            icon: Icons.male_rounded,
+            label: LocaleService.current.boy,
+            selected: _selectedGender == Gender.male,
+            onTap: () => setState(() {
+              _selectedGender = Gender.male;
+              _customSelected = false;
+            }),
+          ),
+          const SizedBox(width: 12),
+          tile(
+            icon: Icons.female_rounded,
+            label: LocaleService.current.girl,
+            selected: _selectedGender == Gender.female,
+            onTap: () => setState(() {
+              _selectedGender = Gender.female;
+              _customSelected = false;
+            }),
+          ),
+        ]),
+        const SizedBox(height: 12),
+        Row(children: [
+          tile(
+            icon: Icons.do_not_disturb_on_rounded,
+            label: ruEn('Не хочу указывать', 'Prefer not to say'),
+            selected:
+                _selectedGender == Gender.unspecified && !_customSelected,
+            onTap: () => setState(() {
+              _selectedGender = Gender.unspecified;
+              _customSelected = false;
+            }),
+          ),
+          const SizedBox(width: 12),
+          tile(
+            icon: Icons.edit_rounded,
+            label: ruEn('Свой пол', 'Custom'),
+            selected: _customSelected,
+            onTap: () => setState(() {
+              _selectedGender = Gender.unspecified;
+              _customSelected = true;
+            }),
+          ),
+        ]),
+        if (_customSelected) ...[
+          const SizedBox(height: 12),
+          AuthField(
+            controller: _customGenderController,
+            label: ruEn('Свой пол', 'Custom gender'),
+            hint: ruEn('Укажите свой пол', 'Enter your gender'),
+            accent: _accent,
+            onChanged: (_) => setState(() {}),
+          ),
+        ],
+      ],
+    );
+  }
+
+  // ═══════════════════════════════════════════════════
+  //  STEP 2: REGISTRATION
+  // ═══════════════════════════════════════════════════
+  Widget _buildRegistrationStep() {
+    final s = LocaleService.current;
+    final t = context.appTheme;
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+
+    return Column(
+      children: [
+        // ── Кнопка «назад» поверх фона ──
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: GestureDetector(
+              onTap: () => _goToStep(0),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: t.isDark
+                      ? t.cardSurface
+                      : Colors.white.withOpacity(0.75),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                      color: t.isDark
+                          ? t.cardBorder
+                          : Colors.white.withOpacity(0.6)),
+                ),
+                child: Icon(Icons.arrow_back_rounded,
+                    color: t.isDark ? t.textSecondary : Colors.grey.shade800,
+                    size: 20),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 18),
+        // ── Белая карточка с формой (как в референсе) ──
+        Expanded(
+          child: Container(
+            width: double.infinity,
+            decoration: BoxDecoration(
+              color: t.cardSurface,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(34)),
+            ),
+            child: SingleChildScrollView(
+              physics: const BouncingScrollPhysics(),
+              padding: EdgeInsets.fromLTRB(28, 30, 28, 28 + bottomInset),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // Пока вводят пароль, облачко отворачивается и не подглядывает
+                  if (MascotGuideService.instance.on)
+                    Center(
+                      child: GuideMascot(
+                        _passwordFocused ? 'nopeek' : 'look_down',
+                        side: _kPasswordGuideSide,
+                      ),
+                    ),
+                  Center(
+                    child: Text(
+                      s.createAccountBtn,
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.w800,
+                        color: t.textPrimary,
+                        letterSpacing: -0.5,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  Center(child: _avatarPicker()),
+                  const SizedBox(height: 24),
+                  AuthField(
+                    controller: _nameController,
+                    label: s.fullName,
+                    hint: s.yourName,
+                    accent: _accent,
+                  ),
+                  const SizedBox(height: 18),
+                  AuthField(
+                    controller: _emailController,
+                    label: s.email,
+                    hint: 'your@email.com',
+                    accent: _accent,
+                    keyboardType: TextInputType.emailAddress,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.deny(RegExp(r'[а-яёА-ЯЁ]')),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  Focus(
+                    canRequestFocus: false,
+                    skipTraversal: true,
+                    onFocusChange: (focused) =>
+                        setState(() => _passwordFocused = focused),
+                    child: AuthField(
+                      controller: _passwordController,
+                      label: s.password,
+                      hint: s.yourPassword,
+                      accent: _accent,
+                      isPassword: true,
+                      textInputAction: TextInputAction.done,
+                      onChanged: (_) => setState(() {}),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  _buildPasswordChecks(),
+                  const SizedBox(height: 18),
+                  _termsCheckbox(s),
+                  const SizedBox(height: 24),
+                  _signUpButton(s),
+                  const SizedBox(height: 26),
+                  AuthSocialRow(
+                    label: s.signUpWith,
+                    onGoogle:
+                        _isLoading ? null : () => _oauthSignIn('google'),
+                    onYandex:
+                        _isLoading ? null : () => _oauthSignIn('yandex'),
+                    onApple: Platform.isIOS
+                        ? (_isLoading ? null : () => _oauthSignIn('apple'))
+                        : null,
+                  ),
+                  const SizedBox(height: 28),
+                  // Already have an account? Sign In
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        '${s.alreadyHaveAccountLogin} ',
+                        style: TextStyle(
+                            fontSize: 14, color: t.textSecondary),
+                      ),
+                      GestureDetector(
+                        onTap: _isLoading ? null : _goToLogin,
+                        child: Text(
+                          s.login,
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w800,
+                            color: _accent,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _goToLogin() {
+    Navigator.of(context).pushReplacement(
+      PageRouteBuilder(
+        pageBuilder: (_, _, _) => LoginScreen(userData: widget.userData),
+        transitionsBuilder: (_, animation, _, child) =>
+            FadeTransition(opacity: animation, child: child),
+        transitionDuration: const Duration(milliseconds: 300),
+      ),
+    );
+  }
+
+  Widget _avatarPicker() {
+    return GestureDetector(
+      onTap: _pickAvatar,
+      child: Stack(
+        children: [
+          Container(
+            width: 80,
+            height: 80,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _accentLight,
+            ),
+            child: _selectedAvatarFile != null
+                ? ClipOval(
+                    child: Image.file(
+                      File(_selectedAvatarFile!.path),
+                      fit: BoxFit.cover,
+                    ),
+                  )
+                : _avatarUrl.isNotEmpty
+                    ? ClipOval(
+                        child: StorageImage(
+                          imageUrl: _avatarUrl,
+                          fit: BoxFit.cover,
+                          errorWidget: (context, url, error) => Icon(
+                            Icons.person_rounded,
+                            color: _accent.withOpacity(0.5),
+                            size: 36,
+                          ),
+                        ),
+                      )
+                    : Icon(
+                        Icons.person_rounded,
+                        color: _accent.withOpacity(0.5),
+                        size: 36,
+                      ),
+          ),
+          Positioned(
+            bottom: 0,
+            right: 0,
+            child: Container(
+              width: 26,
+              height: 26,
+              decoration: BoxDecoration(
+                color: _accent,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 2),
+              ),
+              child: const Icon(
+                Icons.camera_alt_rounded,
+                color: Colors.white,
+                size: 13,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _termsCheckbox(AppStrings s) {
+    final t = context.appTheme;
+    return GestureDetector(
+      onTap: () => setState(() => _agreeToTerms = !_agreeToTerms),
+      behavior: HitTestBehavior.opaque,
+      child: Row(
+        children: [
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            width: 22,
+            height: 22,
+            decoration: BoxDecoration(
+              color: _agreeToTerms ? _accent : Colors.transparent,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: _agreeToTerms ? _accent : t.textMuted,
+                width: 2,
+              ),
+            ),
+            child: _agreeToTerms
+                ? const Icon(Icons.check_rounded, size: 16, color: Colors.white)
+                : null,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text.rich(
+              TextSpan(
+                children: [
+                  TextSpan(text: s.agreeToTermsPrefix),
+                  TextSpan(
+                    text: s.termsOfUse,
+                    style: TextStyle(
+                      color: _accent,
+                      decoration: TextDecoration.underline,
+                      decorationColor: _accent,
+                    ),
+                    recognizer: _termsRecognizer
+                      ..onTap = () => safeLaunchUrl(_termsUri),
+                  ),
+                  TextSpan(text: s.agreeToTermsAnd),
+                  TextSpan(
+                    text: s.privacyPolicyLink,
+                    style: TextStyle(
+                      color: _accent,
+                      decoration: TextDecoration.underline,
+                      decorationColor: _accent,
+                    ),
+                    recognizer: _privacyRecognizer
+                      ..onTap = () => safeLaunchUrl(_privacyUri),
+                  ),
+                ],
+              ),
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: t.textSecondary,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _signUpButton(AppStrings s) {
+    // M3: таблетка сплошного цвета без свечения; загрузка — морфинг-индикатор.
+    final cs = ProfileTheme.themeFor(context.appTheme).colorScheme;
+    return SizedBox(
+      width: double.infinity,
+      height: 58,
+      child: FilledButton(
+        onPressed: (_isLoading || !_agreeToTerms) ? null : _completeSetup,
+        style: FilledButton.styleFrom(
+          backgroundColor: cs.primary,
+          foregroundColor: cs.onPrimary,
+          disabledBackgroundColor: cs.primary.withValues(alpha: 0.4),
+          shape: const StadiumBorder(),
+          elevation: 0,
+        ),
+        child: _isLoading
+            ? SizedBox(
+                width: 26,
+                height: 26,
+                child: ExpressiveLoadingIndicator(color: cs.onPrimary),
+              )
+            : Text(
+                s.createAccountBtn,
+                style: const TextStyle(
+                  fontFamily: 'Onest',
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
+        fontVariations: const [FontVariation('wght', 700)],
+                ),
+              ),
+      ),
+    );
+  }
+
+  /// Живые индикаторы требований к паролю (8 символов + заглавная + спецсимвол).
+  /// Те же правила, что проверяет _completeSetup перед регистрацией.
+  Widget _buildPasswordChecks() {
+    final pwd = _passwordController.text;
+    final s = LocaleService.current;
+    return Wrap(
+      spacing: 12,
+      runSpacing: 6,
+      children: [
+        // Правила живут в одном месте (`utils/password_rules.dart`): раньше
+        // индикаторы и проверка при отправке считали по своим регуляркам, и
+        // список знаков в них не совпадал ни с чем.
+        _passwordCheckRow(
+          s.min8Chars,
+          !passwordProblems(pwd).contains(PasswordProblem.tooShort),
+        ),
+        _passwordCheckRow(
+          s.oneUppercase,
+          !passwordProblems(pwd).contains(PasswordProblem.noUppercase),
+        ),
+        _passwordCheckRow(
+          s.oneSpecialChar,
+          !passwordProblems(pwd).contains(PasswordProblem.noSpecial),
+        ),
+      ],
+    );
+  }
+
+  Widget _passwordCheckRow(String label, bool passed) {
+    final t = context.appTheme;
+    final color = passed ? const Color(0xFF4CAF50) : t.textMuted;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          passed ? Icons.check_circle_rounded : Icons.circle_outlined,
+          size: 16,
+          color: color,
+        ),
+        const SizedBox(width: 5),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w500,
+            color: color,
+          ),
+        ),
+      ],
+    );
+  }
+
+}

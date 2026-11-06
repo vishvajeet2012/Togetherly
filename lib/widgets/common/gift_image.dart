@@ -1,0 +1,85 @@
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
+
+import '../../services/catalog_service.dart';
+import '../../services/offline/media_view_cache.dart';
+
+/// Рисунок подарка: живая анимация из серверного каталога, а пока её нет
+/// (каталог не пришёл, нет сети, старая запись) — неподвижный кадр из сборки
+/// `assets/images/gifts/<ключ>.webp`.
+///
+/// Холст картинки 176 с рисунком 144 в центре — запас под пар, искры и
+/// полёт. Чтобы сам рисунок занимал [side], картинка рисуется на 176/144
+/// крупнее и выходит за свои границы, раскладку это не трогает.
+class GiftImage extends StatelessWidget {
+  const GiftImage(
+    this.giftKey, {
+    super.key,
+    required this.side,
+    this.animated = true,
+    this.stillAsset,
+  });
+
+  final String giftKey;
+
+  /// Сторона рисунка на экране, в логических точках.
+  final double side;
+  final bool animated;
+
+  /// Свой неподвижный кадр из сборки вместо `assets/images/gifts/<ключ>.webp`.
+  /// Рисунок с таким кадром при [animated] = false в сеть не ходит вовсе:
+  /// кадр уже лежит в сборке, качать его второй раз незачем.
+  final String? stillAsset;
+
+  static const double _canvas = 176 / 144;
+
+  @override
+  Widget build(BuildContext context) {
+    final full = side * _canvas;
+    final dpr = MediaQuery.maybeDevicePixelRatioOf(context) ?? 2.0;
+    final decode = (full * dpr).round();
+    final still = Image.asset(
+      stillAsset ?? 'assets/images/gifts/$giftKey.webp',
+      width: full,
+      height: full,
+      cacheWidth: decode,
+      // Без fit картинка не растёт больше своего файла: кадр 256 точек на
+      // полноэкранном показе приза оставался в четверть экрана.
+      fit: BoxFit.contain,
+      errorBuilder: (_, _, _) => SizedBox.square(dimension: full),
+    );
+    return SizedBox.square(
+      dimension: side,
+      // Нижние пределы обнулены: под жёсткой высотой родителя (сцена листа
+      // подарка в 220 точек) квадрат вытягивался, и рисунку доставалось «не
+      // меньше 220, не больше 208» — противоречивые пределы (TOG-39).
+      child: OverflowBox(
+        minWidth: 0,
+        minHeight: 0,
+        maxWidth: full,
+        maxHeight: full,
+        child: stillAsset != null && !animated
+            ? still
+            : ListenableBuilder(
+          listenable: CatalogService.instance,
+          builder: (context, _) {
+            final url = CatalogService.instance.giftArt(giftKey)?.urlFor(side, animated: animated);
+            if (url == null) return still;
+            return CachedNetworkImage(
+              cacheManager: OfflineImageCacheManager.instance,
+              imageUrl: url,
+              width: full,
+              height: full,
+              memCacheWidth: decode,
+              memCacheHeight: decode,
+              fit: BoxFit.contain,
+              fadeInDuration: Duration.zero,
+              placeholder: (_, _) => still,
+              errorWidget: (_, _, _) => still,
+            );
+          },
+        ),
+      ),
+    );
+  }
+}

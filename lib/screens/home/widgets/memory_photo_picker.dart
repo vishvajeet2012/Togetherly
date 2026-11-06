@@ -1,0 +1,371 @@
+import '../../../widgets/storage_image.dart';
+import 'package:flutter/material.dart';
+import '../../../theme/fonts.dart';
+import '../../../services/locale_service.dart';
+import 'dart:async';
+
+import '../../../models/memory.dart';
+import '../../../models/memory_photos.dart';
+import '../../../services/memory_repository.dart';
+import '../../../theme/app_theme.dart';
+import '../../../widgets/app_sheet.dart';
+
+/// Пара (url, caption) — одна фотография из ленты воспоминаний.
+typedef _Photo = MemoryPhoto;
+
+/// Bottom-sheet для выбора фото из ленты воспоминаний.
+///
+/// Открывается через [MemoryPhotoPicker.show] и возвращает список URL
+/// выбранных фотографий (они уже лежат на сервере, повторной загрузки нет).
+class MemoryPhotoPicker extends StatefulWidget {
+  final String groupId;
+  final AppTheme theme;
+  final int maxCount;
+  final List<String> alreadySelected;
+
+  const MemoryPhotoPicker({
+    super.key,
+    required this.groupId,
+    required this.theme,
+    required this.maxCount,
+    this.alreadySelected = const [],
+  });
+
+  /// Открывает пикер и возвращает выбранные URL-адреса.
+  /// Возвращает пустой список, если пользователь закрыл без выбора.
+  static Future<List<String>> show(
+    BuildContext context, {
+    required String groupId,
+    required AppTheme theme,
+    required int maxCount,
+    List<String> alreadySelected = const [],
+  }) async {
+    final result = await showModalSheet<List<String>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      // Высоту выбор держит сам перетаскиванием.
+      topGap: 0,
+      builder: (_) => MemoryPhotoPicker(
+        groupId: groupId,
+        theme: theme,
+        maxCount: maxCount,
+        alreadySelected: alreadySelected,
+      ),
+    );
+    return result ?? [];
+  }
+
+  @override
+  State<MemoryPhotoPicker> createState() => _MemoryPhotoPickerState();
+}
+
+class _MemoryPhotoPickerState extends State<MemoryPhotoPicker> {
+  List<_Photo>? _photos;
+  bool _loading = true;
+  String? _error;
+  final Set<String> _selected = {};
+
+  StreamSubscription<List<Memory>>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _watchPhotos();
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  /// Снимки берём из того же места, что лента воспоминаний, — из кэша плюс
+  /// живого канала.
+  ///
+  /// Разовый сетевой запрос тут не годится: `loadMemories` глотает отказ и
+  /// отдаёт пустой список, поэтому сорванный запрос (холодный старт на iPhone,
+  /// сессия ещё не восстановилась) показывал «фотографий нет» при полной
+  /// ленте. Та же мина уже ловилась в чате на кнопке «собачка».
+  void _watchPhotos() {
+    if (widget.groupId.isEmpty) {
+      setState(() => _loading = false);
+      return;
+    }
+    _sub = MemoryRepository.instance.watch(widget.groupId).listen((list) {
+      if (!mounted) return;
+      setState(() {
+        _photos = photosFromMemories(list);
+        _loading = false;
+      });
+    }, onError: (Object e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    });
+  }
+
+  void _toggle(String url) {
+    if (_selected.contains(url)) {
+      setState(() => _selected.remove(url));
+    } else {
+      if (_selected.length >= widget.maxCount) return;
+      setState(() => _selected.add(url));
+    }
+  }
+
+  void _confirm() {
+    Navigator.pop(context, _selected.toList());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.theme;
+    final remaining = widget.maxCount - _selected.length;
+    final canConfirm = _selected.isNotEmpty;
+
+    return DraggableScrollableSheet(
+      initialChildSize: 0.85,
+      minChildSize: 0.5,
+      maxChildSize: 0.95,
+      expand: false,
+      builder: (context, scrollController) {
+        return Container(
+          decoration: BoxDecoration(
+            color: t.cardSurface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          child: Column(
+            children: [
+              const SizedBox(height: 10),
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: t.divider,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            LocaleService.current.memoryLane,
+                            style: AppFonts.onest(size: 18, weight: 700, color: t.primary),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            widget.maxCount == 1
+                                ? LocaleService.current.selectOnePhoto
+                                : remaining == 0
+                                    ? LocaleService.current.maxSelected
+                                    : LocaleService.current
+                                        .selectUpToPhotos(remaining),
+                            style: AppFonts.onest(size: 12, color: t.textSecondary),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (_selected.isNotEmpty)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: t.primary.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          '${_selected.length}/${widget.maxCount}',
+                          style: AppFonts.onest(size: 12, weight: 700, color: t.primary),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              Expanded(child: _buildBody(t, scrollController)),
+              SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
+                  child: SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: ElevatedButton(
+                      onPressed: canConfirm ? _confirm : null,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: t.primary,
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: t.surfaceMuted,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        elevation: 0,
+                      ),
+                      child: Text(
+                        _selected.isEmpty
+                            ? LocaleService.current.selectPhotosPrompt
+                            : LocaleService.current
+                                .addWithCount(_selected.length),
+                        style: AppFonts.onest(size: 15, weight: 700),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBody(AppTheme t, ScrollController scrollController) {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Text(
+          LocaleService.current.failedToLoadMemories,
+          style: TextStyle(fontFamily: AppFonts.body, color: t.textMuted),
+        ),
+      );
+    }
+    final photos = _photos ?? [];
+    if (photos.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.photo_library_outlined,
+                size: 48, color: t.textMuted),
+            const SizedBox(height: 12),
+            Text(
+              LocaleService.current.noPhotosInMemoryLane,
+              style: TextStyle(fontFamily: AppFonts.body, color: t.textMuted),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return GridView.builder(
+      // Запас прогрева: без него ряд за краем экрана начинал готовиться
+      // ровно тогда, когда его уже листают.
+      cacheExtent: 600,
+      controller: scrollController,
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        crossAxisSpacing: 4,
+        mainAxisSpacing: 4,
+      ),
+      itemCount: photos.length,
+      itemBuilder: (context, index) {
+        final photo = photos[index];
+        final isSelected = _selected.contains(photo.url);
+        final isAlreadyUsed =
+            widget.alreadySelected.contains(photo.url);
+        final atMax = _selected.length >= widget.maxCount;
+        final disabled = !isSelected && atMax;
+
+        return GestureDetector(
+          onTap: disabled ? null : () => _toggle(photo.url),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              StorageImage(
+                imageUrl: photo.url,
+                fit: BoxFit.cover,
+                memCacheWidth: 300,
+                placeholder: (_, __) => Container(
+                  color: t.surfaceMuted,
+                ),
+                errorWidget: (_, __, ___) => Container(
+                  color: t.surfaceMuted,
+                  child: Icon(Icons.broken_image_rounded,
+                      color: t.textMuted),
+                ),
+              ),
+              // Dim if at max and not selected
+              if (disabled)
+                Container(color: Colors.white.withOpacity(0.5)),
+              // Selection overlay
+              if (isSelected)
+                Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: t.primary, width: 3),
+                    color: t.primary.withOpacity(0.18),
+                  ),
+                ),
+              // Checkmark badge
+              Positioned(
+                top: 6,
+                right: 6,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 150),
+                  child: isSelected
+                      ? Container(
+                          key: const ValueKey('checked'),
+                          width: 24,
+                          height: 24,
+                          decoration: BoxDecoration(
+                            color: t.primary,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.check_rounded,
+                              size: 14, color: Colors.white),
+                        )
+                      : Container(
+                          key: const ValueKey('unchecked'),
+                          width: 22,
+                          height: 22,
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.25),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white,
+                              width: 1.5,
+                            ),
+                          ),
+                        ),
+                ),
+              ),
+              // "Already in widget" badge
+              if (isAlreadyUsed && !isSelected)
+                Positioned(
+                  bottom: 4,
+                  left: 4,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.6),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      LocaleService.current.inWidget,
+                      style: AppFonts.onest(size: 9, weight: 600, color: Colors.white),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}

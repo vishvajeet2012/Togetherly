@@ -1,0 +1,1610 @@
+/* Совместная лента: короткие ролики по очереди из лент обоих.
+ *
+ * Своя страница (/watch/reels/#код). Канал пары, вход по сессии и мост звонка
+ * — общие с комнатой совместного просмотра (`../pair.js`, `TgPair`); ролики,
+ * очередь, реакции, чат и кнопки звонка лента ведёт сама. До 05.10.2026 она
+ * жила поверх страницы комнаты и нажимала её спрятанные кнопки.
+ *
+ * Откуда ролики. Ленту платформы держит приложение — скрытым браузером, где
+ * человек как будто листает Shorts сам. Оттуда приходят только номера роликов
+ * (`reelsFeed` и `window.reelsFeedPush`), а смотрят оба здесь, официальным
+ * плеером, поэтому у пары одна и та же картинка и ничего не накладывается.
+ *
+ * Очередь. Каждая страница объявляет партнёру первые номера своей ленты
+ * (`reels-queue`). Свайп берёт следующий ролик из ленты ДРУГОГО — того, чей
+ * ролик сейчас не играет, — и рассылает его (`reels-reel`). Так ход переходит
+ * сам: ролик из ленты Ани, следующий из ленты Бори. Один в комнате — листает
+ * свою ленту.
+ *
+ * Чат — тот же, что в комнате: сообщения `chat {text, name}`, историю новичку
+ * отдаёт `state {to, log}` в ответ на его `hello`. Поэтому партнёр, оставшийся
+ * в комнате, и партнёр в ленте пишут друг другу как обычно.
+ */
+(() => {
+  'use strict';
+
+  const P = window.TgPair;
+  if (!P) return;
+  /** Канал пары: есть, когда сервер пустил (`TgPair.enter`). */
+  let ch = null;
+  const send = (type, extra) => { if (ch) ch.send(type, 0, extra); };
+  const subscribed = () => !!(ch && ch.subscribed());
+
+  const RU = (window.I18N && window.I18N.lang) !== 'en';
+  // В плашке — чья лента сейчас играет. Имена не склоняем («лента Бори» из
+  // имени не собрать), поэтому имя в именительном: «Лента · Боря».
+  const T = RU ? {
+    mine: 'Твоя лента', theirs: (n) => 'Лента · ' + n, partner: 'партнёр',
+    refresh: 'Обновить рекомендации', refreshing: 'Подбираем свежие ролики…',
+    call: 'Позвонить', react: 'Реакция', chat: 'Чат', share: 'Отправить ролик', prev: 'Прошлый ролик', back: 'Назад',
+    mic: 'Микрофон', hang: 'Положить трубку', ringing: 'Звоним…', failed: 'Не вышло',
+    write: () => 'Твоя реплика…', send: 'Отправить',
+    loading: 'Собираем ленту…', loadingSub: 'Первые ролики приходят за несколько секунд',
+    noFeed: 'Ленту даёт приложение', noFeedSub: 'Откройте «Ленты» в Togetherly на телефоне — ролики пойдут и сюда',
+    match: 'Совпало!', matchSub: 'Вам обоим зашёл этот ролик', sound: 'Включить звук',
+    copied: 'Ссылка скопирована', ourChat: 'Наш чат', empty: 'Здесь пока пусто', unavailable: 'Ролик недоступен, листаем дальше',
+    save: 'Сохранить в воспоминания', saved: 'Ролик в воспоминаниях', savedSub: 'Он ждёт вас в ленте воспоминаний',
+    savedBy: (n) => n + ' сохраняет ролик', saveFailed: 'Не сохранилось, попробуйте ещё раз', needApp: 'Сохранять можно из приложения Togetherly',
+    leads: (n) => 'Листает ' + n, take: 'Листать мне', tookLead: (n) => 'Теперь листает ' + n, youLead: 'Теперь листаете вы',
+    you: 'Вы', guest: 'Гость', joined: 'Партнёр в ленте', lost: 'Связь потеряна, переподключаемся…',
+    authTitle: 'Нужно войти', authSub: 'Ленту пары открывают её участники. Войдите на странице комнаты.',
+    strangerTitle: 'Это лента другой пары', strangerSub: 'Откройте совместную ленту из своего приложения.',
+    missingTitle: 'Такой комнаты нет', missingSub: 'Откройте совместную ленту из приложения Togetherly.',
+    offlineTitle: 'Нет связи', offlineSub: 'Проверьте интернет и откройте ленту ещё раз.',
+    toRoom: 'Войти', toHome: 'На главную',
+  } : {
+    mine: 'Your feed', theirs: (n) => 'Feed · ' + n, partner: 'partner',
+    refresh: 'Refresh recommendations', refreshing: 'Picking fresh clips…',
+    call: 'Call', react: 'React', chat: 'Chat', share: 'Send clip', prev: 'Previous clip', back: 'Back',
+    mic: 'Microphone', hang: 'Hang up', ringing: 'Calling…', failed: 'Failed',
+    write: () => 'Your line…', send: 'Send',
+    loading: 'Gathering your feed…', loadingSub: 'The first clips arrive in a few seconds',
+    noFeed: 'The feed comes from the app', noFeedSub: 'Open Feeds in Togetherly on your phone and the clips will show up here too',
+    match: 'It’s a match!', matchSub: 'You both liked this one', sound: 'Turn sound on',
+    copied: 'Link copied', ourChat: 'Our chat', empty: 'Nothing here yet', unavailable: 'Clip unavailable, moving on',
+    save: 'Save to memories', saved: 'Saved to memories', savedSub: 'Find it in your memory lane',
+    savedBy: (n) => n + ' saved this clip', saveFailed: 'Didn’t save, try again', needApp: 'Saving works in the Togetherly app',
+    leads: (n) => n + ' is scrolling', take: 'Let me scroll', tookLead: (n) => n + ' is scrolling now', youLead: 'You’re scrolling now',
+    you: 'You', guest: 'Guest', joined: 'Your partner is here', lost: 'Connection lost, reconnecting…',
+    authTitle: 'Sign in first', authSub: 'Only the couple can open their feed. Sign in on the room page.',
+    strangerTitle: 'This is another couple’s feed', strangerSub: 'Open the shared feed from your own app.',
+    missingTitle: 'No such room', missingSub: 'Open the shared feed from the Togetherly app.',
+    offlineTitle: 'No connection', offlineSub: 'Check your internet and open the feed again.',
+    toRoom: 'Sign in', toHome: 'Home',
+  };
+
+  // Значки — из того же набора Material Symbols Rounded, что в приложении
+  // (symbols.woff2 — нужные глифы, собраны из assets/fonts).
+  const IC = {
+    back: '', call: '', end: '', mic: '', micOff: '', chat: '',
+    swipe: '', send: '', share: '', undo: '', play: '', close: '', sound: '',
+  };
+  IC.refresh = '';
+  IC.save = '';
+  IC.saved = '';
+  const ic = (c) => '<span class="ms" aria-hidden="true">' + c + '</span>';
+  // На iPhone нет системного «назад»: без своей кнопки из лент не выйти.
+  const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+
+  // Реакции — наши рисунки (те же, что в чате приложения), а не системные
+  // эмодзи. По каналу ездит эмодзи, рисунок подставляется при показе.
+  const REACT = [['heart', '❤️'], ['laugh', '😂'], ['wow', '😮'], ['cry', '😢'], ['fire', '🔥'], ['thumbs_up', '👍']];
+  const ART = { '❤️': 'heart', '❤': 'heart', '😂': 'laugh', '😮': 'wow', '😢': 'cry', '🥺': 'cry', '🔥': 'fire', '👍': 'thumbs_up' };
+  const MOVING = {};   // id рисунка → анимированный файл из каталога
+  const stillOf = (e) => 'reactions/' + (ART[e] || 'heart') + '.webp';
+  /** Рисунок реакции встаёт сразу неподвижным (лежит рядом со страницей, пара
+   *  килобайт), анимация из каталога подменяет его, только когда догрузилась.
+   *  Раньше картинке сразу давали адрес анимации, а браузер до конца загрузки
+   *  держит прежнюю: пока под видео ехали 90 КБ, на кнопке висело сердце,
+   *  хотя выбран огонь (04.10.2026). */
+  function setArt(img, e, still) {
+    img.dataset.e = e;
+    img.src = stillOf(e);
+    const moving = MOVING[ART[e] || 'heart'];
+    if (still || !moving) return;
+    const pre = new Image();
+    pre.onload = () => { if (img.dataset.e === e) img.src = moving; };
+    pre.src = moving;
+  }
+  const artImg = (e, still) => '<img class="rl-art" alt="" data-e="' + e + '"' + (still ? ' data-still="1"' : '') + ' src="' + stillOf(e) + '">';
+  /** Ожить рисункам, вставленным разметкой ([artImg]). */
+  const liven = (node) => node.querySelectorAll('img.rl-art').forEach((i) => setArt(i, i.dataset.e, i.dataset.still === '1'));
+  /** Открыли выбор — анимации всех шести тянем заранее, чтобы выбранная
+   *  ожила сразу. */
+  const warmArt = () => REACT.forEach(([id]) => { if (MOVING[id]) new Image().src = MOVING[id]; });
+
+  const bridge = () => {
+    const b = window.flutter_inappwebview;
+    return b && typeof b.callHandler === 'function' ? b : null;
+  };
+
+  // Площадка своей ленты выбрана в приложении (`?feed=`); партнёр может
+  // смотреть другую — у каждого ролика своя метка в ключе.
+  const SOURCES = { shorts: 'SHORTS', tiktok: 'TIKTOK', rutube: 'RUTUBE', vk: 'ВК КЛИПЫ', dzen: 'ДЗЕН' };
+  const feedParam = (new URLSearchParams(location.search).get('feed') || 'shorts').toLowerCase();
+  const S = {
+    src: SOURCES[feedParam] ? feedParam : 'shorts',
+    me: '', name: '', partnerId: '', partnerName: '',
+    mine: [], theirs: [], seen: new Set(),
+    cur: null, back: [],
+    viewers: 1, reacts: {}, saved: new Set(),
+    // Ведущий: листает он, второй смотрит то же. Пусто — ещё никто не листал.
+    lead: '',
+    started: false, paused: false,
+    player: null, ready: false, wantMuted: false, pulling: false,
+  };
+
+  const $ = (s, root) => (root || document).querySelector(s);
+  let el = {};
+
+  function build() {
+    document.body.classList.add('reels');
+    const root = document.createElement('div');
+    root.className = 'rl';
+    root.innerHTML = `
+      <div class="rl-stage">
+        <div class="rl-cards"></div>
+        <div class="rl-shade"></div>
+        <div class="rl-tap"></div>
+        <div class="rl-paused">${ic(IC.play)}</div>
+        <div class="rl-wait"><span class="rl-spin"></span><b></b><span class="rl-wait-sub"></span><a class="rl-go" hidden></a></div>
+      </div>
+      <div class="rl-sheet">
+        <div class="rl-grab">
+          <span class="rl-handle"></span>
+          <div class="rl-head"><b>${T.ourChat}</b><button class="rl-x" aria-label="${T.back}">${ic(IC.close)}</button></div>
+        </div>
+        <div class="rl-list"></div>
+      </div>
+      <div class="rl-ui">
+        <div class="rl-top">
+          ${IOS ? `<button class="rl-ib rl-back" aria-label="${T.back}">${ic(IC.back)}</button>` : ''}
+          <button class="rl-ib rl-refresh" aria-label="${T.refresh}">${ic(IC.refresh)}</button>
+          <span class="rl-pill"><span class="rl-av"></span><b></b><span class="rl-src">SHORTS</span></span>
+        </div>
+        <div class="rl-lead" hidden><span></span><button type="button">${T.take}</button></div>
+        <div class="rl-voice" hidden>
+          <button class="rl-ib accent rl-call" aria-label="${T.call}">${ic(IC.call)}</button>
+          <span class="rl-av lg is-partner rl-vwho" hidden></span>
+          <button class="rl-ib accent rl-mic" aria-label="${T.mic}" hidden>${ic(IC.mic)}</button>
+          <button class="rl-ib end rl-hang" aria-label="${T.hang}" hidden>${ic(IC.end)}</button>
+          <span class="rl-vtime" hidden></span>
+        </div>
+        <div class="rl-rail">
+          <button class="rl-rx rl-react" aria-label="${T.react}">${artImg('❤️', true)}</button>
+          <button class="rl-rx rl-save" aria-label="${T.save}">${ic(IC.save)}</button>
+          <button class="rl-rx rl-chatbtn" aria-label="${T.chat}">${ic(IC.chat)}</button>
+          <button class="rl-rx rl-share" aria-label="${T.share}">${ic(IC.share)}</button>
+          <button class="rl-rx rl-prev" aria-label="${T.prev}" disabled>${ic(IC.undo)}</button>
+        </div>
+        <div class="rl-pick" hidden></div>
+        <div class="rl-feed"></div>
+        <button class="rl-sound" hidden>${ic(IC.sound)}${T.sound}</button>
+        <form class="rl-compose" id="rlCompose" autocomplete="off">
+          <input class="rl-input" enterkeyhint="send" maxlength="500">
+        </form>
+        <!-- Отправка — нижняя кнопка столбика справа (макет «Своя реплика»),
+             поэтому стоит вне поля и шлёт форму атрибутом form. -->
+        <button class="rl-send" type="submit" form="rlCompose" aria-label="${T.send}" disabled>${ic(IC.send)}</button>
+      </div>`;
+    document.body.appendChild(root);
+
+    el = {
+      root,
+      stage: $('.rl-stage', root), tap: $('.rl-tap', root), cards: $('.rl-cards', root),
+      wait: $('.rl-wait', root), pill: $('.rl-pill', root), refresh: $('.rl-refresh', root),
+      voice: $('.rl-voice', root), rail: $('.rl-rail', root), react: $('.rl-react', root),
+      pick: $('.rl-pick', root), feed: $('.rl-feed', root), sound: $('.rl-sound', root),
+      list: $('.rl-list', root), prev: $('.rl-prev', root), input: $('.rl-input', root),
+      save: $('.rl-save', root), lead: $('.rl-lead', root), send: $('.rl-send', root),
+    };
+    el.input.addEventListener('input', syncTyping);
+    $('button', el.lead).addEventListener('click', takeLead);
+
+    REACT.forEach(([, e]) => {
+      const b = document.createElement('button');
+      b.dataset.e = e;
+      b.innerHTML = artImg(e, true);
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); closePick(); react(e); });
+      el.pick.appendChild(b);
+    });
+
+    if (IOS) $('.rl-back', root).addEventListener('click', leave);
+    el.refresh.addEventListener('click', refreshFeed);
+    el.react.addEventListener('click', (e) => { e.stopPropagation(); el.pick.hidden ? openPick() : closePick(); });
+    $('.rl-chatbtn', root).addEventListener('click', () => setChat(!el.root.classList.contains('chat-open')));
+    $('.rl-x', root).addEventListener('click', () => setChat(false));
+    wireSheetDrag();
+    $('.rl-share', root).addEventListener('click', share);
+    el.save.addEventListener('click', save);
+    el.prev.addEventListener('click', () => go(false));
+    el.sound.addEventListener('click', unmute);
+    $('.rl-compose', root).addEventListener('submit', (e) => { e.preventDefault(); sendText(); });
+    el.input.addEventListener('focus', closePick);
+    document.addEventListener('click', (e) => {
+      if (!el.pick.hidden && !el.pick.contains(e.target) && !el.react.contains(e.target)) closePick();
+    });
+
+    wireVoice();
+    wireChat();
+    wireGestures();
+    loadArt();
+    showWait(T.loading, T.loadingSub, true);
+    // Ожидание из разметки страницы больше не нужно: своё стоит на том же месте.
+    const boot = document.getElementById('rlBoot');
+    if (boot) boot.remove();
+    paintTurn();
+    // Вход: панели выезжают на места, а не появляются разом.
+    requestAnimationFrame(() => requestAnimationFrame(() => root.classList.add('is-in')));
+  }
+
+  /** Анимированные рисунки реакций лежат в каталоге — тянем, когда есть сеть. */
+  function loadArt() {
+    fetch('/api/collections/catalog_items/records?perPage=50&fields=id,data&filter=' + encodeURIComponent('kind="reaction"'))
+      .then((r) => r.json())
+      .then((d) => (d.items || []).forEach((it) => {
+        const k = it.data && it.data.key;
+        if (k && it.data.sm) MOVING[k] = it.data.sm;
+      }))
+      .catch(() => {});
+  }
+
+  // ── звонок: свои кнопки, связь в приложении (`TgPair.voice`) ─────────────
+
+  function wireVoice() {
+    // В браузере без приложения звонить нечем — колонки звонка нет вовсе.
+    if (!P.voice.bridged()) return;
+    $('.rl-call', el.voice).addEventListener('click', () => P.voice.say('call'));
+    $('.rl-mic', el.voice).addEventListener('click', () => P.voice.say('mic'));
+    $('.rl-hang', el.voice).addEventListener('click', () => P.voice.say('hangup'));
+
+    const time = $('.rl-vtime', el.voice);
+    const mmss = (sec) => Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
+    let timer = 0;
+    // Секунды считаются от начала разговора, а не сложением тиков: свёрнутая
+    // страница усыпляет интервалы, и счёт отстал бы от настоящего времени.
+    const clock = (on) => {
+      if (!on) { clearInterval(timer); timer = 0; return; }
+      if (timer) return;
+      const since = Date.now();
+      time.textContent = mmss(0);
+      timer = setInterval(() => { time.textContent = mmss(Math.floor((Date.now() - since) / 1000)); }, 1000);
+    };
+
+    /** Состояние присылает приложение: off, connecting, live, failed. */
+    P.voice.onState((data) => {
+      // Приложение отозвалось — значит звонок отсюда оно понимает. Раньше
+      // ответа кнопку не показываем: у старых сборок она была бы мёртвой.
+      el.voice.hidden = false;
+      const now = String((data && data.state) || 'off');
+      const live = now === 'live';
+      const busy = live || now === 'connecting';
+      const micOn = !data || data.micOn !== false;
+      $('.rl-call', el.voice).hidden = busy;
+      // В покое — одна круглая кнопка, без подложки и подписи: колонке звонка
+      // подложка нужна, только когда в ней трубка, микрофон и время.
+      el.voice.classList.toggle('is-idle', !busy && now !== 'failed');
+      const who = $('.rl-vwho', el.voice);
+      who.hidden = !live;
+      who.textContent = initial(S.partnerName);
+      who.classList.toggle('talking', live);
+      const mic = $('.rl-mic', el.voice);
+      mic.hidden = !live;
+      mic.className = 'rl-ib rl-mic ' + (micOn ? 'accent' : 'mute');
+      mic.innerHTML = ic(micOn ? IC.mic : IC.micOff);
+      $('.rl-hang', el.voice).hidden = !busy;
+      // Пока ждём ответа — «Звоним…», в разговоре — время, не поднялось —
+      // «Не вышло».
+      clock(live);
+      if (now === 'connecting') time.textContent = T.ringing;
+      else if (now === 'failed') time.textContent = T.failed;
+      time.hidden = !(busy || now === 'failed');
+    });
+  }
+
+  // ── переписка ────────────────────────────────────────────────────────────
+  //
+  // Сервер ничего не хранит: переписка живёт в открытых страницах пары, и
+  // новичку её отдаёт тот, кто внутри (`state.log` в ответ на `hello`).
+
+  const LOG_LIMIT = 60;
+  /** Переписка этой страницы: `{from, name, text}`, как в комнате. */
+  const log = [];
+  let gotHistory = false;
+
+  function remember(from, name, text) {
+    log.push({ from, name, text });
+    if (log.length > LOG_LIMIT) log.shift();
+  }
+
+  function bubble(m, inList) {
+    const b = document.createElement('div');
+    b.className = 'rl-msg' + (m.mine ? ' me' : '') + (m.sys ? ' sys' : '');
+    if (!inList && !m.mine && !m.sys && m.who) {
+      const name = document.createElement('b');
+      name.textContent = m.who + ': ';
+      b.appendChild(name);
+    }
+    b.appendChild(document.createTextNode(m.text));
+    if (inList && !m.sys) {
+      const small = document.createElement('small');
+      const hm = new Date().toTimeString().slice(0, 5);
+      small.textContent = m.mine ? hm : (m.who ? m.who + ' · ' : '') + hm;
+      b.appendChild(small);
+    }
+    return b;
+  }
+
+  let fadeTimer = 0;
+  function wireChat() {
+    const e = document.createElement('span');
+    e.className = 'rl-empty';
+    e.textContent = T.empty;
+    el.list.appendChild(e);
+  }
+
+  /** Над полем остаются только реплики, влезшие целиком: в низком окне
+   *  место до плашки «Листает…» кончается, и старшая прячется вся, а не
+   *  режется посередине. Зовётся на каждую реплику и на смену размера. */
+  function fitFeed() {
+    // Блок прижат к низу, и вылезшее вверх браузер переполнением не считает
+    // (scrollHeight его не видит), поэтому меряем каждую реплику. От нижнего
+    // края место младших не зависит от того, спрятана ли старшая.
+    const kids = Array.from(el.feed.children);
+    kids.forEach((c) => c.classList.remove('cut'));
+    const top = el.feed.getBoundingClientRect().top;
+    kids.filter((c) => c.getBoundingClientRect().top < top - 0.5).forEach((c) => c.classList.add('cut'));
+  }
+
+  /** Реплика в лист чата и над полем: `{who, text, mine, sys}`. */
+  function addMsg(m) {
+    const e = $('.rl-empty', el.list);
+    if (e) e.remove();
+    el.list.appendChild(bubble(m, true));
+    el.list.scrollTop = el.list.scrollHeight;
+    // Над полем — две последние, старшая бледнее, через 7 секунд гаснут.
+    el.feed.appendChild(bubble(m, false));
+    while (el.feed.children.length > 2) el.feed.firstChild.remove();
+    Array.from(el.feed.children).forEach((c, i, all) => c.classList.toggle('old', i < all.length - 1));
+    fitFeed();
+    el.feed.style.opacity = '1';
+    clearTimeout(fadeTimer);
+    fadeTimer = setTimeout(() => { el.feed.style.opacity = '0'; }, 7000);
+  }
+
+  function sendText() {
+    const text = el.input.value.trim();
+    if (!text) return;
+    const name = S.name || T.guest;
+    addMsg({ who: T.you, text, mine: true });
+    remember(S.me, name, text);
+    // До подписки реплика придерживается и уходит, когда канал встал.
+    send('chat', { text, name });
+    el.input.value = '';
+    syncTyping();
+  }
+
+  /** Чужая реплика: из канала или из истории, которую прислал партнёр. */
+  function theirText(data) {
+    const name = String(data.name || '') || T.guest;
+    remember(data.from, name, String(data.text || ''));
+    addMsg({ who: name, text: String(data.text || ''), mine: false });
+  }
+
+  /** История переписки — ответ на наш `hello` (от комнаты или ленты). */
+  function adoptHistory(data) {
+    if (gotHistory || data.to !== S.me || !Array.isArray(data.log)) return;
+    gotHistory = true;
+    data.log.forEach((m) => {
+      if (!m || typeof m.text !== 'string') return;
+      const mine = m.from === S.me;
+      remember(m.from, m.name, m.text);
+      addMsg({ who: mine ? T.you : (m.name || T.guest), text: m.text, mine });
+    });
+  }
+
+  // Пока в поле есть текст, оно красится как своя реплика, а кнопка отправки
+  // оживает; пустое поле — матовое, кнопка приглушена и не нажимается.
+  function syncTyping() {
+    const live = !!el.input.value.trim();
+    el.root.classList.toggle('is-typing', live);
+    el.send.disabled = !live;
+  }
+
+  // ── жесты по ролику: свайп, касание, двойное касание ─────────────────────
+
+  let wheelLock = false;
+  function wireGestures() {
+    let y0 = 0, t0 = 0, moved = false, down = false, lastTap = 0, single = 0;
+    // Скорость пальца — по последним 90 мс движения: по ней решаем, улетит ли
+    // ролик, и с какой скоростью он доедет. Раньше любой свайп доезжал за
+    // одинаковые 300 мс по одной кривой, и лента ощущалась «деревянной».
+    let samples = [], raf = 0, lastDy = 0;
+    el.tap.addEventListener('pointerdown', (e) => {
+      y0 = e.clientY; t0 = performance.now(); moved = false; down = true;
+      samples = [[t0, 0]];
+      try { el.tap.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+    el.tap.addEventListener('pointermove', (e) => {
+      if (!down) return;
+      const dy = e.clientY - y0;
+      const now = performance.now();
+      samples.push([now, dy]);
+      while (samples.length > 2 && now - samples[0][0] > 90) samples.shift();
+      if (!moved && Math.abs(dy) > 10) { moved = true; closePick(); }
+      if (!moved || el.root.classList.contains('chat-open')) return;
+      // Ролик едет за пальцем, следующий выезжает снизу — как в лентах.
+      // Сдвиг ставим раз в кадр: событий касания бывает больше, чем кадров.
+      lastDy = dy;
+      if (!raf) raf = requestAnimationFrame(() => { raf = 0; if (down) dragCards(lastDy); });
+    });
+    const finish = (e) => {
+      if (!down) return;
+      down = false;
+      cancelAnimationFrame(raf); raf = 0;
+      const dy = e.clientY - y0;
+      const h = el.stage.clientHeight || 1;
+      const [ta, ya] = samples[0];
+      const v = (dy - ya) / Math.max(16, performance.now() - ta);   // точек в мс, минус — вверх
+      if (!moved) { onTap(e); return; }
+      if (el.root.classList.contains('chat-open')) { if (dy > h * 0.18 || v > 0.5) setChat(false); return; }
+      const flick = Math.abs(v) > 0.45 && Math.sign(v) === Math.sign(dy);
+      // Дотянул далеко, но в конце резко повёл обратно — передумал.
+      const undo = Math.abs(v) > 0.3 && Math.sign(v) === -Math.sign(dy);
+      if (!flick && (Math.abs(dy) < h * 0.2 || undo)) { settleCards(); return; }
+      if (!leads()) { settleCards(); nudgeLead(); return; }
+      // Остаток пути — со скоростью пальца: бросок долетает быстро, медленное
+      // перетаскивание дотягивается мягко.
+      slideMs = Math.round(Math.min(360, Math.max(170, (h - Math.abs(dy)) / Math.max(Math.abs(v), 1.5))));
+      const went = go(dy < 0);
+      slideMs = SLIDE_MS;
+      if (!went) settleCards();
+    };
+    el.tap.addEventListener('pointerup', finish);
+    el.tap.addEventListener('pointercancel', () => { if (down) { down = false; cancelAnimationFrame(raf); raf = 0; settleCards(); } });
+    const onTap = (e) => {
+      if (!el.pick.hidden) { closePick(); return; }
+      if (document.activeElement === el.input) { el.input.blur(); return; }
+      const now = Date.now();
+      if (now - lastTap < 300) {
+        // Двойное касание — сердце, как в лентах платформ.
+        clearTimeout(single);
+        lastTap = 0;
+        burstAt(e.clientX, e.clientY, '❤️');
+        if (!S.cur || (S.reacts[S.cur.id] || {}).me !== '❤️') react('❤️');
+        return;
+      }
+      lastTap = now;
+      single = setTimeout(() => togglePause(true), 300);
+    };
+    el.tap.addEventListener('wheel', (e) => {
+      if (Math.abs(e.deltaY) < 30 || wheelLock) return;
+      wheelLock = true; setTimeout(() => { wheelLock = false; }, 700);
+      go(e.deltaY > 0);
+    }, { passive: true });
+    document.addEventListener('keydown', (e) => {
+      if (e.target && /INPUT|TEXTAREA/.test(e.target.tagName)) return;
+      if (e.key === 'ArrowDown') go(true);
+      if (e.key === 'ArrowUp') go(false);
+      if (e.key === ' ') { e.preventDefault(); togglePause(true); }
+    });
+  }
+
+  function burstAt(x, y, e) {
+    const h = document.createElement('img');
+    h.className = 'rl-burst';
+    h.alt = '';
+    setArt(h, e);
+    const box = el.root.getBoundingClientRect();
+    h.style.left = (x - box.left) + 'px';
+    h.style.top = (y - box.top) + 'px';
+    el.root.appendChild(h);
+    setTimeout(() => h.remove(), 1000);
+  }
+
+  // ── очередь ──────────────────────────────────────────────────────────────
+
+  function addMine(ids) {
+    let added = 0;
+    (ids || []).forEach((raw) => {
+      if (typeof raw !== 'string') return;
+      // Приложение отдаёт голые номера своей площадки — ключ собираем здесь.
+      const id = raw.indexOf(':') > 0 ? raw : S.src + ':' + raw;
+      if (!/^[a-z]+:-?[A-Za-z0-9_-]{6,80}$/.test(id)) return;
+      if (S.seen.has(id) || S.mine.indexOf(id) >= 0) return;
+      S.mine.push(id);
+      added++;
+    });
+    if (!added) return;
+    announce();
+    if (S.started && !S.cur) next();
+    else preloadSoon();
+  }
+
+  let announceTimer = 0;
+  function announce() {
+    clearTimeout(announceTimer);
+    announceTimer = setTimeout(() => {
+      if (!subscribed()) return;
+      const ids = S.mine.slice(0, 4);
+      const thumbs = {};
+      ids.forEach((k) => { if (THUMBS[k]) thumbs[k] = THUMBS[k]; });
+      send('reels-queue', { ids, name: S.name, thumbs });
+    }, 150);
+  }
+
+  async function pull(n) {
+    const b = bridge();
+    if (!b || S.pulling) return;
+    S.pulling = true;
+    try {
+      const ids = await b.callHandler('reelsFeed', { need: n || 8 });
+      if (Array.isArray(ids)) addMine(ids);
+    } catch (_) {
+      // Старое приложение без ленты — останутся ролики партнёра.
+    } finally {
+      S.pulling = false;
+    }
+  }
+
+  /** Следующий ролик: из ленты того, чей ролик сейчас НЕ играет. */
+  function next() {
+    closePick();
+    const together = S.viewers > 1 && S.partnerId;
+    let id = '', owner = '';
+    const fromTheirs = () => {
+      while (S.theirs.length && !id) {
+        const c = S.theirs.shift();
+        if (!S.seen.has(c)) { id = c; owner = S.partnerId; }
+      }
+    };
+    const fromMine = () => {
+      while (S.mine.length && !id) {
+        const c = S.mine.shift();
+        if (!S.seen.has(c)) { id = c; owner = S.me; }
+      }
+    };
+    if (together && (!S.cur || S.cur.owner === S.me)) { fromTheirs(); fromMine(); } else { fromMine(); if (together) fromTheirs(); }
+    if (S.mine.length < 4) pull(8);
+    if (!id) {
+      if (!S.cur) showWait(bridge() ? T.loading : T.noFeed, bridge() ? T.loadingSub : T.noFeedSub, !!bridge());
+      return false;
+    }
+    if (owner === S.me) announce();
+    if (S.cur) { S.back.push(S.cur); if (S.back.length > 30) S.back.shift(); }
+    const cur = { id, owner, by: S.me };
+    show(cur);
+    send('reels-reel', { id, owner, by: S.me, name: S.name, lead: S.lead });
+    return true;
+  }
+
+  /** Человек листает сам (палец, колесо, кнопка): лента у него. Сам запуск
+   *  первого ролика ведущего не назначает — иначе вошедший вторым, не
+   *  дождавшись ролика партнёра, забирал ленту себе. */
+  function go(down) {
+    if (!leads()) { nudgeLead(); return false; }
+    if (S.viewers > 1 && S.partnerId && S.lead !== S.me) { S.lead = S.me; paintLead(); }
+    return down ? next() : previous();
+  }
+
+  /** Какой ролик покажет следующий свайп — по тем же правилам, что [next],
+   *  только ничего не забирая из очередей. Его плеер грузится заранее. */
+  function peekNext() {
+    const together = S.viewers > 1 && S.partnerId;
+    const first = (arr) => arr.find((x) => !S.seen.has(x)) || '';
+    if (together && (!S.cur || S.cur.owner === S.me)) return first(S.theirs) || first(S.mine);
+    return first(S.mine) || (together ? first(S.theirs) : '');
+  }
+
+  function previous() {
+    const prev = S.back.pop();
+    if (!prev) return false;
+    const cur = { id: prev.id, owner: prev.owner, by: S.me };
+    show(cur, true);
+    send('reels-reel', { id: cur.id, owner: cur.owner, by: S.me, name: S.name, back: true, lead: S.lead });
+    return true;
+  }
+
+  function show(cur, isBack) {
+    S.cur = cur;
+    S.seen.add(cur.id);
+    const i = S.mine.indexOf(cur.id);
+    if (i >= 0) { S.mine.splice(i, 1); announce(); }
+    S.theirs = S.theirs.filter((x) => x !== cur.id);
+    S.paused = false;
+    el.root.classList.remove('is-paused');
+    el.prev.disabled = !S.back.length;
+    hideWait();
+    paintTurn();
+    paintReact();
+    paintSave();
+    swapTo(cur.id, !!isBack);
+    // Ролик из своей ленты: скрытая страница приложения «смотрит» его тоже,
+    // без звука. Так платформа засчитывает просмотр, а рекомендации учатся.
+    const b = bridge();
+    if (b && cur.owner === S.me && keySrc(cur.id) === S.src) { try { b.callHandler('reelsWatching', { id: keyId(cur.id) }); } catch (_) {} }
+  }
+
+  // ── плеер ────────────────────────────────────────────────────────────────
+
+  let ytAsked = false;
+  const ytWait = [];
+  function whenYT(done) {
+    if (window.YT && window.YT.Player) { done(); return; }
+    ytWait.push(done);
+    if (ytAsked) return;
+    ytAsked = true;
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      if (typeof prev === 'function') { try { prev(); } catch (_) {} }
+      while (ytWait.length) ytWait.shift()();
+    };
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    tag.async = true;
+    document.head.appendChild(tag);
+  }
+
+  // Каждый ролик — своя карточка со своим плеером. Следующий грузится заранее
+  // под экраном и тихо играет: свайп просто сдвигает карточки, а кнопки,
+  // которые YouTube показывает первые секунды после старта, успевают
+  // спрятаться до показа. Раньше один плеер перезаряжался `loadVideoById` и
+  // сам перезапускал повтор — и кнопка паузы всплывала в центре без конца.
+  // Прошлый ролик тоже живёт — над экраном: свайп вниз тянет его за пальцем,
+  // как свайп вверх тянет следующий.
+  const cards = { cur: null, next: null, prev: null };
+  let cardSeq = 0;
+
+  // Ключ ролика — «площадка:номер» («tiktok:7654…», «vk:-2326_4562_c1df»):
+  // у партнёра может быть своя площадка, и по ключу видно, чем играть.
+  // Ключ без площадки — Shorts: так шлют сборки, вышедшие до остальных лент.
+  const keySrc = (key) => (key.indexOf(':') > 0 ? key.slice(0, key.indexOf(':')) : 'shorts');
+  const keyId = (key) => (key.indexOf(':') > 0 ? key.slice(key.indexOf(':') + 1) : key);
+
+  /** Плееры площадок, кроме YouTube: официальный iframe и его команды.
+   *  `keep: false` — команд у плеера нет (Дзен), поэтому заранее под экраном
+   *  его не держим: молчать по просьбе он не умеет. */
+  const FRAMES = {
+    tiktok: {
+      url: (id) => 'https://www.tiktok.com/player/v1/' + id + '?autoplay=1&loop=1&controls=0&progress_bar=0&play_button=0&volume_control=0&fullscreen_button=0&timestamp=0&music_info=0&description=0&rel=0&native_context_menu=0&closed_caption=0',
+      say: (w, cmd) => w.postMessage({ type: { play: 'play', pause: 'pause', mute: 'mute', unmute: 'unMute' }[cmd], 'x-tiktok-player': true }, '*'),
+      playing: (m) => m && m.type === 'onStateChange' && m.value === 1,
+      keep: true,
+    },
+    rutube: {
+      url: (id) => 'https://rutube.ru/play/embed/' + id + '/?autoplay=1',
+      say: (w, cmd) => w.postMessage(JSON.stringify({ type: 'player:' + { play: 'play', pause: 'pause', mute: 'mute', unmute: 'unMute' }[cmd], data: {} }), '*'),
+      // Rutube в конце ролика встаёт: повтор просим сами.
+      ended: (m) => m && m.type === 'player:changeState' && m.data && (m.data.state === 'completed' || m.data.state === 'stopped'),
+      playing: (m) => m && m.type === 'player:changeState' && m.data && m.data.state === 'playing',
+      keep: true,
+    },
+    vk: {
+      url: (id) => { const p = id.split('_'); return 'https://vk.com/video_ext.php?oid=' + p[0] + '&id=' + p[1] + '&hash=' + p[2] + '&autoplay=1&loop=1&js_api=1'; },
+      init: (w) => w.postMessage({ method: 'init' }, '*'),
+      say: (w, cmd) => w.postMessage({ method: cmd }, '*'),
+      ended: (m) => m && m.event === 'ended',
+      playing: (m) => m && (m.event === 'started' || m.event === 'resumed'),
+      keep: true,
+    },
+    dzen: {
+      url: (id) => 'https://dzen.ru/embed/' + id + '?autoplay=1&mute=0&loop=1',
+      keep: false,
+    },
+  };
+  const canKeep = (key) => keySrc(key) === 'shorts' || !!(FRAMES[keySrc(key)] || {}).keep;
+  // Прошлый ролик живым держим только у YouTube: без этого он показал бы свои
+  // кнопки. Плееры остальных площадок крутят свой код и на паузе, а у WebView
+  // он идёт в одном потоке со страницей — лишний плеер добавлял рывков
+  // (замер room-reels-perf: 8% тяжёлых кадров анимации против 4%).
+  const canKeepPrev = (key) => keySrc(key) === 'shorts';
+
+  /** [lazy] — плеер поднимет `card.boot()` позже (после анимации свайпа). */
+  /** Обложка ролика без запросов: Shorts и Rutube отдают её по номеру,
+   *  TikTok — из ленты приложения (`reelsThumbs`). У ВК и Дзена её нет. */
+  const THUMBS = {};
+  window.reelsThumbsPush = (map) => { if (map && typeof map === 'object') Object.assign(THUMBS, map); };
+  function posterOf(key) {
+    if (THUMBS[key]) return THUMBS[key];
+    const id = keyId(key);
+    switch (keySrc(key)) {
+      case 'shorts': return 'https://i.ytimg.com/vi/' + id + '/oar2.jpg';
+      case 'rutube': return 'https://rutube.ru/api/video/' + id + '/thumbnail/?redirect=1';
+      default: return '';
+    }
+  }
+
+  /** Плеер пошёл — обложка и заглушка уходят. */
+  function live(card) {
+    if (card.live || card.dead) return;
+    card.live = true;
+    card.el.classList.add('is-live');
+    if (card.shownAt && !liveTracked) {
+      liveTracked = true;
+      track('reels-live', Object.assign(probeFacts(card), { ms: Date.now() - card.shownAt }));
+    }
+  }
+
+  /** Замер (21.10.2026, обращение 407): на iPhone ролики TikTok стояли
+   *  обложкой и не запускались, а проверить это на устройстве нечем — WebKit
+   *  на Linux не играет H.264. Ролик, который на экране за 8 секунд так и не
+   *  пошёл, страница отмечает в статистике: площадка, система, сборка и
+   *  последнее, что сказал плеер. Первый пошедший за заход — с задержкой
+   *  старта, чтобы было с чем сравнить. */
+  const STUCK_MS = 8000;
+  let liveTracked = false;
+
+  function track(name, data) {
+    try { if (window.umami && window.umami.track) window.umami.track(name, data); } catch (_) { /* статистика не важнее ленты */ }
+  }
+
+  function probeFacts(card) {
+    const ua = navigator.userAgent;
+    const osm = ua.match(/OS (\d+)_/) || ua.match(/Android (\d+)/);
+    return {
+      src: keySrc(card.id),
+      platform: /iPhone|iPad|iPod/.test(ua) ? 'ios' : 'android',
+      os: osm ? Number(osm[1]) : 0,
+      b: Number(new URLSearchParams(location.search).get('b')) || 0,
+      ready: card.ready ? 1 : 0,
+      last: card.last || '',
+      muted: S.wantMuted ? 1 : 0,
+    };
+  }
+
+  /** Сообщение плеера площадки одной строкой: `onStateChange:3`,
+   *  `onPlayerError:3001`, `player:changeState:playing`, `started`. */
+  function playerSaid(m) {
+    if (!m || typeof m !== 'object') return '';
+    if (m.type === 'onPlayerError') return 'onPlayerError:' + ((m.value && m.value.errorCode) || '');
+    if (m.type === 'onStateChange' || m.type === 'onError') return m.type + ':' + m.value;
+    if (m.type === 'player:changeState' && m.data) return 'player:changeState:' + m.data.state;
+    if (m.type === 'player:error') return 'player:error';
+    if (m.event) return String(m.event);
+    return '';
+  }
+
+  /** Карточка встала на экран: через 8 секунд проверяем, пошла ли. Ролик,
+   *  загруженный заранее под экраном, мог пойти ещё до показа — у него
+   *  задержка старта нулевая. */
+  function watchStart(card) {
+    if (card.shownAt) return;
+    card.shownAt = Date.now();
+    if (card.live && !liveTracked) {
+      liveTracked = true;
+      track('reels-live', Object.assign(probeFacts(card), { ms: 0 }));
+    }
+    setTimeout(async () => {
+      if (card.dead || card.live || !card.active || document.hidden || S.paused) return;
+      // На iPhone 21.10.2026 плееры не загрузились вовсе: ни `load`, ни одного
+      // сообщения. Отметка различает сеть и браузер: есть ли на странице сам
+      // плеер, доехал ли скрипт YouTube, отвечают ли площадки этой странице.
+      const facts = Object.assign(probeFacts(card), {
+        frame: card.el.querySelector('iframe') ? 1 : 0,
+        ytApi: window.YT && window.YT.Player ? 1 : 0,
+      });
+      const [tt, yt] = await Promise.all([reach('https://www.tiktok.com/favicon.ico'), reach('https://www.youtube.com/favicon.ico')]);
+      track('reels-stuck', Object.assign(facts, { tt, yt }));
+    }, STUCK_MS);
+  }
+
+  /** Отвечает ли площадка этой странице: `ok`, `fail` (отказ сети) или
+   *  `slow` (молчит дольше 5 секунд). Ответ не читается, нужен сам факт. */
+  function reach(url) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 5000);
+    return fetch(url + '?r=' + Date.now(), { mode: 'no-cors', cache: 'no-store', signal: ctl.signal })
+      .then(() => 'ok', (e) => (e && e.name === 'AbortError' ? 'slow' : 'fail'))
+      .finally(() => clearTimeout(timer));
+  }
+
+  function makeCard(key, lazy) {
+    const node = document.createElement('div');
+    node.className = 'rl-card';
+    const frame = document.createElement('div');
+    frame.className = 'rl-frame';
+    const holder = document.createElement('div');
+    holder.id = 'rlCard' + (++cardSeq);
+    frame.appendChild(holder);
+    node.appendChild(frame);
+    // Пока плеер площадки поднимается, на карточке обложка ролика, а без неё —
+    // переливающаяся заглушка. Раньше тут было чёрное.
+    const poster = posterOf(key);
+    if (poster) {
+      const img = document.createElement('img');
+      img.className = 'rl-poster';
+      img.alt = '';
+      img.decoding = 'async';
+      img.addEventListener('error', () => {
+        // У старых Shorts вертикальной обложки нет — берём обычную.
+        if (keySrc(key) === 'shorts' && !img.dataset.alt) { img.dataset.alt = '1'; img.src = 'https://i.ytimg.com/vi/' + keyId(key) + '/hqdefault.jpg'; } else img.remove();
+      });
+      img.src = poster;
+      node.appendChild(img);
+    }
+    node.appendChild(document.createElement('i')).className = 'rl-shimmer';
+    el.cards.appendChild(node);
+    const card = { id: key, el: node, api: null, ready: false, active: false, dead: false };
+    const src = keySrc(key);
+    card.boot = () => {
+      card.boot = null;
+      if (src === 'shorts') ytCard(card, holder, keyId(key));
+      else frameCard(card, holder, src, keyId(key));
+    };
+    if (!lazy) card.boot();
+    return card;
+  }
+
+  /** Ролик не открылся: соседний — просто убрать, текущий — листать дальше.
+   *  Листает тот, кто его включил, чтобы двое не перескочили дважды. */
+  function failed(card) {
+    if (card === cards.next) {
+      // Закрытый для встраивания ролик вычёркиваем и грузим следующий.
+      drop(card); cards.next = null;
+      S.seen.add(card.id);
+      S.mine = S.mine.filter((x) => x !== card.id);
+      S.theirs = S.theirs.filter((x) => x !== card.id);
+      preloadSoon();
+      return;
+    }
+    if (card === cards.prev) { drop(card); cards.prev = null; return; }
+    if (card !== cards.cur || !S.cur || S.cur.by !== S.me) return;
+    say(T.unavailable);
+    setTimeout(next, 600);
+  }
+
+  function ytCard(card, holder, id) {
+    whenYT(() => {
+      if (card.dead) return;
+      const p = new YT.Player(holder.id, {
+        videoId: id,
+        // Повтор делает сам плеер (`loop` с `playlist` из одного ролика):
+        // наш перезапуск через seekTo снова вызывал его кнопки.
+        playerVars: { autoplay: 1, mute: 1, controls: 0, playsinline: 1, rel: 0, modestbranding: 1, fs: 0, iv_load_policy: 3, disablekb: 1, loop: 1, playlist: id },
+        events: {
+          onReady: () => {
+            card.ready = true;
+            if (card.active) wake(card);
+            // Под экраном ролик играет без звука в четверть скорости: кнопки
+            // YouTube за это время прячутся, а ролик почти не уходит вперёд.
+            // Останавливать его нельзя — пауза снова вызывает кнопки.
+            else card.api.shelve();
+          },
+          onError: (ev) => { card.last = 'error:' + (ev && ev.data); failed(card); },
+          onStateChange: (ev) => {
+            if (ev) card.last = 'state:' + ev.data;
+            if (ev && ev.data === 1) live(card);
+          },
+        },
+      });
+      card.api = {
+        play: () => p.playVideo(),
+        pause: () => p.pauseVideo(),
+        mute: () => p.mute(),
+        unmute: () => { p.unMute(); p.setVolume(100); },
+        muted: () => p.isMuted(),
+        // Без паузы и без перемотки: и то и другое вызывает кнопки YouTube.
+        shelve: () => { p.mute(); p.setPlaybackRate(0.25); p.playVideo(); },
+        wake: () => p.setPlaybackRate(1),
+        destroy: () => p.destroy(),
+      };
+    });
+  }
+
+  function frameCard(card, holder, src, id) {
+    const spec = FRAMES[src];
+    if (!spec) { setTimeout(() => failed(card), 0); return; }
+    const f = document.createElement('iframe');
+    f.src = spec.url(id);
+    f.allow = 'autoplay; encrypted-media; picture-in-picture';
+    // Площадкам реферер нужен: YouTube без него отвечает ошибкой 153. Ставим
+    // явно — если странице когда-нибудь закроют реферер, плееры не замолчат.
+    f.referrerPolicy = 'strict-origin-when-cross-origin';
+    holder.appendChild(f);
+    card.frame = f;
+    card.spec = spec;
+    const say = (cmd) => { try { if (spec.say) spec.say(f.contentWindow, cmd); } catch (_) {} };
+    card.api = {
+      play: () => say('play'),
+      pause: () => say('pause'),
+      mute: () => say('mute'),
+      unmute: () => say('unmute'),
+      muted: () => false,
+      shelve: () => { card.playing = false; say('mute'); say('pause'); },
+      // После сворачивания система ставит видео на паузу. Плеер с командами
+      // будим «играть», а Дзен их не понимает — его перезагружаем, и он
+      // стартует сам (эмулятор, 04.10.2026: после возврата был чёрный экран).
+      revive: () => {
+        if (spec.say) { say('play'); if (card.nudge) card.nudge(); return; }
+        const u = f.src;
+        f.src = 'about:blank';
+        setTimeout(() => { f.src = u; }, 50);
+      },
+      wake: () => {},
+      destroy: () => f.remove(),
+    };
+    f.addEventListener('load', () => {
+      card.ready = true;
+      // Дзен о себе не сообщает: обложку снимаем, когда плеер загрузился.
+      if (!spec.playing) setTimeout(() => live(card), 1200);
+      try { if (spec.init) spec.init(f.contentWindow); } catch (_) {}
+      // Плееры поднимаются не сразу и первые команды теряют — повторяем.
+      [0, 700, 1800, 3500].forEach((ms) => setTimeout(() => {
+        if (card.dead) return;
+        if (card.active) wake(card); else card.api.shelve();
+      }, ms));
+    });
+    // Плеер ВК на телефоне принимает «играть» не с первого раза и стоит с
+    // кнопкой на кадре (эмулятор, 04.10.2026). Пока он сам не скажет, что
+    // пошёл, текущий ролик будим раз в полторы секунды, до 15 секунд.
+    let tries = 0;
+    card.nudge = () => {
+      clearInterval(card.nudgeTimer);
+      tries = 0;
+      card.nudgeTimer = setInterval(() => {
+        if (card.dead || !card.active || card.playing || ++tries > 10) { clearInterval(card.nudgeTimer); return; }
+        try { if (spec.init) spec.init(f.contentWindow); } catch (_) {}
+        if (!S.paused) { if (!S.wantMuted) card.api.unmute(); card.api.play(); }
+      }, 1500);
+    };
+  }
+
+  // Ответы плееров площадок: пошёл — больше не будим, конец ролика — повтор.
+  window.addEventListener('message', (e) => {
+    const all = [cards.cur, cards.next, cards.prev];
+    const card = all.find((c) => c && c.frame && c.frame.contentWindow === e.source);
+    if (!card || !card.spec) return;
+    let m = e.data;
+    if (typeof m === 'string') { try { m = JSON.parse(m); } catch (_) { return; } }
+    card.last = playerSaid(m) || card.last;
+    if (card.spec.playing && card.spec.playing(m)) { card.playing = true; live(card); }
+    if (card.active && card.spec.ended && card.spec.ended(m)) card.api.play();
+  });
+
+  function drop(card) {
+    if (!card) return;
+    card.dead = true;
+    try { if (card.api) card.api.destroy(); } catch (_) {}
+    card.el.remove();
+  }
+
+  /** Карточка стала текущей: обычная скорость и звук. Без перемотки в начало:
+   *  `seekTo` вызывает у YouTube полный набор кнопок поверх ролика (проверено
+   *  перебором в scratchpad/ytui), а смена скорости и звука — нет. */
+  function wake(card) {
+    if (!card.ready || !card.api) return;
+    try {
+      card.api.wake();
+      if (S.wantMuted) card.api.mute(); else card.api.unmute();
+      card.api.play();
+    } catch (_) {}
+    checkSound(card);
+  }
+
+  // Уход ролика начинается со скорости пальца и мягко тормозит; возврат на
+  // место — тоже торможением, без отскока (так в лентах площадок).
+  const EASE_GO = 'cubic-bezier(.17, .84, .32, 1)';
+  const EASE_BACK = 'cubic-bezier(.22, 1, .36, 1)';
+  /** [ms] — 0: без анимации (палец ведёт сам). */
+  const place = (card, y, ms, ease) => {
+    if (!card) return;
+    card.el.style.transition = ms ? 'transform ' + ms + 'ms ' + (ease || EASE_GO) : 'none';
+    card.el.style.transform = 'translate3d(0,' + y + ',0)';
+  };
+  /** Тянуть некуда (нет соседа или листает партнёр) — лента пружинит. */
+  const rubber = (d, h) => Math.sign(d) * (h * 0.22) * (1 - 1 / (Math.abs(d) / (h * 0.5) + 1));
+
+  /** Палец тянет: текущая едет за ним, соседняя выезжает с той стороны. */
+  function dragCards(dy) {
+    const h = el.stage.clientHeight;
+    const free = leads() && (dy < 0 ? !!(cards.next || peekNext()) : S.back.length > 0);
+    const y = free ? dy : rubber(dy, h);
+    place(cards.cur, y + 'px', 0);
+    if (cards.next) place(cards.next, (h + Math.min(0, y)) + 'px', 0);
+    if (cards.prev) place(cards.prev, (-h + Math.max(0, y)) + 'px', 0);
+  }
+
+  /** Свайп не дотянул — всё на место. */
+  function settleCards() {
+    place(cards.cur, '0', 340, EASE_BACK);
+    if (cards.next) place(cards.next, '100%', 340, EASE_BACK);
+    if (cards.prev) place(cards.prev, '-100%', 340, EASE_BACK);
+  }
+
+  /** Карточка ушла с экрана: молчит (YouTube — в четверть скорости, без
+   *  паузы; остальные — на паузе). */
+  function shelve(card) {
+    card.active = false;
+    card.el.classList.remove('is-cur');
+    try { if (card.api) card.api.shelve(); } catch (_) {}
+  }
+
+  function swapTo(id, isBack) {
+    flushSettle();
+    let card = null;
+    if (cards.prev && cards.prev.id === id) { card = cards.prev; cards.prev = null; }
+    else if (cards.next && cards.next.id === id) { card = cards.next; cards.next = null; }
+    // Новый плеер (не загруженный заранее) поднимаем после того, как карточки
+    // доедут: плееры площадок работают в одном потоке со страницей (у WebView
+    // нет отдельных процессов для iframe), и их запуск посреди анимации рвал
+    // свайп — замер room-reels-perf, 04.10.2026.
+    else { card = makeCard(id, true); place(card, isBack ? '-100%' : '100%', 0); }
+    const old = cards.cur;
+    const ms = slideMs;
+    cards.cur = card;
+    card.active = true;
+    watchStart(card);
+    card.el.classList.add('is-cur');
+    if (!old) card.el.classList.add('is-first');
+    requestAnimationFrame(() => place(card, '0', old ? ms : 0));
+    if (old) {
+      old.active = false;
+      old.el.classList.remove('is-cur');
+      place(old, isBack ? '100%' : '-100%', ms);
+    }
+    // Команды плеерам — тоже после анимации: «играть», «пауза» и звук
+    // запускают декодирование, и посреди сдвига это давало рывки.
+    pendingSettle = () => {
+      if (old && !old.dead) {
+        shelve(old);
+        if (isBack || !canKeepPrev(old.id)) drop(old);
+        else {
+          // Ушедший вверх ролик и есть прошлый: свайп вниз вернёт его сразу.
+          if (cards.prev && cards.prev !== old) drop(cards.prev);
+          cards.prev = old;
+        }
+      }
+      if (card.dead || cards.cur !== card) return;
+      if (card.boot) card.boot();
+      wake(card);
+      if (card.nudge) card.nudge();
+      // Следующий грузим сразу, как карточки доехали: прежде он ждал
+      // простоя потока до полутора секунд, и быстрый второй свайп попадал
+      // на ещё не начатую загрузку — чёрный экран.
+      setTimeout(() => { preloadNext(); ensurePrev(); }, 60);
+    };
+    settleTimer = setTimeout(flushSettle, old ? ms : 0);
+  }
+  const SLIDE_MS = 320;
+  let slideMs = SLIDE_MS;
+  let settleTimer = 0;
+  let pendingSettle = null;
+  /** Доделать прошлую смену сразу — новый свайп пришёл раньше, чем она доехала. */
+  function flushSettle() {
+    clearTimeout(settleTimer);
+    const f = pendingSettle;
+    pendingSettle = null;
+    if (f) f();
+  }
+
+  /** Над экраном лежит ролик, на который ведёт «назад». */
+  function ensurePrev() {
+    const want = S.back.length ? S.back[S.back.length - 1].id : '';
+    if (cards.prev && cards.prev.id === want) return;
+    if (cards.prev) { drop(cards.prev); cards.prev = null; }
+    if (!want || !canKeepPrev(want)) return;
+    cards.prev = makeCard(want);
+    place(cards.prev, '-100%', false);
+  }
+
+  /** «Обновить рекомендации»: свой запас в сторону, скрытая лента начинает
+   *  заново, и первый свежий ролик включается сам. */
+  let refreshing = false;
+  async function refreshFeed() {
+    const b = bridge();
+    if (!b || refreshing) return;
+    if (!leads()) { nudgeLead(); return; }
+    if (S.viewers > 1 && S.partnerId) { S.lead = S.me; paintLead(); }
+    refreshing = true;
+    el.refresh.classList.add('is-busy');
+    S.mine = [];
+    if (cards.next) { drop(cards.next); cards.next = null; }
+    // Сборка без этого обработчика может не ответить вовсе — ждём недолго.
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    try { await Promise.race([b.callHandler('reelsRefresh', {}), wait(3000)]); } catch (_) {}
+    // Запрос ленты мог уже идти (тогда pull сразу выходит) — ждём, пока
+    // придёт хоть один свежий ролик, до 14 секунд.
+    pull(10);
+    for (let t = 0; t < 14000 && !S.mine.some((x) => !S.seen.has(x)); t += 300) await wait(300);
+    refreshing = false;
+    el.refresh.classList.remove('is-busy');
+    const id = S.mine.find((x) => !S.seen.has(x));
+    if (!id) return;
+    S.mine = S.mine.filter((x) => x !== id);
+    announce();
+    if (S.cur) { S.back.push(S.cur); if (S.back.length > 30) S.back.shift(); }
+    show({ id, owner: S.me, by: S.me });
+    send('reels-reel', { id, owner: S.me, by: S.me, name: S.name, lead: S.me });
+  }
+
+  /** Следующий ролик заранее, под экраном. */
+  function preloadNext() {
+    if (!S.cur) return;
+    const id = peekNext();
+    if (cards.next && cards.next.id === id) return;
+    if (cards.next) { drop(cards.next); cards.next = null; }
+    if (!id || !canKeep(id)) return;
+    cards.next = makeCard(id);
+    place(cards.next, '100%', false);
+  }
+  let preloadTimer = 0;
+  const preloadSoon = () => { clearTimeout(preloadTimer); preloadTimer = setTimeout(preloadNext, 300); };
+
+  /** Браузер без касания не даст звук: тогда играем без него и предлагаем включить. */
+  let soundCheck = 0;
+  function checkSound(card) {
+    clearTimeout(soundCheck);
+    soundCheck = setTimeout(() => {
+      if (card !== cards.cur || !card.api || S.paused) return;
+      let muted = false;
+      try { muted = card.api.muted(); } catch (_) {}
+      if (muted && !S.wantMuted) {
+        S.wantMuted = true;
+        el.sound.hidden = false;
+      }
+    }, 1200);
+  }
+
+  function unmute() {
+    S.wantMuted = false;
+    el.sound.hidden = true;
+    const c = cards.cur;
+    try { c.api.unmute(); c.api.play(); } catch (_) {}
+  }
+
+  function togglePause(tell) {
+    if (!cards.cur || !S.cur) return;
+    if (!el.sound.hidden) { unmute(); return; }
+    setPaused(!S.paused);
+    if (tell) send('reels-pause', { id: S.cur.id, paused: S.paused });
+  }
+
+  function setPaused(p) {
+    S.paused = p;
+    el.root.classList.toggle('is-paused', p);
+    const c = cards.cur;
+    try { if (p) c.api.pause(); else c.api.play(); } catch (_) {}
+  }
+
+  // ── ход, реакции ─────────────────────────────────────────────────────────
+
+  const initial = (name) => (String(name || '').trim()[0] || '·').toUpperCase();
+
+  function paintTurn() {
+    const pName = S.partnerName || T.partner;
+    const mine = !S.cur || S.cur.owner === S.me;
+    const av = $('.rl-av', el.pill);
+    av.textContent = initial(mine ? S.name : S.partnerName);
+    av.classList.toggle('is-partner', !mine);
+    $('b', el.pill).textContent = mine ? T.mine : T.theirs(pName);
+    $('.rl-src', el.pill).textContent = SOURCES[S.cur ? keySrc(S.cur.id) : S.src] || 'SHORTS';
+    el.input.placeholder = T.write();
+  }
+
+  // ── ведущий ──────────────────────────────────────────────────────────────
+  // Листает один: иначе двое тянут ленту в разные стороны, и каждый свайп
+  // одного перебивает другого. Второй смотрит то же и может забрать ленту
+  // себе кнопкой — без спроса, как пульт на диване.
+
+  /** Могу ли я листать: один в комнате, ведущего нет или ведущий я. */
+  function leads() {
+    return S.viewers < 2 || !S.partnerId || !S.lead || S.lead === S.me;
+  }
+
+  function paintLead() {
+    const follower = !leads();
+    el.lead.hidden = !follower;
+    if (follower) $('span', el.lead).textContent = T.leads(S.partnerName || T.partner);
+  }
+
+  /** Ведомый тянет ленту — подсвечиваем, кто листает и как забрать. */
+  function nudgeLead() {
+    paintLead();
+    el.lead.classList.remove('is-nudge');
+    void el.lead.offsetWidth;
+    el.lead.classList.add('is-nudge');
+  }
+
+  function takeLead() {
+    S.lead = S.me;
+    paintLead();
+    send('reels-lead', { lead: S.me, name: S.name });
+    toast(T.youLead);
+  }
+
+  function openPick() {
+    warmArt();
+    const r = el.react.getBoundingClientRect();
+    const box = el.root.getBoundingClientRect();
+    el.pick.style.top = (r.top - box.top + r.height / 2 - 26) + 'px';
+    const mine = S.cur ? (S.reacts[S.cur.id] || {}).me : '';
+    Array.from(el.pick.children).forEach((b) => b.classList.toggle('is-on', b.dataset.e === mine));
+    el.pick.hidden = false;
+  }
+  function closePick() { if (el.pick) el.pick.hidden = true; }
+
+  function react(e) {
+    if (!S.cur) return;
+    const r = S.reacts[S.cur.id] || (S.reacts[S.cur.id] = {});
+    r.me = r.me === e ? '' : e;
+    paintReact();
+    send('reels-react', { id: S.cur.id, e: r.me });
+    if (r.me && r.me === r.them) matched(r.me);
+  }
+
+  function paintReact() {
+    const r = (S.cur && S.reacts[S.cur.id]) || {};
+    const img = $('img', el.react);
+    // Та же реакция — картинку не трогаем, иначе анимация начнётся заново.
+    if (img.dataset.e !== (r.me || '❤️') || (img.dataset.still === '1') !== !r.me) {
+      img.dataset.still = r.me ? '' : '1';
+      setArt(img, r.me || '❤️', !r.me);
+    }
+    el.react.classList.toggle('is-on', !!r.me);
+  }
+
+  function theirReaction(data) {
+    const r = S.reacts[data.id] || (S.reacts[data.id] = {});
+    r.them = data.e || '';
+    if (!S.cur || data.id !== S.cur.id || !r.them) return;
+    const pop = document.createElement('div');
+    pop.className = 'rl-pop';
+    pop.innerHTML = '<span class="rl-av is-partner"></span>' + artImg(r.them);
+    pop.firstChild.textContent = initial(S.partnerName);
+    liven(pop);
+    const rr = el.react.getBoundingClientRect();
+    const box = el.root.getBoundingClientRect();
+    pop.style.top = (rr.top - box.top + 2) + 'px';
+    el.root.appendChild(pop);
+    setTimeout(() => pop.remove(), 2700);
+    if (r.me && r.me === r.them) matched(r.me);
+  }
+
+  function matched(e) {
+    const old = $('.rl-match', el.root);
+    if (old) old.remove();
+    const m = document.createElement('div');
+    m.className = 'rl-match';
+    m.innerHTML = artImg(e) + '<span><b></b><small></small></span>';
+    m.querySelector('b').textContent = T.match;
+    m.querySelector('small').textContent = T.matchSub;
+    liven(m);
+    el.root.appendChild(m);
+    setTimeout(() => m.remove(), 3500);
+  }
+
+  function setChat(on) {
+    closePick();
+    el.root.classList.toggle('chat-open', on);
+    $('.rl-chatbtn', el.root).classList.toggle('is-on', on);
+    const sheet = $('.rl-sheet', el.root);
+    sheet.style.transition = '';
+    sheet.style.transform = '';
+    if (on) setTimeout(() => { el.list.scrollTop = el.list.scrollHeight; }, 50);
+  }
+
+  /** Лист чата закрывается свайпом вниз — за шапку листа или по переписке,
+   *  когда она уже прокручена до верха. */
+  function wireSheetDrag() {
+    const sheet = $('.rl-sheet', el.root);
+    let y0 = 0, dy = 0, on = false;
+    sheet.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.rl-x')) return;
+      const fromHead = !!e.target.closest('.rl-grab');
+      if (!fromHead && el.list.scrollTop > 0) return;
+      y0 = e.clientY; dy = 0; on = true;
+    });
+    sheet.addEventListener('pointermove', (e) => {
+      if (!on) return;
+      dy = Math.max(0, e.clientY - y0);
+      if (dy < 8) return;
+      sheet.style.transition = 'none';
+      sheet.style.transform = 'translateY(' + dy + 'px)';
+    });
+    const end = () => {
+      if (!on) return;
+      on = false;
+      if (dy > Math.min(120, sheet.clientHeight * 0.25)) { setChat(false); return; }
+      sheet.style.transition = '';
+      sheet.style.transform = '';
+    };
+    sheet.addEventListener('pointerup', end);
+    sheet.addEventListener('pointercancel', end);
+  }
+
+  /** Адрес ролика для человека. Те же правила — `ReelLink.url` в приложении:
+   *  разъедутся, и «Отправить» с «Сохранить» поведут в разные места. */
+  function watchUrl(key) {
+    const id = keyId(key);
+    switch (keySrc(key)) {
+      case 'tiktok': return 'https://www.tiktok.com/@/video/' + id;
+      case 'rutube': return 'https://rutube.ru/shorts/' + id + '/';
+      case 'vk': { const p = id.split('_'); return 'https://vk.com/clip' + p[0] + '_' + p[1]; }
+      case 'dzen': return 'https://dzen.ru/embed/' + id;
+      default: return 'https://youtube.com/shorts/' + id;
+    }
+  }
+
+  // ── закладка: ролик в ленту воспоминаний пары ───────────────────────────
+
+  const savedKey = (key) => keySrc(key) + ':' + keyId(key);
+
+  function paintSave() {
+    const on = !!(S.cur && S.saved.has(savedKey(S.cur.id)));
+    el.save.classList.toggle('is-on', on);
+    el.save.innerHTML = ic(on ? IC.saved : IC.save);
+    el.save.setAttribute('aria-label', on ? T.saved : T.save);
+  }
+
+  async function save() {
+    if (!S.cur || el.save.classList.contains('is-busy')) return;
+    const key = savedKey(S.cur.id);
+    if (S.saved.has(key)) { toast(T.saved, T.savedSub); return; }
+    const b = bridge();
+    if (!b) { toast(T.needApp); return; }
+    el.save.classList.add('is-busy');
+    let ok = false;
+    try {
+      const r = await Promise.race([
+        b.callHandler('reelsSave', { key }),
+        new Promise((res) => setTimeout(() => res(null), 15000)),
+      ]);
+      ok = !!(r && r.ok);
+    } catch (_) {}
+    el.save.classList.remove('is-busy');
+    if (!ok) { toast(T.saveFailed); return; }
+    S.saved.add(key);
+    paintSave();
+    toast(T.saved, T.savedSub);
+    send('reels-saved', { id: key, name: S.name });
+  }
+
+  function theirSave(data) {
+    const key = savedKey(String(data.id || ''));
+    if (S.saved.has(key)) return;
+    S.saved.add(key);
+    if (S.cur && savedKey(S.cur.id) === key) { paintSave(); toast(T.savedBy(S.partnerName || T.partner)); }
+  }
+
+  /** Короткая плашка над столбиком: что случилось с роликом. */
+  function toast(title, sub, icon) {
+    const old = $('.rl-toast', el.root);
+    if (old) old.remove();
+    const t = document.createElement('div');
+    t.className = 'rl-toast';
+    t.innerHTML = (icon === '' ? '' : ic(icon || IC.saved)) + '<span><b></b><small></small></span>';
+    t.querySelector('b').textContent = title;
+    t.querySelector('small').textContent = sub || '';
+    el.root.appendChild(t);
+    setTimeout(() => t.remove(), 2800);
+  }
+
+  async function share() {
+    if (!S.cur) return;
+    const url = watchUrl(S.cur.id);
+    const b = bridge();
+    if (b) { try { await b.callHandler('reelsShare', { url }); return; } catch (_) {} }
+    if (navigator.share) { navigator.share({ url }).catch(() => {}); return; }
+    try { await navigator.clipboard.writeText(url); say(T.copied); } catch (_) { say(url); }
+  }
+
+  /** Без звука и без значка: что случилось со связью или роликом. */
+  const say = (text) => toast(text, '', '');
+
+  function leave() {
+    const b = bridge();
+    if (b && window.__togetherlyChrome) { try { b.callHandler('watchBack', {}); return; } catch (_) {} }
+    location.href = '../room/' + location.hash;
+  }
+
+  /** Экран ожидания посреди ленты. [go] — кнопка-ссылка `{href, label}`. */
+  function showWait(title, sub, spin, go) {
+    el.wait.hidden = false;
+    $('.rl-spin', el.wait).style.display = spin ? '' : 'none';
+    $('b', el.wait).textContent = title;
+    $('.rl-wait-sub', el.wait).textContent = sub;
+    const a = $('.rl-go', el.wait);
+    a.hidden = !go;
+    if (go) { a.href = go.href; a.textContent = go.label; }
+  }
+  function hideWait() { el.wait.hidden = true; }
+
+  // ── канал ────────────────────────────────────────────────────────────────
+
+  /** Подписка встала (и после переподключения тоже). */
+  let startTimer = 0;
+  function onSubscribed(opened) {
+    if (!ch) ch = opened;
+    S.me = ch.me;
+    announce();
+    pull(10);
+    // Партнёр уже листает — его ролик придёт ответом на наш «hello».
+    clearTimeout(startTimer);
+    startTimer = setTimeout(() => { S.started = true; if (!S.cur) next(); }, 1500);
+  }
+
+  /** Сколько людей в канале. Приход партнёра отмечаем строкой в чате, но не
+   *  чаще раза в полминуты: переподключения дают дребезг 1↔2. */
+  let joinedAt = -Infinity;
+  function onViewers(n) {
+    const was = S.viewers;
+    S.viewers = n;
+    // Остался один — лента снова у него.
+    if (S.viewers < 2) S.lead = '';
+    if (n > 1 && was <= 1 && performance.now() - joinedAt > 30000) {
+      joinedAt = performance.now();
+      addMsg({ text: T.joined, sys: true });
+    }
+    paintTurn();
+    paintLead();
+  }
+
+  function onMessage(data) {
+    switch (data.t) {
+      case 'hello':
+        // Новичку — наш ролик, наша очередь и переписка. Переписку ждёт и
+        // партнёр в комнате: она отвечает на «hello» тем же `state`.
+        if (S.cur) {
+          // Пришёл второй, а лента уже идёт: ведёт тот, кто листал.
+          if (!S.lead) S.lead = S.me;
+          send('reels-state', { to: data.from, cur: S.cur, name: S.name, ids: S.mine.slice(0, 4), lead: S.lead });
+        } else announce();
+        if (log.length) send('state', { to: data.from, url: '', file: null, playing: false, log: log.slice(-LOG_LIMIT) });
+        return;
+      case 'state':
+        adoptHistory(data);
+        return;
+      case 'chat':
+        if (data.name) notePartner(data);
+        theirText(data);
+        return;
+      case 'reels-state':
+        if (data.to !== S.me) return true;
+        notePartner(data);
+        if (data.lead) S.lead = data.lead;
+        paintLead();
+        if (Array.isArray(data.ids)) S.theirs = data.ids.filter((x) => !S.seen.has(x));
+        if (data.cur && data.cur.id && (!S.cur || S.cur.id !== data.cur.id)) {
+          if (S.cur) S.back.push(S.cur);
+          show({ id: data.cur.id, owner: data.cur.owner, by: data.cur.by });
+        }
+        return true;
+      case 'reels-queue':
+        notePartner(data);
+        if (data.thumbs && typeof data.thumbs === 'object') {
+          Object.keys(data.thumbs).forEach((k) => { if (/^https:\/\//.test(String(data.thumbs[k]))) THUMBS[k] = String(data.thumbs[k]); });
+        }
+        S.theirs = (data.ids || []).filter((x) => !S.seen.has(x));
+        if (S.started && !S.cur) next();
+        else preloadSoon();
+        return true;
+      case 'reels-reel':
+        notePartner(data);
+        if (data.lead) S.lead = data.lead;
+        paintLead();
+        // Тот же ролик (напоминание листающего) — ничего не перезапускаем.
+        if (S.cur && S.cur.id === data.id) return true;
+        if (S.cur && !data.back) { S.back.push(S.cur); if (S.back.length > 30) S.back.shift(); }
+        if (data.back) {
+          const i = S.back.map((x) => x.id).lastIndexOf(data.id);
+          if (i >= 0) S.back.splice(i);
+        }
+        show({ id: data.id, owner: data.owner, by: data.by }, !!data.back);
+        if (S.mine.length < 4) pull(8);
+        return true;
+      case 'reels-react':
+        notePartner(data);
+        theirReaction(data);
+        return true;
+      case 'reels-saved':
+        notePartner(data);
+        theirSave(data);
+        return true;
+      case 'reels-lead':
+        notePartner(data);
+        S.lead = data.lead || '';
+        paintLead();
+        if (S.lead && S.lead !== S.me) toast(T.tookLead(S.partnerName || T.partner));
+        return true;
+      case 'reels-pause':
+        if (S.cur && data.id === S.cur.id) setPaused(!!data.paused);
+        return true;
+      default:
+        // Команды плеера комнаты (play, pause, sync, source) ленте ни к чему.
+        return false;
+    }
+  }
+
+  function notePartner(data) {
+    if (!data.from || data.from === S.me) return;
+    const changed = S.partnerId !== data.from || (data.name && S.partnerName !== data.name);
+    S.partnerId = data.from;
+    if (data.name) S.partnerName = data.name;
+    if (changed) { paintTurn(); paintLead(); }
+  }
+
+  // Приложение досылает свежие номера само, когда скрытая лента их принесла.
+  window.reelsFeedPush = (ids) => addMine(ids);
+
+  // Свёрнутое приложение: оба плеера спят. Иначе, пока человека нет, они
+  // крутят видео, а при возврате просыпаются разом — отсюда лаги. Зовёт
+  // приложение (жизненный цикл), браузер — сменой видимости вкладки.
+  let asleep = false;
+  function sleep(on) {
+    if (asleep === on) return;
+    asleep = on;
+    [cards.cur, cards.next, cards.prev].forEach((c) => {
+      if (!c || !c.api || !c.ready) return;
+      try {
+        if (on) c.api.pause();
+        else if (c !== cards.cur) c.api.shelve();
+        else if (!S.paused) (c.api.revive || c.api.play)();
+      } catch (_) {}
+    });
+  }
+  window.reelsSleep = (on) => sleep(!!on);
+
+  // Сообщение о свайпе может разминуться с партнёром: он заходил в комнату
+  // в ту же секунду (проверка смешанных лент, 04.10.2026). Листавший
+  // последним раз в 12 секунд напоминает, какой ролик идёт.
+  setInterval(() => {
+    if (!S.cur || S.cur.by !== S.me || !subscribed() || S.viewers < 2 || (S.lead && S.lead !== S.me)) return;
+    send('reels-reel', { id: S.cur.id, owner: S.cur.owner, by: S.me, name: S.name, lead: S.lead });
+  }, 12000);
+  document.addEventListener('visibilitychange', () => sleep(document.hidden));
+  // Для проверок: что сейчас играет и чья очередь (tests/room-reels.test.js).
+  window.__reelsState = () => ({ cur: S.cur, mine: S.mine.length, theirs: S.theirs.length, viewers: S.viewers, partner: S.partnerId });
+
+  /** Не пустили: говорим, почему, и куда идти. Вход есть на странице комнаты
+   *  пары — там экран у двери; из приложения лента открывается со сессией. */
+  function denied(err) {
+    const why = err && err.denied;
+    const room = { href: '../room/' + location.hash, label: T.toRoom };
+    const home = { href: '../', label: T.toHome };
+    if (!why) showWait(T.offlineTitle, T.offlineSub, false);
+    else if (why === 'auth_required') showWait(T.authTitle, T.authSub, false, room);
+    else if (why === 'not_member') showWait(T.strangerTitle, T.strangerSub, false, home);
+    else showWait(T.missingTitle, T.missingSub, false, home);
+  }
+
+  function start() {
+    build();
+    P.viewport(['.rl-input']);
+    // Клавиатура Android урезает окно целиком, и `typing` из pair.js её не
+    // видит: столбик оставался на месте и налезал на звонок и шапку. Своя
+    // примета — поле в фокусе, а окно заметно ниже полной высоты.
+    const kb = () => {
+      const full = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--vph-full')) || 0;
+      const on = document.activeElement === el.input && full > 0 && window.innerHeight < full * 0.8;
+      document.body.classList.toggle('rl-kb', on);
+    };
+    window.addEventListener('resize', kb);
+    el.input.addEventListener('focus', kb);
+    el.input.addEventListener('blur', () => document.body.classList.remove('rl-kb'));
+    // Клавиатура и поворот меняют место под реплики — пересчитываем.
+    // Лента целиком — чтобы спрятанная реплика вернулась, когда место
+    // прибавилось: сам блок реплик от этого не растёт.
+    if (window.ResizeObserver) {
+      const ro = new ResizeObserver(fitFeed);
+      ro.observe(el.feed);
+      ro.observe(el.root);
+    }
+    // Имя приходит от приложения (?name=): им подписаны реплики и ход ленты.
+    const params = new URLSearchParams(location.search);
+    S.name = (params.get('name') || '').trim().slice(0, 32);
+    const room = P.roomFromHash();
+    if (!room) { denied({ denied: 'not_found' }); return; }
+    P.enter(room, {
+      message: onMessage,
+      viewers: onViewers,
+      subscribed: onSubscribed,
+      status: (kind) => { if (kind === 'lost') say(T.lost); },
+    }).then((opened) => {
+      ch = opened;
+      S.me = opened.me;
+    }, denied);
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();

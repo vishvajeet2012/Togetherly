@@ -1,0 +1,229 @@
+import 'dart:async';
+
+import 'package:characters/characters.dart';
+import 'package:flutter/foundation.dart';
+
+import '../models/countdown_widget.dart';
+import '../models/mood_entry.dart';
+import '../models/pair_data.dart';
+import '../models/timer_item.dart';
+import '../utils/couple_days.dart';
+import '../theme/app_theme.dart';
+import 'home_widget_service.dart';
+import 'locale_service.dart';
+import 'map/pair_map_widget_service.dart';
+import 'mood_service.dart';
+import 'pb_data_service.dart';
+
+/// Данные для виджетов нового каталога: «Вместе», «Настроение — плитки»,
+/// «Кольцо года» и «Календарь лет».
+///
+/// Раньше их писал только экран «Виджеты». Кто добавлял виджет из системной
+/// галереи, ни разу не заглянув на этот экран, видел пустые плитки — и считал,
+/// что виджет сломан. На Android это отчасти прикрывало фоновое обновление
+/// через WorkManager, а на iOS фонового обновления нет вовсе, поэтому там пусто
+/// оставалось насовсем.
+///
+/// Теперь тот же набор пишется с главного экрана при каждом обновлении виджетов.
+/// Экран «Виджеты» свои вызовы сохранил: там данные нужны сразу после правки
+/// настроек, не дожидаясь возврата на главную.
+class CatalogWidgetSync {
+  CatalogWidgetSync._();
+
+  static const _months = <String>[
+    'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+    'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря',
+  ];
+
+  static String _dayMonth(DateTime d) => '${d.day} ${_months[d.month - 1]}';
+
+  static const _monthsEn = <String>[
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+
+  /// Подпись даты на чипе «До встречи» — как в превью экрана «Виджеты».
+  static String _countdownDate(DateTime d) =>
+      switch (LocaleService.instance.language) {
+        AppLanguage.ru => _dayMonth(d),
+        AppLanguage.zh => '${d.month}月${d.day}日',
+        AppLanguage.uk => LocaleService.current.dayLogDate(d),
+        _ => '${_monthsEn[d.month - 1]} ${d.day}',
+      };
+
+  static String _initial(String name) {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return '';
+    return trimmed.characters.first.toUpperCase();
+  }
+
+  /// Доля дня в шкале виджета: 20..100. `-1` — отметки нет.
+  static int _percentOf(MoodEntry? e) =>
+      e == null ? -1 : (((e.score - 1) / 4) * 80 + 20).round().clamp(20, 100);
+
+  /// Записать данные всех виджетов каталога.
+  ///
+  /// [memoriesCount] — сколько воспоминаний у пары; влияет только на
+  /// «Календарь лет». Ошибки глушим: виджеты не стоят сорванного экрана.
+  static Future<void> sync({
+    required PairData pair,
+    required MoodService moods,
+    required String myName,
+    required String myAvatarUrl,
+    String myUid = '',
+    TimerItem? systemTimer,
+    TimerItem? defaultTimer,
+    int memoriesCount = 0,
+    /// Все таймеры пары: из обратных отсчётов собирается «До встречи».
+    List<TimerItem> timers = const [],
+    /// Тема приложения: картинка виджета «Где мы» рисуется её цветами.
+    AppTheme? theme,
+  }) async {
+    // «Где мы» — при каждом входе в приложение. Служба сама решает, стоит ли
+    // рисовать: виджета нет или ничего не сдвинулось — не рисует. Не ждём её:
+    // карта качает плитки, а остальным виджетам ждать незачем.
+    if (theme != null) {
+      unawaited(PairMapWidgetService.instance.refreshFromApp(
+        groupId: pair.pairId,
+        myUid: myUid,
+        partnerUid: pair.partnerUid,
+        myName: myName,
+        partnerName: pair.partnerDisplayName,
+        myAvatarUrl: myAvatarUrl,
+        partnerAvatarUrl: pair.partnerAvatarUrl,
+        theme: theme,
+      ));
+    }
+    try {
+      final hws = HomeWidgetService.instance;
+      final timer = defaultTimer ?? systemTimer;
+      final start = timer?.startDate ?? pair.startDate;
+      final days = timer != null
+          ? timer.daysElapsed.abs()
+          : (start != null ? calendarDaysBetween(start, DateTime.now()) : 0);
+
+      final partnerName = pair.partnerDisplayName.trim();
+      final names =
+          [myName.trim(), partnerName].where((n) => n.isNotEmpty).join(' + ');
+
+      await hws.syncTogether(
+        groupId: pair.pairId,
+        days: days,
+        startDate: start == null ? '' : 'С ${_dayMonth(start)} ${start.year}',
+        start: start,
+        myInitial: _initial(myName),
+        partnerInitial: _initial(partnerName),
+        names: names,
+        anniversary: start == null ? '' : _dayMonth(start),
+        anniversaryDate: pair.anniversaryDate,
+        myAvatarUrl: myAvatarUrl,
+        partnerAvatarUrl: pair.partnerAvatarUrl,
+      );
+
+      await hws.syncYearWidgets(
+        groupId: pair.pairId,
+        start: start,
+        memoriesCount: memoriesCount,
+        startDateLabel: start == null ? '' : 'с ${_dayMonth(start)} ${start.year}',
+      );
+
+      // Пустой список — таймеры ещё не загрузились (системный есть всегда):
+      // не стираем виджет раньше времени.
+      if (timers.isNotEmpty) {
+        await hws.syncCountdownEvents(
+          groupId: pair.pairId,
+          events: countdownEventsFor(
+            timers,
+            now: DateTime.now(),
+            dateLabel: _countdownDate,
+          ),
+          from: coupleStartDate(
+            timerStart: timer?.startDate,
+            groupStart: pair.startDate,
+            anniversary: pair.anniversaryDate,
+          ),
+        );
+      }
+
+      await _syncMoodTiles(pair: pair, moods: moods);
+      await _syncMiss(pair: pair, myUid: myUid);
+    } catch (e) {
+      debugPrint('CatalogWidgetSync.sync failed: $e');
+    }
+  }
+
+  /// Счётчики «Скучаю» — для виджета-полоски и его собрата на экране
+  /// блокировки.
+  ///
+  /// До 31.08.2026 их писал ТОЛЬКО экран «Виджеты». Виджет экрана блокировки
+  /// ставят прямо с экрана блокировки, а на этот экран приложения человек не
+  /// заходит никогда — и виджет стоял с нулями до первого тихого пуша.
+  static Future<void> _syncMiss({
+    required PairData pair,
+    required String myUid,
+  }) async {
+    if (pair.pairId.isEmpty || myUid.isEmpty) return;
+    final counts = await PbDataService().getMissYouCounts(pair.pairId);
+    if (counts.isEmpty) return;
+    final partnerName = pair.partnerDisplayName.trim();
+    await HomeWidgetService.instance.syncMiss(
+      groupId: pair.pairId,
+      myCount: counts[myUid] ?? 0,
+      partnerCount: counts[pair.partnerUid] ?? 0,
+      partnerName: partnerName,
+      partnerInitial: _initial(partnerName),
+      partnerAvatarUrl: pair.partnerAvatarUrl,
+    );
+  }
+
+  static Future<void> _syncMoodTiles({
+    required PairData pair,
+    required MoodService moods,
+  }) async {
+    final today = DateTime.now();
+    final partnerUid = pair.partnerUid;
+
+    MoodEntry? first(List<MoodEntry> list) =>
+        list.isNotEmpty ? list.first : null;
+
+    final week = <List<int>>[];
+    var matched = 0;
+    // От понедельника этой недели к воскресенью — тот же порядок, что в виджете.
+    final monday = today.subtract(Duration(days: today.weekday - 1));
+    for (var i = 0; i < 7; i++) {
+      final day = DateTime(monday.year, monday.month, monday.day + i);
+      final mine = first(moods.myEntriesForDay(day));
+      final theirs = partnerUid.isEmpty
+          ? null
+          : first(moods.partnerEntriesForDay(partnerUid, day));
+      week.add([_percentOf(mine), _percentOf(theirs)]);
+      if (mine != null && theirs != null && mine.score == theirs.score) {
+        matched++;
+      }
+    }
+
+    final myToday = first(moods.myEntriesForDay(today));
+    final partnerToday = partnerUid.isEmpty
+        ? null
+        : first(moods.partnerEntriesForDay(partnerUid, today));
+
+    await HomeWidgetService.instance.syncMoodTiles(
+      groupId: pair.pairId,
+      // Подпись по полу: «Устал» парню, «Устала» девушке.
+      myLabel: myToday == null
+          ? ''
+          : (MoodOption.byId(myToday.moodId)
+                  ?.localizedLabelFor(HomeWidgetService.instance.cachedMyGender) ??
+              ''),
+      myMoodId: myToday?.moodId ?? '',
+      partnerLabel: partnerToday == null
+          ? ''
+          : (MoodOption.byId(partnerToday.moodId)?.localizedLabelFor(
+                  HomeWidgetService.instance.cachedPartnerGender) ??
+              ''),
+      partnerName: pair.partnerDisplayName.trim(),
+      week: week,
+      matchedDays: matched,
+    );
+  }
+}

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<script>
+/* Совместная лента с 05.10.2026 живёт на своей странице (/watch/reels/).
+   Выпущенные сборки приложения открывают её прежним адресом этой комнаты с
+   `?reels=1` — уводим их туда до первой отрисовки, с теми же параметрами и
+   кодом комнаты, чтобы комната не мелькнула. `stop()` обрывает то, что
+   браузер успел запросить заранее (стили и скрипт комнаты): ни грузить, ни
+   запускать их незачем. */
+if (/[?&]reels=1\b/.test(location.search)) {
+  window.stop();
+  location.replace('../reels/' + location.search + location.hash);
+}
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Комната — Togetherly</title>
+<meta name="robots" content="noindex">
+<!-- Яндекс Диск отдаёт файл только тем, кто не представился чужим сайтом:
+     с нашим Referer он отвечает 403. Заодно площадки перестают узнавать,
+     откуда пришёл человек.
+     ВАЖНО: мета действует на всю страницу, а ютуб на запрос без реферера
+     отвечает ошибкой 153 и не играет ни одного ролика. Поэтому iframe
+     площадок получает свою политику в room.js (у iframe атрибут
+     referrerpolicy поддерживается и перебивает страничный, у <video> — нет).
+     Стережёт tests/room-youtube-referrer.test.js. -->
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#150D0F">
+<link rel="stylesheet" href="../landing.css?v=20260812">
+<link rel="stylesheet" href="room.css?v=20261026a">
+<script>
+/* В комнате смотрят кино, поэтому тёмная тема здесь по умолчанию: светлую
+   получает только тот, кто выбрал её сам. */
+(function () {
+  try {
+    document.documentElement.dataset.theme = localStorage.getItem('watch-theme') || 'dark';
+  } catch (e) { document.documentElement.dataset.theme = 'dark'; }
+})();
+/* Приложение сообщает состояние звонка вызовом window.watchVoiceState. Оно
+   может прийти раньше, чем выполнится pair.js, поэтому первое значение просто
+   запоминаем — `TgPair.voice` применит его при запуске. */
+window.watchVoiceState = (s) => { window.__voicePending = s; };
+</script>
+<script defer src="https://analytics.togetherly.day/script.js" data-website-id="00feef0e-ea5b-435a-8455-af0dc5ac18cb"></script>
+</head>
+<body class="room-body">
+
+<header class="top top--room">
+  <!-- «Назад» — только в приложении, которое убрало свою шапку
+       (window.__togetherlyChrome): одна шапка вместо двух (28.09.2026). -->
+  <button class="btn btn--ghost btn--compact btn--icon" id="back" data-i18n-aria="room.back" hidden>
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+  </button>
+  <a class="brand" href="../">
+    <span class="brand__mark" aria-hidden="true"></span>
+    <span class="brand__name">TOGETHERLY</span>
+    <span class="brand__sub">watch</span>
+  </a>
+  <span class="status-line" id="status" data-i18n="room.connecting">Подключаюсь…</span>
+  <div class="room-code">
+    <span class="room-code__cap" data-i18n="room.code">Код комнаты</span>
+    <b id="code">—</b>
+  </div>
+  <button class="btn btn--ghost btn--compact" id="copy" data-i18n-aria="room.copy">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg>
+    <span data-i18n="room.copy">Скопировать ссылку</span>
+  </button>
+  <button class="btn btn--ghost btn--compact btn--icon" id="share" data-i18n-aria="room.share" hidden>
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7M12 3v13M8 7l4-4 4 4"/></svg>
+  </button>
+  <!-- Голос. Кнопка живёт в шапке комнаты и красится её токенами, а связь
+       поднимает приложение: у страницы нет ни микрофона пары, ни сигналинга.
+       Поэтому группа скрыта и показывается только в WebView приложения —
+       room.js включает её, увидев мост flutter_inappwebview. Раньше эту кнопку
+       рисовал Flutter полосой ПОД комнатой: светлая панель под тёмной
+       страницей, и вдобавок она отрезала 84 точки высоты уже после загрузки,
+       из-за чего нижний ряд уезжал за край на айфонах (20.08.2026).
+       Стережёт tests/room-voice-bridge.test.js. -->
+  <span class="voice" id="voice" hidden>
+    <button class="btn btn--ghost btn--compact btn--icon voice__btn" id="voiceCall" data-i18n-aria="room.voiceCall">
+      <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M6.6 10.8a15 15 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.24 11.4 11.4 0 0 0 3.6.58 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1 11.4 11.4 0 0 0 .57 3.6 1 1 0 0 1-.25 1z"/></svg>
+    </button>
+    <span class="voice__state" id="voiceState" hidden><i class="voice__dot" aria-hidden="true"></i><b id="voiceTime"></b></span>
+    <button class="btn btn--ghost btn--compact btn--icon voice__btn" id="voiceMic" data-i18n-aria="room.voiceMic" aria-pressed="true" hidden>
+      <svg class="i-mic-on" viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/></svg>
+      <svg class="i-mic-off" viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M15 11V6a3 3 0 0 0-5.9-.75l5.8 5.8A3 3 0 0 0 15 11zM4.3 3.3 3 4.6l6 6V11a3 3 0 0 0 4.4 2.65l1.2 1.2A5 5 0 0 1 7 11H5a7 7 0 0 0 6 6.92V21h2v-3.08a7 7 0 0 0 3.2-1.3l3.2 3.2 1.3-1.3z"/></svg>
+    </button>
+    <button class="btn btn--compact btn--icon voice__btn voice__btn--hang" id="voiceHang" data-i18n-aria="room.voiceHang" hidden>
+      <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M12 9c-1.6 0-3.2.25-4.7.7v3.1c0 .4-.23.75-.57.9-1 .5-1.9 1.13-2.7 1.87a1 1 0 0 1-1.4 0l-2-2a1 1 0 0 1 0-1.42C3.94 9.5 7.76 8 12 8s8.06 1.5 11.37 4.15a1 1 0 0 1 0 1.42l-2 2a1 1 0 0 1-1.4 0c-.8-.74-1.7-1.37-2.7-1.87a1 1 0 0 1-.57-.9v-3.1A16 16 0 0 0 12 9z"/></svg>
+    </button>
+  </span>
+  <button class="theme-btn" id="theme" data-i18n-aria="nav.theme" aria-pressed="true">
+    <svg class="i-moon" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>
+    <svg class="i-sun" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"/></svg>
+  </button>
+  <!-- Свернуть шапку: видео получает всю высоту, вернуть — кнопкой в углу. -->
+  <button class="theme-btn" id="fold" data-i18n-aria="room.fold">
+    <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg>
+  </button>
+</header>
+<button class="unfold" id="unfold" data-i18n-aria="room.unfold" hidden>
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+</button>
+
+<!-- Плашка для телефона. Строка статуса в шапке там скрыта, и отказ по ссылке
+     («такую ссылку не открыть»), пустое поле и обрыв связи человек не видел:
+     «Включить» казалась мёртвой (жалоба с iPhone 17.09.2026). Текст ставит
+     note() в room.js. Стережёт tests/room-phone-note.test.js. -->
+<p class="note" id="note" role="status" aria-live="polite" hidden></p>
+
+<main class="stage-wrap" id="stage">
+  <div class="player" id="player">
+    <div class="player__empty">
+      <svg viewBox="0 0 24 24" width="40" height="40" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>
+      <span data-i18n="room.empty">Вставьте ссылку на видео</span>
+    </div>
+  </div>
+
+  <aside class="side">
+    <div class="side__head">
+      <h2 data-i18n="room.chat">Чат</h2>
+      <span class="viewers" id="viewers" data-i18n="room.alone">вы один</span>
+    </div>
+    <div class="chat" id="chat"></div>
+  </aside>
+
+  <div class="manual" id="manual" hidden>
+    <span class="manual__note" data-i18n="room.manualNote">Этим плеером управляет каждый сам: жмите вместе по отсчёту.</span>
+    <button class="btn btn--ghost btn--compact" id="together" data-i18n="room.together">Начать вместе</button>
+    <button class="btn btn--ghost btn--compact" id="pauseBoth" data-i18n="room.pauseBoth">Пауза у обоих</button>
+  </div>
+
+  <div class="source">
+    <input id="link" class="source__input" autocomplete="off" spellcheck="false"
+           data-i18n-ph="room.linkPlaceholder">
+    <button class="btn btn--ghost btn--compact btn--icon" id="pick" data-i18n-aria="room.fileBtn">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4zM9 12l5 3-5 3z"/></svg>
+    </button>
+    <input id="file" type="file" accept="video/*" hidden>
+    <button class="btn btn--ghost btn--compact btn--icon" id="chatToggle" data-i18n-aria="room.chatToggle" aria-pressed="false">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.4A8 8 0 1 1 21 12z"/></svg>
+    </button>
+    <button class="btn btn--ghost btn--compact btn--icon" id="cinema" data-i18n-aria="room.cinema" aria-pressed="false">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    </button>
+    <button class="btn btn--filled btn--compact" id="apply" data-i18n="room.play">Включить</button>
+  </div>
+
+  <!-- Полноэкранный режим: чат свёрнут в кнопку, пришедшее сообщение
+       всплывает над ней и уходит само (room.js, cinemaChat). -->
+  <button class="cin-fab" id="cinChat" type="button" data-i18n-aria="room.chatOpen">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.4A8 8 0 1 1 21 12z"/></svg>
+    <span class="cin-fab__n" hidden></span>
+  </button>
+  <button class="cin-toast" id="cinToast" type="button" hidden><b></b><span></span></button>
+
+  <div class="composer">
+    <input id="message" class="input input--flat" autocomplete="off" data-i18n-ph="room.message">
+    <button class="btn btn--filled btn--icon" id="send" data-i18n-aria="room.send">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 20l18-8L3 4v6l12 2-12 2z"/></svg>
+    </button>
+  </div>
+</main>
+
+<!-- Экран у двери. Комнату пары открывают только её участники, набранный
+     руками код ведёт в никуда — и то и другое сервер говорит отказом, а
+     этот экран объясняет, что делать дальше. Режим задаёт room.js
+     (`showGate`): closed — войти, stranger — аккаунт не из этой пары,
+     missing — такой комнаты нет. Стережёт tests/room-access.test.js. -->
+<section class="gate" id="gate" hidden>
+  <div class="gate__card" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
+    <span class="gate__mark" aria-hidden="true">
+      <svg class="gate__lock" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="3"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+      <svg class="gate__search" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5M9 9l4 4M13 9l-4 4"/></svg>
+    </span>
+    <h1 class="gate__title" id="gateTitle"></h1>
+    <p class="gate__text" id="gateText"></p>
+
+    <form class="gate__form" id="gateForm" novalidate>
+      <input class="input" id="gateEmail" type="email" autocomplete="username" inputmode="email"
+             spellcheck="false" data-i18n-ph="gate.email" data-i18n-aria="gate.email">
+      <input class="input" id="gatePass" type="password" autocomplete="current-password"
+             data-i18n-ph="gate.pass" data-i18n-aria="gate.pass">
+      <button class="btn btn--filled" type="submit" data-i18n="gate.signIn">Войти</button>
+    </form>
+
+    <div class="gate__or" id="gateOr"><span data-i18n="gate.or">или</span></div>
+    <div class="gate__provs" id="gateProvs">
+      <button class="btn btn--ghost" type="button" data-provider="google" aria-label="Google">
+        <svg viewBox="0 0 256 262" width="18" height="18" aria-hidden="true"><path fill="#4285f4" d="M255.9 133.5c0-10.8-.9-18.6-2.8-26.7H130.6v48.4h71.9a64 64 0 0 1-26.7 42.4l-.2 1.6 38.7 30 2.7.3c24.7-22.8 38.9-56.3 38.9-96"/><path fill="#34a853" d="M130.6 261.1c35.2 0 64.8-11.6 86.4-31.6l-41.2-32a76 76 0 0 1-45.2 13.1 79 79 0 0 1-74.3-54.2l-1.5.1-40.3 31.2-.6 1.5A131 131 0 0 0 130.6 261"/><path fill="#fbbc05" d="M56.3 156.4a80 80 0 0 1-.2-51.7V103L15.3 71.3l-1.4.6a131 131 0 0 0 0 117.3z"/><path fill="#eb4335" d="M130.6 50.5c24.5 0 41 10.6 50.4 19.4L218 34c-22.8-21-52.2-34-87.4-34C79.5 0 35.4 29.3 13.9 72l42.2 32.7a79 79 0 0 1 74.5-54.2"/></svg>
+        <span>Google</span>
+      </button>
+      <button class="btn btn--ghost" type="button" data-provider="yandex" data-i18n-aria="gate.yandex">
+        <svg viewBox="0 0 44 44" width="18" height="18" aria-hidden="true"><rect width="44" height="44" fill="#fc3f1d" rx="22"/><path fill="#fff" d="M25.2 12.3H23c-3.8 0-5.7 2-5.7 4.8 0 3.2 1.3 4.8 4.1 6.7l2.3 1.6-6.4 9.8h-5.1l6-8.9c-3.5-2.5-5.4-4.8-5.4-8.9 0-5 3.5-8.6 10.2-8.6h6.7v26.4h-4.5z"/></svg>
+        <span data-i18n="gate.yandex">Яндекс</span>
+      </button>
+      <button class="btn btn--ghost" type="button" data-provider="apple" aria-label="Apple">
+        <svg viewBox="0 0 256 315" width="16" height="18" fill="currentColor" aria-hidden="true"><path d="M213.8 167c.4 47.6 41.7 63.4 42.2 63.6-.3 1.2-6.6 22.6-21.8 44.8-13 19.1-26.7 38.2-48 38.6-21.1.4-28-12.5-52-12.5s-31.6 12.1-51.5 12.9c-20.7.8-36.4-20.7-49.6-39.8-27-39-47.7-110.3-20-158.4a77 77 0 0 1 65.1-39.4c20.3-.4 39.5 13.6 51.9 13.6s35.7-16.9 60.2-14.4c10.2.4 39 4.2 57.5 31.2-1.5 1-34.4 20-34 59.8M174.2 50.2A69 69 0 0 0 190.6 0c-15.8.6-35 10.5-46.3 23.8-10.2 11.8-19.1 30.6-16.7 48.7 17.6 1.3 35.7-9 46.6-22.3"/></svg>
+        <span>Apple</span>
+      </button>
+    </div>
+
+    <p class="gate__msg" id="gateMsg" role="status"></p>
+
+    <div class="gate__actions" id="gateActions">
+      <button class="btn btn--ghost" type="button" id="gateOther" data-i18n="gate.other">Войти другим аккаунтом</button>
+      <button class="btn btn--filled" type="button" id="gateNew" data-i18n="gate.create">Создать комнату</button>
+    </div>
+    <a class="gate__home" href="../" data-i18n="gate.home">На главную</a>
+  </div>
+</section>
+
+<script src="../i18n.js?v=20261006a"></script>
+<script src="../theme.js?v=20260812"></script>
+<script src="../vendor/centrifuge.js"></script>
+<!-- Скрипт ютуба (iframe_api) НЕ подключаем тегом: обычный <script src> держит
+     разбор страницы, а у операторов, где ютуб замедлен, запрос висит до
+     таймаута — room.js тогда не выполняется вовсе, и комната открывается
+     мёртвой (жалоба с айфона 18.08.2026). Его грузит whenYT() в room.js, и
+     только когда включают ролик с ютуба. Стережёт tests/room-youtube-hang.test.js. -->
+<script src="../pair.js?v=20261005a"></script>
+<script src="room.js?v=20261026a"></script>
+</body>
+</html>

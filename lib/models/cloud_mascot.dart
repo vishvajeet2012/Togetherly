@@ -1,0 +1,175 @@
+import 'mascot_anim.dart';
+import 'mood_pack.dart';
+
+/// Облачко — главный маскот Togetherly, коралловое, с глазами, как иконка.
+///
+/// Рисунок не меняется никогда: мастерская значков снимает его кадры из
+/// вектора (`bake_cloud.py`) и кладёт каждую сцену в каждом цвете отдельной
+/// анимацией в каталог, ключ `cloud_<сцена>_<цвет>`. Здесь только правила:
+/// какой цвет у настроения и что облачко делает сейчас.
+const String kCloudMascotId = 'cloud';
+
+/// Цвета облачка: обычный и семь настроений дня.
+const List<String> kCloudTints = ['base', 'joy', 'love', 'calm', 'sad', 'angry', 'tired', 'shy'];
+
+const Map<String, String> _tintOfMood = {
+  'happy': 'joy',
+  'laugh': 'joy',
+  'pride': 'joy',
+  'cool': 'joy',
+  'winking': 'joy',
+  'bliss': 'joy',
+  'drooling': 'joy',
+  'love': 'love',
+  'kiss': 'love',
+  'no_emotion': 'calm',
+  'sad': 'sad',
+  'very_sad': 'sad',
+  'hurt': 'sad',
+  'disappointed': 'sad',
+  'missing': 'sad',
+  'upset': 'sad',
+  'anxiety': 'sad',
+  'fear': 'sad',
+  'anger': 'angry',
+  'devil': 'angry',
+  'tired': 'tired',
+  'sleepy': 'tired',
+  'sick': 'tired',
+  'embarrassed': 'shy',
+};
+
+/// Цвет облачка по id настроения. Нет настроения или оно из пака, которого
+/// сборка не знает, — обычное коралловое.
+String cloudTintForMood(String? moodId) => _tintOfMood[moodId] ?? 'base';
+
+/// Id пака настроений «Облачко» в каталоге.
+const String kCloudMoodPackId = 'cloud';
+
+/// Анимация эмоции [moodId] из пака «Облачко», или null.
+///
+/// В покое маскот играет саму эмоцию, а не только цвет: «Дьявол» с рожками,
+/// «Крутая» в очках. Id настроений общие у всех паков, поэтому эмоция,
+/// выбранная из «Пёсика», на облачке тоже своя.
+String? cloudEmotionUrl(List<MoodPack> packs, String? moodId) {
+  if (moodId == null || moodId.isEmpty) return null;
+  for (final pack in packs) {
+    if (pack.id != kCloudMoodPackId) continue;
+    for (final mood in pack.moods) {
+      if (mood.id == moodId) return mood.imagePath;
+    }
+  }
+  return null;
+}
+
+/// Картинки всех эмоций пака Ту — их прогревают заранее: иначе новая эмоция
+/// начинала качаться только в момент выбора, и Ту менялся с задержкой.
+List<String> cloudEmotionWarmUrls(List<MoodPack> packs) => [
+      for (final pack in packs)
+        if (pack.id == kCloudMoodPackId)
+          for (final mood in pack.moods)
+            if (mood.imagePath.isNotEmpty) mood.imagePath,
+    ];
+
+/// Сцены Ту в цвете [tint], которые нужны на главной: их подгружают
+/// заранее вместе со слоями надетых вещей.
+List<String> cloudScenesFor(String tint) => [
+      for (final scene in const ['idle', 'tap', 'drag', 'miss_send', 'miss_get', 'joy', 'flip', 'burst']) 'cloud_${scene}_$tint',
+      'cloud_shake_base',
+      'cloud_sleep_base',
+      'cloud_sick_base',
+    ];
+
+/// То, что случилось на главной и перекрывает остальную жизнь облачка.
+enum CloudEvent { missSend, missGet, shake, burst }
+
+/// Ключ анимации облачка в каталоге.
+///
+/// Порядок важности: событие («Скучаю», встряска), руки человека, серия,
+/// затем покой — ночью сон, в годовщину праздник, у приболевшего партнёра
+/// градусник, иначе цвет настроения.
+/// Сон, праздник и встряска только обычного цвета: у них своё лицо.
+String cloudArt({
+  required MascotAnimState anim,
+  required String tint,
+  bool night = false,
+  bool anniversary = false,
+  bool sick = false,
+  CloudEvent? event,
+}) {
+  String key(String scene, String t) => 'cloud_${scene}_$t';
+  switch (event) {
+    case CloudEvent.missSend:
+      return key('miss_send', tint);
+    case CloudEvent.missGet:
+      return key('miss_get', tint);
+    case CloudEvent.shake:
+      return key('shake', 'base');
+    case CloudEvent.burst:
+      return key('burst', tint);
+    case null:
+      break;
+  }
+  switch (anim) {
+    case MascotAnimState.grab:
+    case MascotAnimState.drag:
+    case MascotAnimState.resize:
+      return key('drag', tint);
+    case MascotAnimState.drop:
+      return key('tap', tint);
+    case MascotAnimState.happy:
+      return key('joy', tint);
+    case MascotAnimState.grow:
+      return key('flip', tint);
+    case MascotAnimState.sad:
+      return key('idle', 'sad');
+    case MascotAnimState.live:
+    case MascotAnimState.freeze:
+      if (night) return key('sleep', 'base');
+      if (anniversary) return key('party', 'base');
+      if (sick) return key('sick', 'base');
+      return key('idle', tint);
+  }
+}
+
+/// Длина разовой сцены: после неё облачко возвращается к обычной жизни.
+/// Петли (покой, полёт за пальцем, сон) — null. Длины те же, что у петель
+/// в `mascot.js`.
+/// Сцены, которые запечены в цвете каждой эмоции пака (мастерская
+/// `bake_emotion_shake.py --scene=…`).
+const List<String> kCloudEmotionScenes = ['shake', 'tap', 'flip', 'drag', 'burst'];
+
+/// Сцена [art] в цвете выбранной эмоции: `cloud_<сцена>_emo_<id>`. Движение
+/// то же, что у обычной, а Ту остаётся цвета эмоции. Без этого касание,
+/// кувырок и встряска перекрашивали Ту в цвет настроения: серый «Без эмоций»
+/// становился бирюзовым. Null — обычная сцена: эмоции нет, сцена не из
+/// списка или её ещё нет в каталоге.
+String? cloudEmotionSceneArt({required String art, required String? mood, required bool Function(String key) hasArt}) {
+  if (mood == null || mood.isEmpty) return null;
+  for (final scene in kCloudEmotionScenes) {
+    if (!art.startsWith('cloud_${scene}_')) continue;
+    final key = 'cloud_${scene}_emo_$mood';
+    return hasArt(key) ? key : null;
+  }
+  return null;
+}
+
+/// Сцены выбранной эмоции, которые прогревают заранее вместе с обычными.
+List<String> cloudEmotionScenesFor(String? mood) =>
+    mood == null || mood.isEmpty ? const [] : [for (final scene in kCloudEmotionScenes) 'cloud_${scene}_emo_$mood'];
+
+Duration? cloudOneShot(String art) {
+  const ms = {
+    'tap': 2400,
+    'miss_send': 3600,
+    'miss_get': 3600,
+    'joy': 2600,
+    'flip': 2800,
+    'shake': 3800,
+    'burst': 2200, // ровно как BURST в mascot.js мастерской
+  };
+  for (final e in ms.entries) {
+    if (art.startsWith('cloud_${e.key}_')) return Duration(milliseconds: e.value);
+  }
+  return null;
+}

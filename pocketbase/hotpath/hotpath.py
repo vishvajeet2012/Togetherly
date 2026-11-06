@@ -1,0 +1,5019 @@
+#!/usr/bin/env python3
+"""Togetherly hotpath — PB-совместимый API горячих коллекций поверх Postgres.
+
+Зачем: единственный писатель PocketBase упирался в ~6 записей/с (цепочка хуков
+живёт на пути записи), и очередь клала весь прод — регистрацию, профиль, коды.
+Горячие коллекции вынесены сюда: Caddy заворачивает их маршруты
+`/api/collections/<имя>/records*` на 127.0.0.1:8120, приложение разницы не
+видит — формы запросов и ответов повторяют PocketBase один в один, вплоть до
+`Value must be unique` (на неё смотрит `alreadyExists` в pb_errors.dart).
+
+Хранение — Postgres из self-hosted Supabase (127.0.0.1:5433, база togetherly).
+Realtime — публикация в Centrifugo в канал `pair:<group_id>` тем же телом
+`{event, collection, record}`, что шлёт centrifugo.pb.js.
+
+Аутентификация: подпись токена PocketBase проверяется ЗДЕСЬ, тем же ключом,
+что использует сам PB, — HS256 с ключом `users.tokenKey + authToken.secret`
+коллекции (формула из core/record_tokens.go, живьём проверена смоуком:
+PB принимает токен, подписанный этим же способом). tokenKey и `group_ids`
+читаются напрямую из SQLite PocketBase в read-only: ходить в REST PB нельзя
+по двум причинам — его очередь записи в коллапсе и есть цель от неё не
+зависеть, а `group_ids` — скрытое поле, REST его не отдаёт даже владельцу.
+Членством в группе проверяются все операции — ровно как правила коллекций
+после миграции 13.08 (`@request.auth.group_ids.id ?= group_id`). Кэш на две
+минуты; протухание tokenKey (выход из аккаунта) подхватывается на промахе.
+
+Что повторено из серверной обвязки PB для вынесенных коллекций:
+  • страж чата (chat_guard.pb.js): не-автор правит только `reactions` и
+    `voice_heard_at`, `note_seen_at` и `note_hearts` (сердечки на фигурке
+    ставит смотрящий), жёсткое удаление — автору;
+  • счётчик `groups.messages_count` (counters.pb.js): +1 на создание, −1 на
+    жёсткое удаление; пишется прямо в SQLite PB фоновым воркером с батчингом;
+  • пуши (push_apns.pb.js + apns_push.js): чат и настроение — тем же релеям
+    APNs/FCM, с теми же текстами, порогом «на связи» и чисткой мёртвых токенов;
+  • колонка `updated` (autodate PB): заполняется здесь, формат PB
+    `YYYY-MM-DD HH:MM:SS.mmmZ` — по ней ходит водяной знак синхронизации.
+"""
+
+import asyncio
+import base64
+import fcntl
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import random
+import secrets
+import sqlite3
+import threading
+import time
+import subprocess
+import tempfile
+import shutil
+
+import asyncpg
+import httpx
+import orjson
+import uvicorn
+from fastapi import FastAPI, Request
+import movies
+from fastapi.responses import (ORJSONResponse, JSONResponse, Response,
+                               FileResponse)
+from sqlite_read import ReadyCache, build_list, load_fields, serialize
+
+log = logging.getLogger("hotpath")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# httpx пишет INFO на КАЖДЫЙ запрос, а публикаций в Centrifugo идёт под сотню
+# в секунду: полмиллиона строк в час уходили в journald, тот пишет их на диск
+# синхронно и отъедает процессор ровно на пике. Отказы публикации видно и на
+# уровне WARNING, а поток «200 OK» не говорит ничего.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+PG_DSN = os.environ["HOTPATH_PG_DSN"]
+PB_DB = os.environ.get("PB_DB", "/opt/pocketbase/pb_data/data.db")
+CENT_API = os.environ.get("CENTRIFUGO_API", "http://127.0.0.1:9000/api")
+CENT_KEY = os.environ.get("CENTRIFUGO_API_KEY", "")
+APNS_RELAY = os.environ.get("APNS_RELAY", "http://127.0.0.1:8096/push")
+FCM_RELAY = os.environ.get("FCM_RELAY", "http://127.0.0.1:8100/push")
+LISTEN_PORT = int(os.environ.get("HOTPATH_PORT", "8120"))
+# Окно «человек на связи» для пушей: один пропущенный удар присутствия.
+#
+# Клиент бьёт раз в 20 секунд и перестаёт сразу, как приложение уходит в фон.
+# Значит через 25 секунд после закрытия человек уже точно не смотрит в экран, и
+# сердце обязано прилететь пушем. Прежние две минуты давали ровно ту жалобу, с
+# которой пришли: «уведомление приходит через три-пять минут, а иногда вообще
+# нет» (17.08.2026).
+#
+# Цена ошибки в другую сторону мала: если удар потерялся в сети, человек в
+# приложении получит и баннер, и живое сердце на экране. Пропущенное
+# уведомление хуже лишнего.
+ONLINE_WINDOW_MS = 25 * 1000
+
+# Где лежит ИСТОЧНИК ПРАВДЫ по записи пары: пока «sqlite» — правит PocketBase,
+# hotpath только читает; «pg» — правит hotpath, а в SQLite уходит зеркало.
+# Флаг отделён от маршрута Caddy намеренно: код выкатывается и проверяется
+# заранее, а переключение остаётся отдельным движением, которое можно отменить.
+GROUPS_SRC = os.environ.get("HOTPATH_GROUPS", "sqlite")
+
+# Типы колонок: text | num | bool | json | auto (updated, ведём сами).
+COLLECTIONS = {
+    "canvas_strokes": {
+        "collection_id": os.environ.get("CID_CANVAS_STROKES", ""),
+        "columns": {
+            "canvas_id": "text", "group_id": "text", "order_index": "num",
+            "deleted": "bool", "data": "json",
+        },
+        "sortable": {"order_index", "id"},
+        "filterable": {"id", "group_id", "canvas_id", "deleted"},
+        "create_owner_field": None,
+        "guard": None,
+        "delete_guard": None,
+        "after_create": None,
+        "after_delete": None,
+        "default_sort": "order_index ASC, id ASC",
+    },
+    "chat_messages": {
+        "collection_id": os.environ.get("CID_CHAT_MESSAGES", "pbc_102036695"),
+        "columns": {
+            "color": "num", "deleted": "bool", "edited_ts": "num", "face": "text",
+            "face_x": "num", "face_y": "num", "group_id": "text", "pin_id": "text",
+            "pin_thumb": "text", "pin_title": "text", "reactions": "json",
+            "reply_to_id": "text", "reply_to_name": "text", "reply_to_text": "text",
+            "text": "text", "ts": "num", "user_name": "text", "user_uid": "text",
+            "updated": "auto", "text_color": "num", "voice_url": "text",
+            "voice_ms": "num", "voice_peaks": "text", "voice_heard_at": "num",
+            "note_url": "text", "note_ms": "num", "note_shape": "text",
+            "note_thumb": "text", "note_seen_at": "num", "note_hearts": "text",
+            "deliver_at": "num",
+            # Запись о звонке в комнате или лентах: длительность, мс.
+            "call_ms": "num",
+        },
+        # Сообщение «к утру» (28.09.2026): пока deliver_at в будущем, его видит
+        # только автор, партнёру оно не рассылается и пуш не уходит. Выпускает
+        # `_deliver_worker`: ставит ts = deliver_at и рассылает как обычное.
+        "hold": ("deliver_at", "user_uid"),
+        "sortable": {"ts", "updated", "id"},
+        "filterable": {"id", "group_id", "user_uid", "deleted", "ts", "updated",
+                       "text", "voice_url", "note_url", "pin_id"},
+        # Поиск по переписке: `text ~ 'слово'` → ILIKE внутри своей пары.
+        "searchable": {"text"},
+        "create_owner_field": None,
+        "guard": "chat",
+        "delete_guard": "author",
+        "after_create": "chat",
+        "after_delete": "chat",
+        "default_sort": "id ASC",
+    },
+    "memories": {
+        "collection_id": os.environ.get("CID_MEMORIES", "pbc_1337100956"),
+        "columns": {
+            "author_avatar": "text", "author_name": "text", "author_uid": "text",
+            "created_at": "date", "data": "json", "deleted": "bool",
+            "edited_at": "date", "group_id": "text", "is_pinned": "bool",
+            "type": "text", "updated": "auto", "tz": "text", "added_at": "date",
+        },
+        "sortable": {"created_at", "updated", "added_at", "id"},
+        "filterable": {"id", "group_id", "author_uid", "deleted", "type",
+                       "created_at", "updated", "is_pinned"},
+        "create_owner_field": "author_uid",   # createRule: автор — только сам
+        "guard": None,
+        "delete_guard": None,
+        "after_create": "memory",
+        "after_delete": "memory",
+        "default_sort": "id ASC",
+    },
+    "widget_data": {
+        "collection_id": os.environ.get("CID_WIDGET_DATA", "pbc_3321224104"),
+        "columns": {
+            "avatar_url": "text", "data": "json", "display_name": "text",
+            "gender": "text", "group_id": "text", "message": "text",
+            "mood_emoji": "text", "mood_label": "text", "music_artist": "text",
+            "music_cover_url": "text", "music_title": "text", "music_url": "text",
+            "photo_for_partner_url": "text", "photo_for_partner_urls": "json",
+            "photo_grid_count": "num", "photo_grid_urls": "json",
+            "photo_url": "text", "status": "text", "updated_at": "date",
+            "user_uid": "text", "updated": "auto", "plus": "bool",
+        },
+        "sortable": {"updated", "updated_at", "id"},
+        "filterable": {"id", "group_id", "user_uid", "updated"},
+        "create_owner_field": "user_uid",
+        "guard": None,
+        "delete_guard": None,
+        "after_create": "widget",
+        "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    "user_presence": {
+        "collection_id": os.environ.get("CID_USER_PRESENCE", "pbc_1624121044"),
+        "columns": {"seen_at": "num", "user_uid": "text"},
+        "sortable": {"seen_at", "id"},
+        "filterable": {"id", "user_uid", "seen_at"},
+        # listRule у presence — просто «залогинен»: партнёрское присутствие
+        # читают по user_uid, группы тут ни при чём.
+        "scope": "authed",
+        "create_owner_field": "user_uid",
+        "update_owner_field": "user_uid",
+        "channel": "user",          # публикуем в user:<user_uid>
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    "chat_typing": {
+        "collection_id": os.environ.get("CID_CHAT_TYPING", "pbc_1175427710"),
+        "columns": {"group_id": "text", "typing_at": "num", "user_uid": "text"},
+        "sortable": {"typing_at", "id"},
+        "filterable": {"id", "group_id", "user_uid"},
+        "create_owner_field": "user_uid",
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    "chat_reads": {
+        "collection_id": os.environ.get("CID_CHAT_READS", "pbc_932032954"),
+        "columns": {
+            "group_id": "text", "last_read_ts": "num", "updated_at": "date",
+            "user_uid": "text", "updated": "auto",
+        },
+        "sortable": {"updated", "id"},
+        "filterable": {"id", "group_id", "user_uid", "updated"},
+        "create_owner_field": "user_uid",
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    "live_location": {
+        "collection_id": os.environ.get("CID_LIVE_LOCATION", "pbc_1895612750"),
+        "columns": {"channel": "text", "data": "json", "user_uid": "text"},
+        "sortable": {"id"},
+        "filterable": {"id", "channel", "user_uid"},
+        # канал — либо личный (содержит свой uid), либо id своей пары.
+        "scope": "channel",
+        "create_owner_field": "user_uid",
+        "update_owner_field": "user_uid",
+        "channel": "loc",           # публикуем в loc:<channel>
+        "guard": None, "delete_guard": None,
+        # Будим второго из пары: его виджет «Где мы» перерисуется.
+        "after_create": "location", "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    "canvas_meta": {
+        "collection_id": os.environ.get("CID_CANVAS_META", "pbc_2121884867"),
+        "columns": {
+            "bg_color": "num", "canvas_id": "text", "canvas_rotation": "num",
+            "clear_version": "num", "group_id": "text", "updated_at": "date",
+            "coloring_id": "text", "coloring_mode": "text",
+            "coloring_done": "json", "coloring_swap": "bool",
+            "coloring_outline": "text",
+        },
+        "sortable": {"updated_at", "id"},
+        "filterable": {"id", "group_id", "canvas_id"},
+        "create_owner_field": None,
+        "guard": None,
+        "delete_guard": None,
+        "after_create": None,
+        "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # «Скучаю» и его собратья. Самая горячая запись вечера 14.08.2026: люди жали
+    # кнопку 58 раз в секунду с полусотни устройств, каждый тап открывал в
+    # PocketBase транзакцию, очередь к SQLite выросла до семи тысяч и вместе с
+    # ней встала регистрация. В Postgres такой поток — обычное дело.
+    "miss_you": {
+        "collection_id": os.environ.get("CID_MISS_YOU", "pbc_1227645100"),
+        "columns": {
+            "group_id": "text", "user_uid": "text", "count": "num",
+            "updated_at": "text", "last_vibe": "text", "last_vibe_text": "text",
+            # ВНИМАНИЕ: отдаём эти две карты СТРОКОЙ, а не объектом. В
+            # PocketBase поле было text, и выпущенные сборки читают его как
+            # строку: `miss?['by_weekday'] as String?` в профиле партнёра
+            # падает на объекте прямо внутри setState, экран остаётся с
+            # вечным спиннером (жалоба 15.08.2026). Форму ответа менять
+            # нельзя, пока живы старые сборки.
+            "by_weekday": "jsontext", "by_vibe": "jsontext", "updated": "auto",
+        },
+        "sortable": {"updated", "id"},
+        "filterable": {"id", "group_id", "user_uid", "updated"},
+        "create_owner_field": None,
+        "guard": None,
+        "delete_guard": None,
+        "after_create": None,
+        "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # Запись пары. Отличий от прочих три, и все существенные:
+    # 1) ключ доступа — не колонка group_id, а членство в самой строке
+    #    (правило PB у всех пяти действий одно: members ?~ @request.auth.id);
+    # 2) id записи И ЕСТЬ id пары, поэтому канал — pair:<id>, а не pair:<group_id>;
+    # 3) событие уходит ещё и в личные каналы обоих: иначе приглашающий не
+    #    увидит появление пары до перезапуска приложения (разбор 02.08.2026).
+    "groups": {
+        "collection_id": os.environ.get("CID_GROUPS", "pbc_3346940990"),
+        "columns": {
+            "members": "json", "member_names": "json", "member_avatars": "json",
+            "member_birthdays": "json", "member_moods": "json",
+            "member_ailments": "json", "max_members": "num",
+            "relationship_type": "text", "custom_relationship_label": "text",
+            "custom_relationship_emoji": "text",
+            "custom_relationship_types": "json", "start_date": "text",
+            "anniversary_date": "text", "first_kiss_date": "text",
+            "current_status": "json", "custom_statuses": "json",
+            "memories_count": "num", "drawings_count": "num",
+            "messages_count": "num", "xp": "num", "streak_days": "num",
+            "streak_last_opened_date": "text", "streak_pending_date": "text",
+            "streak_pending_uid": "text", "daily_tasks": "json",
+            "active_mascot_id": "text", "mascot_position_x": "num",
+            "mascot_position_y": "num", "mascot_scale": "num",
+            "mascots": "json", "mascot_streaks": "json", "timers": "json",
+            "active_session": "json", "owned_features": "json",
+            "waiting_mode": "bool", "placeholder_name": "text",
+            "placeholder_avatar": "text", "return_date": "text",
+            "claim_token": "text", "claim_uid": "text", "claim_name": "text",
+            "claim_at": "num", "disbanded": "bool", "disbanded_at": "text",
+            "created_at": "text", "chat_background": "text",
+            "updated": "auto",
+        },
+        "sortable": {"updated", "id"},
+        "filterable": {"id", "members", "disbanded", "updated", "claim_token"},
+        "scope": "members",
+        "channel": "group_record",
+        "create_owner_field": None,
+        "guard": None,
+        "delete_guard": None,
+        "after_create": None,
+        "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    "mood_entries": {
+        "collection_id": os.environ.get("CID_MOOD_ENTRIES", "pbc_1148030965"),
+        "columns": {
+            "group_id": "text", "image_path": "text", "label": "text",
+            "mood_id": "text", "timestamp": "date", "user_uid": "text",
+            "updated": "auto", "tz": "text",
+        },
+        "sortable": {"updated", "timestamp", "id"},
+        "filterable": {"id", "group_id", "user_uid", "mood_id", "timestamp", "updated"},
+        "create_owner_field": None,
+        "guard": None,
+        "delete_guard": None,
+        "after_create": "mood",
+        "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # Тест «Умение любить» (переезд 19.10.2026: 9 чтений в секунду под наплывом
+    # шли в пул чтения SQLite). Запись одна на человека в паре, id считает
+    # приложение (`loveTestRecordId`). Правила PB: читают оба из пары, заводит
+    # только автор и только в своей паре, правит и удаляет только автор.
+    # В канал пары PocketBase этот тест не рассылал, приложение его не слушает.
+    "love_tests": {
+        "collection_id": os.environ.get("CID_LOVE_TESTS", "pbc_3473979481"),
+        "columns": {
+            "group_id": "text", "user_uid": "text", "data": "json",
+            "total": "num", "updated": "auto",
+        },
+        "sortable": {"updated", "id"},
+        "filterable": {"id", "group_id", "user_uid", "updated"},
+        "create_owner_field": "user_uid",
+        "update_owner_field": "user_uid",
+        "channel": "none",
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # Маскоты пары (переезд 19.10.2026: 6 чтений в секунду и правки позиций).
+    # Правило PB у всех пяти действий одно — член пары. Ищутся по паре и
+    # mascot_id, уникальный индекс тот же, что в SQLite.
+    "mascots": {
+        "collection_id": os.environ.get("CID_MASCOTS", "pbc_1942193109"),
+        "columns": {
+            "group_id": "text", "mascot_id": "text", "name": "text",
+            "image_url": "text", "default_asset": "text", "created_by": "text",
+            "created_at": "date", "is_default": "bool", "record_streak": "num",
+            "updated": "auto",
+        },
+        "sortable": {"updated", "created_at", "id"},
+        "filterable": {"id", "group_id", "mascot_id", "is_default", "updated"},
+        "create_owner_field": None,
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # Отметки цикла (переезд 19.10.2026). Правило PB: свои видны всегда,
+    # партнёрские только с `shared`; заводит человек свои и только в своей
+    # паре, правит и удаляет только свои. Канал пары тот же, что раздавала
+    # сборка PocketBase (`rtCollections`).
+    "cycle_entries": {
+        "collection_id": os.environ.get("CID_CYCLE_ENTRIES", "pbc_3289459707"),
+        "columns": {
+            "group_id": "text", "user_uid": "text", "day": "date",
+            "kind": "text", "flow": "text", "shared": "bool",
+            "created": "created", "updated": "auto",
+        },
+        "scope": "own_or_shared",
+        "sortable": {"day", "updated", "created", "id"},
+        "filterable": {"id", "group_id", "user_uid", "day", "kind", "shared", "updated"},
+        "create_owner_field": "user_uid",
+        "update_owner_field": "user_uid",
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # Желания пары (переезд 19.10.2026, страж — перенос wishes_guard.pb.js).
+    # Заводит автор от своего имени, «сбылось» отмечает любой из пары, но
+    # не-автор правит только поля отметки; удаляет только автор.
+    "wishes": {
+        "collection_id": os.environ.get("CID_WISHES", "pbc_3927760422"),
+        "columns": {
+            "group_id": "text", "author_uid": "text", "title": "text",
+            "note": "text", "category": "text", "symbol": "text",
+            "done": "bool", "done_at": "date", "done_by": "text",
+            "done_note": "text", "kind": "text", "price": "num",
+            "currency": "text", "url": "text", "image": "text", "shop": "text",
+            "created": "created", "updated": "auto",
+        },
+        "sortable": {"created", "updated", "id"},
+        "filterable": {"id", "group_id", "author_uid", "done", "updated", "created"},
+        "create_owner_field": "author_uid",
+        "author_field": "author_uid",
+        "guard": "wishes", "delete_guard": "author",
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # Свои категории желаний (переезд 19.10.2026): заводит автор, правит и
+    # удаляет любой из пары.
+    "wish_categories": {
+        "collection_id": os.environ.get("CID_WISH_CATEGORIES", "pbc_487999210"),
+        "columns": {
+            "group_id": "text", "author_uid": "text", "title": "text",
+            "symbol": "text", "note": "text",
+            "created": "created", "updated": "auto",
+        },
+        "sortable": {"created", "updated", "id"},
+        "filterable": {"id", "group_id", "author_uid", "updated", "created"},
+        "create_owner_field": "author_uid",
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+    # Настройки приложения (19.10.2026): только чтение и без входа, как
+    # пустое правило PB. Источник правды остаётся в SQLite: его правят руками
+    # и читают хуки, а сюда копию кладёт `_app_config_worker`.
+    "app_config": {
+        "collection_id": os.environ.get("CID_APP_CONFIG", "pbc_3476648556"),
+        "columns": {
+            "min_build": "num", "updated_at": "date", "gifts_enabled": "bool",
+            "wishes_enabled": "bool", "widget_diag_enabled": "bool",
+            "wallet": "json", "chest_enabled": "bool", "room_native_ios": "num",
+            # Кому показывать облачко-гида (31.10.2026, `mascotGuideOn`).
+            "mascot_guide": "json",
+            # Пороги званий за часы (05.11.2026, `parseRankHours`).
+            "rank_hours": "json",
+        },
+        "scope": "public",
+        "read_only": True,
+        "channel": "none",
+        "sortable": {"id"},
+        "filterable": {"id"},
+        "create_owner_field": None,
+        "guard": None, "delete_guard": None,
+        "after_create": None, "after_delete": None,
+        "default_sort": "id ASC",
+    },
+}
+
+app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None,
+              default_response_class=ORJSONResponse)
+pg: asyncpg.Pool | None = None
+cent_client: httpx.AsyncClient | None = None
+push_client: httpx.AsyncClient | None = None
+pb_client: httpx.AsyncClient | None = None   # проксирование редких записей в PocketBase
+wd_client: httpx.AsyncClient | None = None   # Викиданные и poiskkino для поиска фильмов
+lite: sqlite3.Connection | None = None      # read-only: auth, группы, presence
+lite_rw: sqlite3.Connection | None = None   # счётчики групп и чистка токенов
+_bg_lock_fd: int | None = None             # замок роли фоновых задач
+auth_secret = ""
+_lite_lock = asyncio.Lock()
+# Соединение записи в SQLite ОДНО на процесс, а пишущих задач несколько:
+# зеркало пар, списки групп, счётчики, отметки присутствия, чистка токенов.
+# Они живут в разных потоках (asyncio.to_thread), и без общего замка их
+# транзакции наезжают друг на друга: «cannot start a transaction within a
+# transaction», после чего правка молча не доезжает до SQLite.
+_lite_rw_lock = threading.Lock()
+_counter_deltas: dict = {}                 # (group_id, поле) -> дельта
+
+# ── совместимость с PocketBase: время и ошибки ───────────────────────────────
+
+
+def now_pb() -> str:
+    t = time.time()
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t)) + f".{int(t * 1000) % 1000:03d}Z"
+
+
+def _err(code: int, message: str, data: dict | None = None) -> ORJSONResponse:
+    return ORJSONResponse(
+        {"code": code, "message": message, "data": data or {}}, status_code=code
+    )
+
+
+# ── аутентификация ───────────────────────────────────────────────────────────
+
+_AUTH_TTL = 120.0
+_AUTH_CACHE_MAX = 30000
+_auth_cache: dict[str, tuple[float, str]] = {}
+
+# Список пар человека живёт отдельно от подписи токена и обновляется быстро.
+#
+# Пока он лежал в общем кэше на две минуты, только что принятый в пару видел
+# ПУСТОЙ чат и пустую ленту: правила фильтруют записи по group_id, а сервер эти
+# две минуты помнил прежний состав. Ровно так же работало и наоборот — вышедший
+# из пары ещё две минуты читал чужую переписку. Дорогая часть проверки (HMAC по
+# токену) кэшируется по-прежнему надолго, состав пар — на несколько секунд:
+# это один SELECT по первичному ключу в SQLite, он дешевле переспросить.
+_GROUPS_TTL = 5.0
+_GROUPS_CACHE_MAX = 30000
+_groups_cache: dict[str, tuple[float, frozenset]] = {}
+_USERS_COLLECTION_ID = "_pb_users_auth_"
+
+
+def _jwt_payload(token: str) -> dict:
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return {}
+
+
+def _user_has_plus(uid: str) -> bool:
+    # Пробный Плюс из сундука живёт в plus_trial_until и тоже считается
+    try:
+        row = lite.execute(
+            "SELECT plus, plus_trial_until FROM users WHERE id = ?", (uid,)
+        ).fetchone()
+        if not row:
+            return False
+        return bool(row[0]) or float(row[1] or 0) > _now_ms()
+    except sqlite3.Error:
+        return False
+
+
+def _lite_user(uid: str) -> tuple[str, frozenset] | None:
+    """tokenKey и группы юзера из SQLite PocketBase (read-only, WAL пускает
+    читателей всегда). group_ids хранится json-текстом, бывает и голой строкой."""
+    row = lite.execute(
+        "SELECT tokenKey, group_ids FROM users WHERE id = ?", (uid,)
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row[1]
+    groups: list = []
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            groups = parsed if isinstance(parsed, list) else [parsed]
+        except ValueError:
+            groups = [raw]
+    return row[0], frozenset(str(g) for g in groups if g)
+
+
+async def _группы_человека(uid: str, now: float) -> frozenset:
+    """Список пар человека — из SQLite, с коротким кэшем.
+
+    Живёт отдельно от подписи токена: состав пар меняется, пока человек сидит
+    с тем же токеном (его приняли в пару, он вышел из пары), и правила доступа
+    обязаны догонять это за секунды, а не за две минуты.
+    """
+    hit = _groups_cache.get(uid)
+    if hit and hit[0] > now:
+        return hit[1]
+    found = await asyncio.to_thread(_lite_user, uid)
+    groups = found[1] if found else frozenset()
+    if len(_groups_cache) >= _GROUPS_CACHE_MAX:
+        _groups_cache.clear()
+    _groups_cache[uid] = (now + _GROUPS_TTL, groups)
+    return groups
+
+
+async def _auth(request: Request) -> tuple[str, frozenset] | None:
+    """Токен -> (uid, группы) или None. Подпись сверяется локально — той же
+    формулой, что у PocketBase: HS256(tokenKey записи + секрет коллекции)."""
+    token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        return None
+    now = time.monotonic()
+    hit = _auth_cache.get(token)
+    if hit and hit[0] > now:
+        return hit[1], await _группы_человека(hit[1], now)
+
+    payload = _jwt_payload(token)
+    uid = str(payload.get("id") or "")
+    if (
+        not uid
+        or payload.get("type") != "auth"
+        or payload.get("collectionId") != _USERS_COLLECTION_ID
+        or not isinstance(payload.get("exp"), int)
+        or payload["exp"] <= int(time.time())
+    ):
+        return None
+    found = await asyncio.to_thread(_lite_user, uid)
+    if found is None:
+        return None
+    token_key, groups = found
+    head, body, sig = token.split(".")
+    want = base64.urlsafe_b64encode(
+        hmac.new((token_key + auth_secret).encode(),
+                 f"{head}.{body}".encode(), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    if not hmac.compare_digest(want, sig):
+        return None
+    if len(_auth_cache) >= _AUTH_CACHE_MAX:
+        _auth_cache.clear()
+    _auth_cache[token] = (now + _AUTH_TTL, uid)
+    if len(_groups_cache) >= _GROUPS_CACHE_MAX:
+        _groups_cache.clear()
+    _groups_cache[uid] = (now + _GROUPS_TTL, groups)
+    return uid, groups
+
+
+# ── записи: сериализация и разбор фильтров ───────────────────────────────────
+
+
+def _new_id() -> str:
+    # У PB тут дефолт 'r' || hex(randomblob(7)) — 15 символов.
+    return "r" + secrets.token_hex(7)
+
+
+def _num(v):
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return v
+
+
+def _record_json(col: str, row) -> dict:
+    meta = COLLECTIONS[col]
+    out = {
+        "id": row["id"],
+        "collectionId": meta["collection_id"],
+        "collectionName": col,
+    }
+    for field, kind in meta["columns"].items():
+        v = row[field]
+        if kind == "num":
+            out[field] = _num(v if v is not None else 0)
+        elif kind == "bool":
+            out[field] = bool(v)
+        elif kind == "json":
+            if isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except ValueError:
+                    v = None
+            out[field] = v
+        elif kind == "jsontext":
+            # json в базе, строка в ответе — ради совместимости со сборками
+            if v is None:
+                out[field] = ""
+            elif isinstance(v, str):
+                out[field] = v
+            else:
+                out[field] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[field] = v if v is not None else ""
+    return out
+
+
+_COND = re.compile(
+    r"""^\s*\(*\s*(\w+)\s*(!=|>=|<=|=|>|<|~)\s*"""
+    r"""(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|(true|false)|(-?\d+(?:\.\d+)?))"""
+    r"""\s*\)*\s*$"""
+)
+# `~` у PocketBase — поиск подстроки. Приложение шлёт его в двух смыслах:
+# `members ~ '<uid>'` («состоит ли человек в паре», на jsonb это containment
+# по индексу) и `text ~ 'слово'` — поиск по переписке (28.09.2026). Второй
+# разрешён только колонкам из `searchable` коллекции и всегда внутри своих
+# пар: правило группы добавляет `group_id` к любому запросу, поэтому скан идёт
+# по одной переписке, а не по миллионам сообщений всех пар.
+_OPS = {"=": "=", "!=": "<>", ">": ">", "<": "<", ">=": ">=", "<=": "<=",
+        "~": "~"}
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _held(meta: dict, rec: dict) -> bool:
+    """Запись придержана до своего срока (сообщение «к утру»)."""
+    hold = meta.get("hold")
+    if not hold:
+        return False
+    try:
+        return float(rec.get(hold[0]) or 0) > _now_ms()
+    except (TypeError, ValueError):
+        return False
+
+
+def _hold_cond(meta: dict, uid: str, args: list) -> str | None:
+    """Условие «придержанное видит только автор» для SELECT."""
+    hold = meta.get("hold")
+    if not hold:
+        return None
+    field, owner = hold
+    args.append(float(_now_ms()))
+    args.append(uid)
+    return (f"({field} IS NULL OR {field} = 0 OR {field} <= ${len(args) - 1} "
+            f"OR {owner} = ${len(args)})")
+
+
+def _like_pattern(s: str) -> str:
+    """Подстрока для ILIKE: `%` и `_` из запроса — буквы, а не шаблон."""
+    return "%" + s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _parse_filter(expr: str, allowed: set) -> list[tuple[str, str, object]]:
+    """Разбирает конъюнкцию условий `f = 'v' && f2 > 'w' && f3 != true` —
+    ровно то подмножество синтаксиса PB, которым пользуется приложение
+    (включая водяной знак `updated > '...'`). Неразбираемое — ValueError."""
+    out = []
+    if not expr:
+        return out
+    for part in expr.split("&&"):
+        m = _COND.match(part)
+        if not m:
+            raise ValueError(part)
+        field, op, v_sq, v_dq, v_bool, v_numlit = m.groups()
+        if field not in allowed:
+            raise ValueError(field)
+        if v_bool is not None:
+            val: object = v_bool == "true"
+        elif v_numlit is not None:
+            val = float(v_numlit)
+        else:
+            raw = v_sq if v_sq is not None else (v_dq or "")
+            val = raw.replace("\\'", "'").replace('\\"', '"')
+        if op == "~" and not isinstance(val, str):
+            raise ValueError(part)
+        out.append((field, _OPS[op], val))
+    return out
+
+
+def _coerce(col: str, field: str, val: object) -> object:
+    """Значение фильтра к типу колонки: сравнение с num-колонкой числом."""
+    kind = COLLECTIONS[col]["columns"].get(field)
+    if kind == "num" and isinstance(val, str):
+        try:
+            return float(val)
+        except ValueError:
+            return val
+    if kind == "bool" and isinstance(val, str):
+        return val == "true"
+    return val
+
+
+# ── realtime и пуши ──────────────────────────────────────────────────────────
+
+
+async def _publish(col: str, event: str, record: dict) -> None:
+    # Каналы те же, что раздаёт сборка PocketBase (centChannels в main.go):
+    # присутствие в user:<uid>, геопозиция в loc:<channel>, запись пары — в
+    # pair:<id> И в личные каналы обоих участников, остальное в pair:<group_id>.
+    kind = COLLECTIONS[col].get("channel", "pair")
+    if kind == "none":
+        return
+    if kind == "user":
+        chans = ["user:" + (record.get("user_uid") or "")]
+    elif kind == "loc":
+        chans = ["loc:" + (record.get("channel") or "")]
+    elif kind == "group_record":
+        chans = ["pair:" + (record.get("id") or "")]
+        участники = record.get("members")
+        if isinstance(участники, list):
+            chans += ["user:" + str(m) for m in участники if m]
+    else:
+        chans = ["pair:" + (record.get("group_id") or "")]
+    chans = [c for c in chans if not c.endswith(":")]
+    if not chans or not CENT_KEY:
+        return
+    data = {"event": event, "collection": col, "record": record}
+    for chan in chans:
+        try:
+            await cent_client.post(
+                "/publish",
+                json={"channel": chan, "data": data},
+                headers={"X-API-Key": CENT_KEY},
+            )
+        except httpx.HTTPError:
+            pass  # realtime — best effort, как и в хуке
+
+
+def _push_candidates(group_id: str, author_uid: str,
+                     members: list | None = None) -> list[dict]:
+    """Участники группы с их токенами. Токены живут в users, то есть в SQLite
+    PocketBase, всегда. Состав пары приходит параметром, когда источник правды
+    уже переехал в Postgres; иначе читается тут же, рядом с токенами.
+    Кто сейчас на связи, решается отдельно: присутствие живёт в Postgres."""
+    if members is None:
+        g = lite.execute(
+            "SELECT members, disbanded FROM groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if g is None or g[1]:
+            return []
+        try:
+            members = json.loads(g[0] or "[]") or []
+        except ValueError:
+            members = []
+    out = []
+    for uid in members:
+        uid = str(uid or "")
+        if not uid or uid == author_uid:
+            continue
+        u = lite.execute(
+            "SELECT apns_token, apns_sandbox, fcm_token, apns_bg_ms, "
+            "notif_chat, notif_mood, notif_new_memory, notif_miss_you, "
+            "notif_synced_at "
+            "FROM users WHERE id = ?",
+            (uid,),
+        ).fetchone()
+        if u is None:
+            continue
+        out.append({"uid": uid, "apns": u[0] or "", "sandbox": bool(u[1]),
+                    "fcm": u[2] or "", "bg_ms": int(u[3] or 0),
+                    # Выключатели уведомлений из приложения — их читает
+                    # `_уведомление_разрешено` перед отправкой. Пустая метка
+                    # `notif_synced_at` значит, что телефон их ещё не присылал,
+                    # и тогда нули не считаются выбором человека.
+                    "notif_chat": u[4], "notif_mood": u[5],
+                    "notif_new_memory": u[6], "notif_miss_you": u[7],
+                    "notif_synced_at": u[8]})
+    return out
+
+
+async def _online_uids(uids: list[str]) -> set:
+    """Кто из них на связи — по presence в Postgres (окно две минуты)."""
+    if not uids:
+        return set()
+    edge = int(time.time() * 1000) - ONLINE_WINDOW_MS
+    try:
+        async with pg.acquire() as c:
+            rows = await c.fetch(
+                "SELECT user_uid FROM user_presence WHERE user_uid = ANY($1) AND seen_at > $2",
+                uids, float(edge))
+        return {r["user_uid"] for r in rows}
+    except Exception as e:
+        log.warning("presence lookup: %s", e)
+        return set()   # не знаем — лучше прислать пуш, чем промолчать
+
+
+async def _members_pg(group_id: str) -> list | None:
+    """Состав живой пары из Postgres. None — пары нет или она распущена."""
+    async with pg.acquire() as c:
+        row = await c.fetchrow(
+            "SELECT members, disbanded FROM groups WHERE id = $1", group_id)
+    if row is None or row["disbanded"]:
+        return None
+    m = row["members"]
+    if isinstance(m, str):
+        try:
+            m = json.loads(m)
+        except ValueError:
+            m = []
+    return [str(x) for x in (m or []) if x]
+
+
+# Виды уведомлений, которые уходят ВСЕГДА, даже когда человек в приложении.
+#
+# «Скучаю» — это импульс внимания: его смысл в том, что он приходит в любой
+# момент. Отметка присутствия пишется на сервер редко (раз в пять минут, см.
+# PresenceLiveness.lastSeenWrite), поэтому по ней нельзя судить, смотрит человек
+# в экран или нет: она то устаревает у сидящего в приложении, то остаётся свежей
+# у закрывшего его. Ставка на такую отметку и давала «уведомления приходят
+# только при открытом приложении» (две пары, 17.08.2026). Пропущенное сердце
+# хуже лишнего баннера, поэтому здесь фильтр не применяется вовсе.
+БЕЗ_ФИЛЬТРА_ОНЛАЙНА = {"miss"}
+
+
+async def _push_targets(group_id: str, author_uid: str,
+                        thread: str = "") -> list[dict]:
+    """Кому слать: участники группы, кроме автора и тех, кто сейчас на связи."""
+    members = None
+    if GROUPS_SRC == "pg":
+        members = await _members_pg(group_id)
+        if members is None:
+            return []
+    cand = await asyncio.to_thread(_push_candidates, group_id, author_uid, members)
+    if not cand:
+        return []
+    if thread in БЕЗ_ФИЛЬТРА_ОНЛАЙНА:
+        return cand
+    online = await _online_uids([t["uid"] for t in cand])
+    return [t for t in cand if t["uid"] not in online]
+
+
+def _forget_token(uid: str, field: str) -> None:
+    try:
+        with _lite_rw_lock:
+            lite_rw.execute(f"UPDATE users SET {field} = '' WHERE id = ?", (uid,))
+            lite_rw.commit()
+    except sqlite3.Error:
+        pass  # попробуем в следующий раз
+
+
+async def _notify_group(group_id: str, author_uid: str, title: str, body: str,
+                        thread: str) -> int:
+    """Пуш всем в группе, кроме автора — как notifyGroup в apns_push.js.
+
+    Возвращает, сколько пушей реально ушло. Это нужно гейту частоты: отметку
+    «уже отправляли» нельзя ставить, когда адресатов не осталось (например, все
+    сейчас в приложении), иначе проглоченная попытка крадёт следующую минуту.
+    """
+    try:
+        targets = await _push_targets(group_id, author_uid, thread)
+    except Exception as e:
+        log.warning("push targets %s: %s", group_id, e)
+        return 0
+    отправлено = 0
+    for t in targets:
+        # Человек выключил этот вид уведомлений в приложении — молчим.
+        # Переключатели доезжали до сервера с самого начала, но их не читал
+        # никто: «Скучаю» было выключено у 16 507 человек, и все получали его
+        # по-прежнему (жалоба 16.08.2026).
+        if not _уведомление_разрешено(thread, t):
+            continue
+        if t["apns"]:
+            try:
+                r = await push_client.post(APNS_RELAY, json={
+                    "token": t["apns"], "title": title, "body": body,
+                    "thread": thread, "sandbox": t["sandbox"], "data": {"kind": thread},
+                })
+                if (r.json() or {}).get("gone"):
+                    await asyncio.to_thread(_forget_token, t["uid"], "apns_token")
+                else:
+                    отправлено += 1
+            except Exception as e:
+                log.warning("apns %s: %s", t["uid"], e)
+        if t["fcm"]:
+            try:
+                r = await push_client.post(FCM_RELAY, json={
+                    "token": t["fcm"], "title": title, "body": body,
+                    # Одна строка на вид события — как в apns_push.js.
+                    "tag": thread, "data": {"kind": thread},
+                })
+                if (r.json() or {}).get("gone"):
+                    await asyncio.to_thread(_forget_token, t["uid"], "fcm_token")
+                else:
+                    отправлено += 1
+            except Exception as e:
+                log.warning("fcm %s: %s", t["uid"], e)
+    return отправлено
+
+
+MIN_WAKE_GAP_MS = 15 * 60 * 1000
+
+
+def _mark_woke(uid: str, now_ms: int) -> None:
+    try:
+        lite_rw.execute("UPDATE users SET apns_bg_ms = ? WHERE id = ?", (now_ms, uid))
+        lite_rw.commit()
+    except sqlite3.Error:
+        pass  # отметка не критична: в худшем случае разбудим раньше
+
+
+async def _wake_group(group_id: str, author_uid: str, kind: str = "widgets") -> None:
+    """Тихий пуш «проснись и обнови виджеты» — перенос wakeGroup/wakeUp из
+    apns_push.js. Apple лимитирует такие пуши, поэтому будим не чаще раза в
+    15 минут на устройство и только тех, кто сейчас не на связи."""
+    try:
+        targets = await _push_targets(group_id, author_uid)
+    except Exception as e:
+        log.warning("wake targets %s: %s", group_id, e)
+        return
+    await _wake_targets(targets, kind)
+
+
+async def _wake_targets(targets: list[dict], kind: str = "widgets") -> None:
+    """Тихий пуш каждому из [targets], кого не будили последние 15 минут."""
+    now_ms = int(time.time() * 1000)
+    for t in targets:
+        if not t["apns"] and not t["fcm"]:
+            continue
+        if t["bg_ms"] and now_ms - t["bg_ms"] < MIN_WAKE_GAP_MS:
+            continue
+        woke = False
+        if t["apns"]:
+            try:
+                r = await push_client.post(APNS_RELAY, json={
+                    "token": t["apns"], "silent": True,
+                    "sandbox": t["sandbox"], "data": {"kind": kind}})
+                a = r.json() or {}
+                if a.get("gone"):
+                    await asyncio.to_thread(_forget_token, t["uid"], "apns_token")
+                elif a.get("ok"):
+                    woke = True
+            except Exception as e:
+                log.warning("apns wake %s: %s", t["uid"], e)
+        if t["fcm"]:
+            try:
+                r = await push_client.post(FCM_RELAY, json={
+                    "token": t["fcm"], "silent": True, "data": {"kind": kind}})
+                a = r.json() or {}
+                if a.get("gone"):
+                    await asyncio.to_thread(_forget_token, t["uid"], "fcm_token")
+                elif a.get("ok"):
+                    woke = True
+            except Exception as e:
+                log.warning("fcm wake %s: %s", t["uid"], e)
+        if woke:
+            await asyncio.to_thread(_mark_woke, t["uid"], now_ms)
+
+
+def _второй_из_канала(канал: str, автор: str) -> str:
+    """Второй из пары по каналу точки `pair_<uid1>_<uid2>`; пусто — не знаем.
+
+    У `live_location` нет `group_id`: пара зашита в имени канала. Старые сборки
+    писали точку в канал с id группы — там партнёра не видно, и будить наугад
+    нельзя.
+    """
+    if not канал.startswith("pair_"):
+        return ""
+    части = канал[5:].split("_")
+    if len(части) != 2 or автор not in части:
+        return ""
+    return части[1] if части[0] == автор else части[0]
+
+
+async def _wake_channel(channel: str, author_uid: str) -> None:
+    """Точка на карте сдвинулась — будим второго из пары: виджет «Где мы» у
+    него перерисуется (19.09.2026). На iPhone другого способа поднять
+    приложение в фоне нет, на Android тот же пуш запускает обновление
+    виджетов. Частота — как у `_wake_group`: не чаще раза в 15 минут на
+    устройство и только тем, кто сейчас не в приложении."""
+    uid = _второй_из_канала(channel or "", author_uid or "")
+    if not uid:
+        return
+    try:
+        cand = await asyncio.to_thread(_push_candidates, "", "", [uid])
+        online = await _online_uids([t["uid"] for t in cand])
+        targets = [t for t in cand if t["uid"] not in online]
+    except Exception as e:
+        log.warning("wake channel %s: %s", channel, e)
+        return
+    await _wake_targets(targets, "widgets")
+
+
+# Вид уведомления → колонка выключателя в users. Пустое поле означает
+# «включено»: у старых аккаунтов этих колонок нет вовсе, и молчать им нельзя.
+ВЫКЛЮЧАТЕЛИ = {
+    "chat": "notif_chat",
+    "mood": "notif_mood",
+    "memory": "notif_new_memory",
+    "miss": "notif_miss_you",
+}
+
+
+def _настройки_известны(человек: dict) -> bool:
+    """Говорил ли телефон, каких уведомлений человек хочет.
+
+    Метку `notif_synced_at` шлют сборки с 06.09.2026, а выключатели ехали и
+    раньше — поэтому единица в любом из них тоже считается ответом: булево поле
+    PocketBase заводит нулём, само оно не встанет. Без этого на время раскатки
+    замолчали бы выключатели у всех сразу.
+    """
+    if str(человек.get("notif_synced_at") or "").strip():
+        return True
+    return any(человек.get(колонка) for колонка in ВЫКЛЮЧАТЕЛИ.values())
+
+
+def _уведомление_разрешено(вид: str, человек: dict) -> bool:
+    """Не выключил ли человек этот вид уведомлений в приложении.
+
+    Переключатели доезжали до сервера с самого начала, но их никто не читал:
+    пуши уходили всем подряд. На 16.08.2026 «Скучаю» было выключено у 16 507
+    человек — и все они его получали (жалоба «уведомления не выключаются»).
+
+    Обратная сторона нашлась 06.09.2026. Колонки булевы, у нового аккаунта в
+    них ноль, а отправлял их только экран профиля — кто не заходил на вкладку
+    «Профиль», не получал НИЧЕГО, хотя в приложении все тумблеры включены
+    (18 481 аккаунт, у 7 421 живой токен). Ноль без метки `notif_synced_at`
+    означает «телефон ещё не сказал, чего хочет», а не «выключено»; метку
+    ставит клиент вместе с настройками.
+    """
+    if not _настройки_известны(человек):
+        return True
+    колонка = ВЫКЛЮЧАТЕЛИ.get(вид)
+    if колонка is None:
+        return True
+    значение = человек.get(колонка)
+    if значение is None:
+        return True
+    return bool(значение)
+
+
+# Когда паре последний раз уходил пуш «Скучаю» — чтобы серия нажатий не
+# превратилась в лавину уведомлений. Держим в памяти процесса: точность тут не
+# нужна, важно снять поток.
+_МОЛЧАНИЕ_MISS_MS = 60_000
+_последний_miss: dict[str, int] = {}
+
+
+def _можно_слать_miss(group_id: str, теперь_мс: int) -> bool:
+    """Не чаще раза в минуту на пару — только проверка, без отметки.
+
+    Человек жмёт сердце подряд, клиент копит нажатия и шлёт их пачками по
+    двадцать — и на каждую пачку уходило отдельное уведомление. Со стороны
+    партнёра это «уведомления без остановки» (жалоба 16.08.2026). Счёт при
+    этом прибавляется весь, теряется только шум в шторке.
+
+    Отметка вынесена в [_отметить_miss] и ставится ПОСЛЕ фактической отправки.
+    Пока она стояла здесь, минуту крала любая попытка, даже когда пуш никому не
+    ушёл: партнёр закрыл приложение, но его отметка присутствия ещё свежая —
+    адресатов ноль, зато следующее сердце уже молчит. Отсюда жалобы «приходит с
+    задержкой три-пять минут, а иногда вообще нет» (17.08.2026).
+    """
+    было = _последний_miss.get(group_id)
+    return было is None or теперь_мс - было >= _МОЛЧАНИЕ_MISS_MS
+
+
+def _отметить_miss(group_id: str, теперь_мс: int) -> None:
+    """Запомнить, что пуш этой паре ушёл."""
+    _последний_miss[group_id] = теперь_мс
+    # Карта не должна расти без края: чистим давние записи пачкой.
+    if len(_последний_miss) > 20_000:
+        порог = теперь_мс - _МОЛЧАНИЕ_MISS_MS
+        for k in [k for k, v in _последний_miss.items() if v < порог]:
+            _последний_miss.pop(k, None)
+
+
+# Насколько часы телефона могут расходиться с сервером, чтобы мы всё ещё верили
+# отметке времени сообщения.
+РАСХОЖДЕНИЕ_ЧАСОВ_MS = 2 * 60 * 1000
+
+# Сообщение, написанное без сети раньше этого срока, встаёт на время доставки:
+# такая давность — уже мусор в часах, а не офлайн.
+ДАВНОСТЬ_ОФЛАЙНА_MS = 7 * 24 * 3600 * 1000
+
+
+def _мс(значение) -> int:
+    try:
+        return int(float(значение))
+    except (TypeError, ValueError):
+        return 0
+
+
+def время_сообщения(своё_мс, серверное_мс: int, отправлено_мс=None) -> int:
+    """Отметка времени для сообщения чата.
+
+    Порядок в чате держится на `ts`, а ставит его телефон отправителя. Когда
+    часы врут, ответ получает меньшее время и встаёт ВЫШЕ сообщения, на которое
+    отвечает — жалоба «почему-то ответ оказывается выше сообщения» (17.08.2026).
+
+    Новые сборки присылают и свои часы в момент отправки (`отправлено_мс`).
+    Разница с серверными — это сдвиг часов телефона, и на неё правится время
+    написания: сообщение из офлайна встаёт туда, где его написали. Без этого
+    «окей», написанное в 11:27 и довезённое очередью в 13:12, вставало
+    ответом на новое сообщение партнёра — «бот сам за меня отвечает»
+    (обращение 409, 21.10.2026).
+
+    Старые сборки часов отправки не шлют: своё время оставляем, пока оно похоже
+    на правду, а разошлось больше пары минут — берём серверное, иначе один
+    сбитый телефон перемешивает переписку обоим.
+    """
+    своё = _мс(своё_мс)
+    if своё <= 0:
+        return серверное_мс
+    отправлено = _мс(отправлено_мс)
+    if отправлено > 0:
+        написано = своё + (серверное_мс - отправлено)
+        if написано > серверное_мс:
+            return серверное_мс
+        if серверное_мс - написано > ДАВНОСТЬ_ОФЛАЙНА_MS:
+            return серверное_мс
+        return написано
+    if abs(серверное_мс - своё) > РАСХОЖДЕНИЕ_ЧАСОВ_MS:
+        return серверное_мс
+    return своё
+
+
+def _мкс_даты(значение) -> int | None:
+    """ISO-строка телефона или базы → микросекунды UTC. Мусор даёт None.
+
+    Python 3.10 на сервере не понимает «Z» и дробь не из 3 или 6 цифр,
+    поэтому строка приводится к виду, который он читает.
+    """
+    from datetime import datetime, timezone
+    if not isinstance(значение, str) or not значение.strip():
+        return None
+    s = значение.strip().replace(" ", "T")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    дата, _, хвост = s.partition("T")
+    if "." in хвост:
+        секунды, _, остаток = хвост.partition(".")
+        цифры = ""
+        while остаток and остаток[0].isdigit():
+            цифры, остаток = цифры + остаток[0], остаток[1:]
+        хвост = f"{секунды}.{(цифры + '000000')[:6]}{остаток}"
+    try:
+        t = datetime.fromisoformat(f"{дата}T{хвост}")
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return int(t.timestamp()) * 1_000_000 + t.microsecond
+
+
+def _iso_даты(мкс: int) -> str:
+    """Микросекунды UTC → строка в том же виде, что пишет телефон."""
+    from datetime import datetime, timezone
+    t = datetime.fromtimestamp(мкс // 1_000_000, tz=timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{мкс % 1_000_000:06d}Z"
+
+
+def даты_воспоминания(тело: dict, серверное_мс: int) -> dict:
+    """Даты воспоминания без будущего.
+
+    Дату записи и момент занесения ставит телефон автора. Когда его часы
+    уходят вперёд, запись встаёт в ленте выше всего нового и висит там, пока
+    настоящее время её не догонит: 14.10.2026 у пары сверху лежали 11 «фото
+    дня» с датами 19–31 октября, присланных 12-го.
+
+    Прошлое не трогаем: запись, сделанная без сети, приезжает позже и честно
+    хранит свой момент, а задним числом люди ставят даты нарочно. Будущего у
+    воспоминания не бывает. Если момент занесения (`added_at`) впереди
+    сервера, часы спешат: оба времени сдвигаются назад на это расхождение, и
+    «два дня назад» по сбитым часам остаётся двумя днями назад по настоящим.
+    Дата, которая и после этого впереди, становится сегодняшней.
+    """
+    данные = тело.get("data") if isinstance(тело.get("data"), dict) else {}
+    сейчас = серверное_мс * 1000
+    допуск = РАСХОЖДЕНИЕ_ЧАСОВ_MS * 1000
+
+    def прочесть(колонка: str, ключ: str) -> int | None:
+        if колонка in тело:
+            return _мкс_даты(тело.get(колонка))
+        return _мкс_даты(данные.get(ключ))
+
+    def записать(колонка: str, ключ: str, мкс: int) -> None:
+        значение = _iso_даты(мкс)
+        if колонка in тело:
+            тело[колонка] = значение
+        if ключ in данные:
+            данные[ключ] = значение
+
+    создано = прочесть("created_at", "createdAt")
+    занесено = прочесть("added_at", "addedAt")
+    if занесено is not None and занесено - сейчас > допуск:
+        сдвиг = занесено - сейчас
+        записать("added_at", "addedAt", сейчас)
+        if создано is not None:
+            создано -= сдвиг
+            записать("created_at", "createdAt", создано)
+    if создано is not None and создано - сейчас > допуск:
+        записать("created_at", "createdAt", сейчас)
+    return тело
+
+
+# Наклейки на пинах (14.10.2026). Наклейку ставит любой из пары поверх
+# главного блока записи; лежит она в `data.stickers` (карта id → наклейка), а
+# пишет её только эта операция: PATCH воспоминания с телом `sticker_put` или
+# `sticker_del`. Обычная правка записи наклейки не трогает (см. update_record),
+# поэтому двое, клеящие одновременно, друг друга не затирают. Те же правила у
+# клиента — `lib/models/memory_sticker.dart`.
+НАКЛЕЕК_НА_ЧЕЛОВЕКА = 3
+_НАКЛЕЙКА_РАЗМЕР = (0.12, 0.7)
+# Каталог наборов и «Свои» настроения пары (Togetherly+): оба файла открытые и
+# лежат на своём сервере.
+_НАКЛЕЙКА_ХОСТЫ = (
+    "https://togetherly.day/api/files/catalog_items/",
+    "https://togetherly.duckdns.org/api/files/catalog_items/",
+    "https://togetherly.day/api/files/custom_moods/",
+    "https://togetherly.duckdns.org/api/files/custom_moods/",
+)
+
+
+def наклейка_из_тела(сырое, uid: str, сейчас_мс: int) -> dict | None:
+    """Присланная наклейка в том виде, в каком она ляжет в базу, или None.
+
+    Автором сервер ставит того, кто прислал, а не то, что написано в теле.
+    Картинка — только ассет сборки, файл своего каталога или своё настроение
+    пары: чужой адрес подгружался бы у партнёра с любого сайта.
+    """
+    import math
+
+    if not isinstance(сырое, dict):
+        return None
+    sid = str(сырое.get("id") or "")
+    картинка = str(сырое.get("img") or "")
+    if not sid or len(sid) > 40 or not картинка or len(картинка) > 300:
+        return None
+    if ".." in картинка:
+        return None
+    if not (картинка.startswith("assets/images/")
+            or картинка.startswith(_НАКЛЕЙКА_ХОСТЫ)):
+        return None
+
+    def число(ключ: str, запас: float) -> float:
+        v = сырое.get(ключ)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return запас
+        return float(v) if math.isfinite(v) else запас
+
+    угол = число("r", 0.0) % (2 * math.pi)
+    if угол > math.pi:
+        угол -= 2 * math.pi
+    мин, макс = _НАКЛЕЙКА_РАЗМЕР
+    t = сырое.get("t")
+    t = int(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else 0
+    if t <= 0 or t > сейчас_мс:
+        t = сейчас_мс
+    return {
+        "id": sid,
+        "uid": uid,
+        "img": картинка,
+        "pack": str(сырое.get("pack") or "")[:40],
+        "mood": str(сырое.get("mood") or "")[:40],
+        "x": min(max(число("x", 0.5), 0.0), 1.0),
+        "y": min(max(число("y", 0.5), 0.0), 1.0),
+        "s": min(max(число("s", 0.28), мин), макс),
+        "r": угол,
+        "t": t,
+    }
+
+
+def применить_наклейку(наклейки: dict, тело: dict, uid: str, автор: str,
+                       сейчас_мс: int) -> tuple[dict, str | None]:
+    """Новая карта наклеек записи после операции из [тело] или код отказа.
+
+    Своих наклеек на запись не больше трёх; переставить можно только свою,
+    убрать — свою, а автор записи убирает любую со своего пина. Повтор
+    удаления из очереди отвечает успехом: наклейки уже нет.
+    """
+    новые = {k: v for k, v in (наклейки or {}).items() if isinstance(v, dict)}
+    if "sticker_del" in тело:
+        sid = str(тело.get("sticker_del") or "")
+        была = новые.get(sid)
+        if была is None:
+            return новые, None
+        if была.get("uid") != uid and автор != uid:
+            return новые, "not_yours"
+        del новые[sid]
+        return новые, None
+    s = наклейка_из_тела(тело.get("sticker_put"), uid, сейчас_мс)
+    if s is None:
+        return новые, "bad_sticker"
+    была = новые.get(s["id"])
+    if была is not None:
+        if была.get("uid") != uid:
+            return новые, "not_yours"
+        # Переставленная остаётся на своём слое, а не прыгает наверх.
+        s["t"] = была.get("t") or s["t"]
+    elif sum(1 for v in новые.values() if v.get("uid") == uid) >= НАКЛЕЕК_НА_ЧЕЛОВЕКА:
+        return новые, "limit"
+    новые[s["id"]] = s
+    return новые, None
+
+
+# Свежая отметка настроения → виджет пары (обращение 265, 14.10.2026: «на
+# виджете у партнёра „Радость“, хотя у него стоит „Люблю“, так уже два дня»).
+# Виджет пары на рабочем столе читает `widget_data` автора, а не календарь.
+# Отметка доходит надёжно, через очередь приложения, а `widget_data` приложение
+# пишет отдельным прямым запросом без повтора: сорвался запрос — у партнёра
+# старое настроение до следующей смены. Отметка кнопкой с виджета настроений
+# `widget_data` не трогает вовсе. За 3 дня до правки так отстал виджет у 790
+# человек. Теперь свежую отметку в виджет переносит сервер (_настроение_в_виджет).
+НАСТРОЕНИЕ_В_ВИДЖЕТ_MS = 6 * 3_600_000
+НАСТРОЕНИЕ_ВПЕРЁД_MS = 10 * 60_000
+
+
+def момент_свежего_настроения(отметка: dict, сейчас_мс: int) -> int | None:
+    """Момент отметки в мс, если она годится в виджет пары, иначе None.
+
+    Годится отметка «сейчас»: не старше шести часов (запоздавшая из очереди
+    тоже) и не из будущего дальше десяти минут (часы телефона спешат).
+    Отметка задним числом из календаря — это вчерашний день, виджет она не
+    трогает. Правил ли кто виджет после отметки, решает запрос к базе.
+    """
+    if not isinstance(отметка, dict):
+        return None
+    if not (отметка.get("group_id") and отметка.get("user_uid")):
+        return None
+    if not (отметка.get("image_path") or отметка.get("label")):
+        return None
+    мкс = _мкс_даты(отметка.get("timestamp"))
+    if мкс is None:
+        return None
+    мс = мкс // 1000
+    if мс < сейчас_мс - НАСТРОЕНИЕ_В_ВИДЖЕТ_MS or мс > сейчас_мс + НАСТРОЕНИЕ_ВПЕРЁД_MS:
+        return None
+    return мс
+
+
+def _miss_you_push_text(вайб_текст: str | None) -> str:
+    """Тело уведомления об импульсе «Скучаю».
+
+    Повторяет прежний хук `push_apns.pb.js` слово в слово: своё пожелание
+    человека, а если его нет — «Обними в ответ». Длинное режем, как в чате:
+    в шторке всё равно видно только начало.
+    """
+    текст = (вайб_текст or "").strip()
+    if not текст:
+        return "Обними в ответ"
+    return текст[:117] + "…" if len(текст) > 120 else текст
+
+
+def _chat_push_text(rec: dict) -> str:
+    text = (rec.get("text") or "").strip()
+    if text:
+        return text[:117] + "…" if len(text) > 120 else text
+    if rec.get("note_url"):
+        return "Фигурка"
+    return "Голосовое сообщение" if rec.get("voice_url") else "Сообщение"
+
+
+async def _настроение_в_виджет(rec: dict) -> None:
+    """Перенести свежую отметку настроения в `widget_data` автора.
+
+    Свежесть решает момент_свежего_настроения. Виджет не трогаем, если его
+    правили после отметки: человек убрал настроение или приложение уже само
+    записало это же. Запись ушла — рассылаем её паре, как обычную правку.
+    """
+    from datetime import datetime, timezone
+    момент = момент_свежего_настроения(rec, int(time.time() * 1000))
+    if момент is None or pg is None:
+        return
+    когда = datetime.fromtimestamp(момент / 1000, tz=timezone.utc)
+    try:
+        async with pg.acquire() as c:
+            row = await c.fetchrow(
+                "UPDATE widget_data SET mood_emoji = $3, mood_label = $4, updated = $5 "
+                "WHERE group_id = $1 AND user_uid = $2 "
+                "AND (NULLIF(updated, '') IS NULL OR NULLIF(updated, '')::timestamptz < $6) "
+                "AND (mood_label IS DISTINCT FROM $4 OR mood_emoji IS DISTINCT FROM $3) "
+                "RETURNING *",
+                rec.get("group_id"), rec.get("user_uid"),
+                rec.get("image_path") or "", (rec.get("label") or "").strip(),
+                now_pb(), когда)
+    except Exception as e:
+        log.warning("настроение в виджет: %s", e)
+        return
+    if row is not None:
+        await _publish("widget_data", "update", _record_json("widget_data", row))
+
+
+async def _after_create(col: str, rec: dict) -> None:
+    kind = COLLECTIONS[col]["after_create"]
+    if kind == "chat":
+        if not rec.get("deleted"):
+            _count(rec.get("group_id") or "", +1)
+            await _notify_group(
+                rec.get("group_id") or "", rec.get("user_uid") or "",
+                (rec.get("user_name") or "Партнёр"), _chat_push_text(rec), "chat")
+    elif kind == "memory":
+        if not rec.get("deleted"):
+            _count(rec.get("group_id") or "", +1, field="memories_count")
+            await _notify_group(
+                rec.get("group_id") or "", rec.get("author_uid") or "",
+                (rec.get("author_name") or "Партнёр"), "Добавил воспоминание", "memory")
+    elif kind == "widget":
+        # Тихий пуш «обнови виджеты» — как wakeGroup в apns_push.js.
+        await _wake_group(rec.get("group_id") or "", rec.get("user_uid") or "")
+    elif kind == "location":
+        await _wake_channel(rec.get("channel") or "", rec.get("user_uid") or "")
+    elif kind == "mood":
+        # Сперва виджет: тихий пуш ниже будит телефон партнёра, и тот должен
+        # прочитать уже новое настроение.
+        await _настроение_в_виджет(rec)
+        label = (rec.get("label") or "").strip()
+        await _notify_group(
+            rec.get("group_id") or "", rec.get("user_uid") or "",
+            "Настроение партнёра",
+            f"Сегодня: {label}" if label else "Партнёр отметил настроение", "mood")
+        # И тихий пуш «обнови виджеты»: на iPhone у виджетов своего фонового
+        # обновления нет, и настроение партнёра на рабочем столе застывало до
+        # следующего открытия приложения — «виджеты не обновляются под
+        # настроение, только уведомления» (жалоба 20.08.2026).
+        await _wake_group(rec.get("group_id") or "", rec.get("user_uid") or "")
+
+
+async def _after_update(col: str, rec: dict) -> None:
+    """Что делать после правки записи.
+
+    Пока это только настроение. Отметка за день у человека одна: первый раз
+    она создаётся, дальше правится — и уведомление уходило лишь на первую.
+    Человек менял настроение днём, а партнёр об этом не узнавал вовсе
+    (жалоба 16.08.2026). Антидребезг общий с «Скучаю»: подряд перебирать
+    эмоции — обычное дело, но шторка от этого захлёбываться не должна.
+    """
+    kind = COLLECTIONS[col]["after_create"]
+
+    # Виджеты рабочего стола: фото и статус МЕНЯЮТ существующую запись, а не
+    # создают новую, поэтому тихий пуш «проснись и обнови» уходил только при
+    # самой первой записи. У людей на iPhone виджет обновлялся ровно тогда,
+    # когда открывали приложение (жалоба 18.08.2026). Частоту держит сам
+    # _wake_group: не чаще раза в 15 минут на устройство и только тем, кто
+    # сейчас не в приложении.
+    if kind == "widget":
+        await _wake_group(rec.get("group_id") or "", rec.get("user_uid") or "")
+        return
+
+    # Точка на карте правит ту же запись каждые пару минут — будим второго
+    # из пары, частоту держит `_wake_targets`.
+    if kind == "location":
+        await _wake_channel(rec.get("channel") or "", rec.get("user_uid") or "")
+        return
+
+    if kind != "mood":
+        return
+    # Виджет догоняет отметку до антидребезга уведомлений: баннер можно
+    # придержать, настроение на рабочем столе — нет.
+    await _настроение_в_виджет(rec)
+    group_id = rec.get("group_id") or ""
+    if not group_id:
+        return
+    теперь_мс = int(time.time() * 1000)
+    if not _можно_слать_miss("mood:" + group_id, теперь_мс):
+        return
+    label = (rec.get("label") or "").strip()
+    ушло = await _notify_group(
+        group_id, rec.get("user_uid") or "", "Настроение партнёра",
+        f"Сегодня: {label}" if label else "Партнёр отметил настроение", "mood")
+    if ушло:
+        _отметить_miss("mood:" + group_id, теперь_мс)
+    # Виджет обновляем даже когда баннер придержал антидребезг: человек
+    # перебирает эмоции подряд, а на рабочем столе должна остаться последняя.
+    # Частоту тихих пушей держит сам _wake_group.
+    await _wake_group(group_id, rec.get("user_uid") or "")
+
+
+def _after_delete(col: str, rec: dict) -> None:
+    kind = COLLECTIONS[col]["after_delete"]
+    if kind == "chat":
+        _count(rec.get("group_id") or "", -1)
+    elif kind == "memory":
+        _count(rec.get("group_id") or "", -1, field="memories_count")
+
+
+# ── счётчик групп: батч-воркер поверх SQLite PB ──────────────────────────────
+
+
+def _count(group_id: str, delta: int, field: str = "messages_count") -> None:
+    if group_id:
+        key = (group_id, field)
+        _counter_deltas[key] = _counter_deltas.get(key, 0) + delta
+
+
+def _flush_counters_sync(deltas: dict) -> None:
+    # BEGIN IMMEDIATE: наша транзакция только пишет, деферред-снапшот ей не
+    # нужен, а мгновенный захват замка сводит окно к миллисекундам.
+    with _lite_rw_lock:
+        _flush_counters_пишем(deltas)
+
+
+def _flush_counters_пишем(deltas: dict) -> None:
+    lite_rw.execute("BEGIN IMMEDIATE")
+    try:
+        for (gid, field), d in deltas.items():
+            lite_rw.execute(
+                f"UPDATE groups SET {field} = MAX(0, COALESCE({field}, 0) + ?) "
+                "WHERE id = ?", (d, gid),
+            )
+        lite_rw.commit()
+    except BaseException:
+        lite_rw.rollback()
+        raise
+
+
+ЗЕРКАЛО_ОТМЕТКА = "/opt/hotpath/.groups_mirror_at"
+ЗЕРКАЛО_ПАЧКА = 1000
+# Курсор по паре (updated, id): у тысяч пар бывает одна и та же метка правки
+# (ночной пересчёт счётчиков пишет её всем сразу), и выборка по одному updated
+# теряла всё, что не влезло в первую пачку. Условие расписано так, чтобы
+# работал индекс idx_groups_updated.
+ЗЕРКАЛО_ЗАПРОС = (
+    "SELECT * FROM groups WHERE updated >= $1 AND (updated > $1 OR id > $2) "
+    "ORDER BY updated, id LIMIT $3")
+
+
+def _разобрать_отметку(текст: str) -> tuple:
+    """Отметка зеркала: «updated<TAB>id». Старая запись без id — id пустой."""
+    время, _, ид = текст.partition("\t")
+    return время, ид
+
+
+def _прочитать_отметку() -> str:
+    try:
+        with open(ЗЕРКАЛО_ОТМЕТКА, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _записать_отметку(v: str) -> None:
+    try:
+        with open(ЗЕРКАЛО_ОТМЕТКА, "w", encoding="utf-8") as f:
+            f.write(v)
+    except OSError as e:
+        log.warning("отметка зеркала не записалась: %s", e)
+
+
+def _чужие_правки_sync(ids: list) -> dict:
+    """Время правки этих пар в SQLite — чтобы понять, не писал ли туда кто-то
+    ещё. Любой писатель через PocketBase двигает autodate-поле updated, и это
+    единственный способ увидеть писателя, о котором мы не знали."""
+    out = {}
+    for i in range(0, len(ids), 500):
+        кусок = ids[i:i + 500]
+        места = ",".join("?" * len(кусок))
+        for gid, upd in lite.execute(
+                f"SELECT id, COALESCE(updated,'') FROM `groups` WHERE id IN ({места})",
+                кусок):
+            out[gid] = upd
+    return out
+
+
+async def _зеркало_воркер() -> None:
+    """Раз в две минуты складывает свежие пары из Postgres обратно в SQLite.
+
+    Пачкой, а не потоком: в этом вся выгода переезда. Отдельно — защита от
+    потери: если в SQLite строка оказалась СВЕЖЕЕ, значит её правил кто-то,
+    кого мы не перевели (хук, старый путь). Такую строку зеркало НЕ затирает,
+    а поднимает в Postgres и пишет тревогу в журнал.
+    """
+    while True:
+        await asyncio.sleep(120)
+        if GROUPS_SRC != "pg":
+            continue
+        try:
+            отметка = _прочитать_отметку()
+            if not отметка:
+                # Первый запуск: историю гнать незачем — базы уже сверены
+                # переносом, а проход по всем парам пачками только зря
+                # нагрузил бы запись в SQLite.
+                _записать_отметку(now_pb())
+                continue
+            время, ид = _разобрать_отметку(отметка)
+            async with pg.acquire() as c:
+                строки = await c.fetch(
+                    ЗЕРКАЛО_ЗАПРОС, время, ид, ЗЕРКАЛО_ПАЧКА)
+            if not строки:
+                continue
+            свои = await asyncio.to_thread(
+                _чужие_правки_sync, [r["id"] for r in строки])
+            к_зеркалу, чужие = [], []
+            for r in строки:
+                было = свои.get(r["id"], "")
+                if было and было > (r["updated"] or ""):
+                    чужие.append(r["id"])
+                else:
+                    к_зеркалу.append(r)
+            if к_зеркалу:
+                await asyncio.to_thread(_зеркало_группы_sync, к_зеркалу)
+            if чужие:
+                log.warning(
+                    "ТРЕВОГА: %d пар правлены мимо Postgres (%s) — поднимаю "
+                    "их в Postgres, зеркало их не затирает", len(чужие),
+                    ", ".join(чужие[:5]))
+                await _поднять_из_sqlite(чужие)
+            последняя = строки[-1]
+            _записать_отметку(
+                f"{последняя['updated'] or время}\t{последняя['id']}")
+        except Exception as e:  # воркер не должен умирать
+            log.warning("зеркало пар: %s", e)
+
+
+def _строки_из_sqlite(ids: list) -> list:
+    места = ",".join("?" * len(ids))
+    поля = ", ".join(ЗЕРКАЛО_КОЛОНКИ)
+    return lite.execute(
+        f"SELECT id, {поля} FROM `groups` WHERE id IN ({места})", ids).fetchall()
+
+
+async def _поднять_из_sqlite(ids: list) -> None:
+    """Залить в Postgres строки, которые кто-то поправил в SQLite мимо нас."""
+    строки = await asyncio.to_thread(_строки_из_sqlite, ids)
+    if not строки:
+        return
+    поля = ", ".join(ЗЕРКАЛО_КОЛОНКИ)
+    места = ", ".join(f"${i + 2}" for i in range(len(ЗЕРКАЛО_КОЛОНКИ)))
+    обнов = ", ".join(f"{c} = EXCLUDED.{c}" for c in ЗЕРКАЛО_КОЛОНКИ)
+    async with pg.acquire() as c:
+        for row in строки:
+            значения = []
+            for idx, имя in enumerate(ЗЕРКАЛО_КОЛОНКИ, start=1):
+                v = row[idx]
+                kind = COLLECTIONS["groups"]["columns"][имя]
+                if kind == "json":
+                    s = v if isinstance(v, str) or v is None else json.dumps(v)
+                    значения.append(s if (s or "").strip() else None)
+                elif kind == "num":
+                    значения.append(float(v or 0))
+                elif kind == "bool":
+                    значения.append(bool(v))
+                else:
+                    значения.append(str(v) if v is not None else "")
+            await c.execute(
+                f"INSERT INTO groups (id, {поля}) VALUES ($1, {места}) "
+                f"ON CONFLICT (id) DO UPDATE SET {обнов}", row[0], *значения)
+
+
+async def _flush_counters_pg(deltas: dict) -> None:
+    """То же, но в Postgres, где строка пары и лежит.
+
+    Тут ограничение «раз в минуту» ни к чему: это обычный UPDATE в своей базе,
+    он никому не протухает снапшоты. Поэтому при переехавших группах счётчик
+    сбрасывается каждые пять секунд и цифра в профиле почти не отстаёт.
+    """
+    отметка = now_pb()
+    async with pg.acquire() as c:
+        async with c.transaction():
+            # Сбрасывает каждый рабочий процесс, и строки одних пар идут у всех
+            # в одном порядке: так процессы не встанут друг другу поперёк.
+            for (gid, field), d in sorted(deltas.items()):
+                # updated двигаем намеренно: по нему зеркало понимает, какие
+                # пары нести обратно в SQLite, а счётчики нужны отчётам.
+                await c.execute(
+                    f"UPDATE groups SET {field} = GREATEST(0, COALESCE({field}, 0) + $1), "
+                    "updated = $2 WHERE id = $3", float(d), отметка, gid)
+
+
+async def _counter_worker() -> None:
+    """Копит дельты messages_count и раз в минуту пишет одной транзакцией.
+
+    Раз в МИНУТУ, а не чаще, намеренно: каждый посторонний коммит в SQLite
+    протухает деферред-снапшоты письменных транзакций самого PocketBase — тот
+    уходит в лесенку ретраев по ~50 секунд, и регистрация с профилем виснут
+    (поймано живьём 14.08: сброс раз в 2с давал константные 48с на любую
+    запись PB при свободном замке). Свежесть счётчика столько не стоит:
+    couple_stats и так считает чат из Postgres."""
+    global _counter_deltas
+    while True:
+        await asyncio.sleep(5 if GROUPS_SRC == "pg" else 60)
+        if not _counter_deltas:
+            continue
+        batch, _counter_deltas = _counter_deltas, {}
+        try:
+            if GROUPS_SRC == "pg":
+                await _flush_counters_pg(batch)
+            else:
+                await asyncio.to_thread(_flush_counters_sync, batch)
+        except (sqlite3.Error, asyncpg.PostgresError, OSError) as e:
+            log.warning("counters отложены (%s)", e)
+            for key, d in batch.items():  # вернуть в очередь
+                _counter_deltas[key] = _counter_deltas.get(key, 0) + d
+
+
+# ── зеркало присутствия в SQLite (для аналитики) ─────────────────────────────
+
+
+def _mirror_presence_sync(rows: list) -> None:
+    """Складывает свежие отметки присутствия обратно в SQLite PocketBase.
+
+    Зачем: когорты удержания и вкладка «Доход» джойнят `users` с
+    `user_presence` одним SQL — а users остались в PB. Держим там теневую
+    копию: одна пачка раз в пять минут вместо сотни отдельных записей в
+    минуту, которые эту базу и душили."""
+    with _lite_rw_lock:
+        lite_rw.execute("BEGIN IMMEDIATE")
+        try:
+            lite_rw.executemany(
+                "INSERT INTO user_presence (id, user_uid, seen_at) VALUES (?,?,?) "
+                "ON CONFLICT(user_uid) DO UPDATE SET seen_at = excluded.seen_at",
+                rows)
+            lite_rw.commit()
+        except BaseException:
+            lite_rw.rollback()
+            raise
+
+
+def _метка_зеркала(отметки: list[float], сейчас_мс: float) -> float:
+    """Докуда зеркало присутствия уже дошло: самая поздняя перенесённая
+    отметка, но не дальше «сейчас».
+
+    Телефон со спешащими часами присылает отметку из будущего. Метка уезжала
+    за ней: 21.10.2026 она стояла на 28 октября, и в SQLite за час попадали
+    две отметки вместо пяти тысяч. Отметки из будущего переносятся каждый
+    раз заново, их единицы."""
+    return min(max(отметки), сейчас_мс)
+
+
+async def _presence_mirror_worker() -> None:
+    last = 0.0
+    while True:
+        await asyncio.sleep(300)
+        try:
+            async with pg.acquire() as c:
+                rows = await c.fetch(
+                    "SELECT id, user_uid, seen_at FROM user_presence WHERE seen_at > $1",
+                    last)
+            if not rows:
+                continue
+            last = _метка_зеркала([float(r["seen_at"]) for r in rows], time.time() * 1000)
+            await asyncio.to_thread(
+                _mirror_presence_sync,
+                [(r["id"], r["user_uid"], int(r["seen_at"])) for r in rows])
+            log.info("присутствие: зеркало %d строк", len(rows))
+        except Exception as e:
+            log.warning("зеркало присутствия отложено: %s", e)
+
+
+# ── маршруты ─────────────────────────────────────────────────────────────────
+
+
+@app.get("/healthz")
+async def healthz():
+    async with pg.acquire() as c:
+        await c.fetchval("SELECT 1")
+    return {"ok": True}
+
+
+# ── История импульсов «Скучаю» (miss_you_events) ─────────────────────────────
+
+_ИМПУЛЬС_ПОДПИСЬ = {
+    "miss_you": "Я скучаю",
+    "thinking_of_you": "Думаю о тебе",
+    "want_hug": "Хочу обнять",
+}
+
+
+def _miss_reply_push_text(вайб: str, текст: str | None) -> str:
+    """Тело пуша об ответе: на что именно ответили. Свой текст — как есть."""
+    подпись = (текст or "").strip() if вайб == "custom" else ""
+    if not подпись:
+        подпись = _ИМПУЛЬС_ПОДПИСЬ.get(вайб, "Я скучаю")
+    if len(подпись) > 60:
+        подпись = подпись[:57] + "…"
+    return f"В ответ на «{подпись}»"
+
+
+def _miss_event_json(row) -> dict:
+    """Строка истории для приложения: время — мс эпохи, ответ — id или null."""
+    return {
+        "id": row["id"],
+        "uid": row["user_uid"],
+        "vibe": row["vibe"],
+        "text": row["text"] or "",
+        "count": int(row["count"] or 1),
+        "replyTo": row["reply_to"],
+        "at": int(row["created"].timestamp() * 1000),
+    }
+
+
+async def _miss_history(group_id: str, since_ms: int | None) -> list[dict]:
+    """События пары с отметки [since_ms] (полночь телефона), но не старше
+    двух суток; новые первыми. Изредка подчищает строки старше трёх дней."""
+    now = time.time()
+    floor = now - 48 * 3600
+    since = max(floor, (since_ms or 0) / 1000)
+    rows = await pg.fetch(
+        "SELECT * FROM miss_you_events WHERE group_id = $1 AND created >= to_timestamp($2) "
+        "ORDER BY created DESC LIMIT 200",
+        group_id, since,
+    )
+    if random.random() < 0.005:
+        try:
+            await pg.execute("DELETE FROM miss_you_events WHERE created < now() - interval '3 days'")
+        except Exception as e:
+            log.warning("miss_you_events cleanup: %s", e)
+    return [_miss_event_json(r) for r in rows]
+
+
+async def _miss_event_add(group_id: str, uid: str, vibe: str, text: str,
+                          times: int, reply_to: str | None) -> None:
+    """Импульс в историю. Тот же импульс того же человека в пределах минуты
+    (и не ответ) прибавляется к последней строке, а не плодит новую."""
+    if not reply_to:
+        upd = await pg.fetchval(
+            """
+            UPDATE miss_you_events SET count = count + $5, created = now()
+             WHERE id = (SELECT id FROM miss_you_events
+                          WHERE group_id = $1 AND user_uid = $2 AND vibe = $3 AND text = $4
+                            AND reply_to IS NULL AND created > now() - interval '60 seconds'
+                          ORDER BY created DESC LIMIT 1)
+            RETURNING id
+            """,
+            group_id, uid, vibe, text, times,
+        )
+        if upd:
+            return
+    await pg.execute(
+        "INSERT INTO miss_you_events (id, group_id, user_uid, vibe, text, count, reply_to) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        _new_id(), group_id, uid, vibe, text, times, reply_to,
+    )
+
+
+@app.post("/api/group/miss-you")
+async def miss_you(request: Request):
+    """Импульс «Скучаю»: один запрос — одна строка вверх.
+
+    В PocketBase это был read-modify-write в транзакции: находим запись,
+    считаем новое значение, сохраняем. При 58 нажатиях в секунду очередь к
+    SQLite выросла до семи тысяч ожидающих. Здесь то же самое делает Postgres
+    одним `INSERT … ON CONFLICT DO UPDATE`: счётчик и обе карты прибавляются
+    прямо в базе, читать перед записью не нужно.
+
+    Форма ответа и канал рассылки повторяют прежний хук `groups.pb.js`, чтобы
+    приложению не пришлось ничего знать о переезде.
+    """
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid_auth, groups = auth
+
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad params")
+
+    group_id = str(body.get("groupId") or "").strip()
+    uid = str(body.get("uid") or "").strip() or uid_auth
+    vibe = str(body.get("vibe") or "miss_you")
+    text = str(body.get("text") or "")
+    reply_to = str(body.get("replyTo") or "").strip() or None
+    if not group_id or not uid:
+        return _err(400, "bad params")
+    if group_id not in groups:
+        return ORJSONResponse({"ok": False, "error": "not a member"}, status_code=403)
+
+    # История за день — тем же маршрутом с флагом: у точки входа на каждый
+    # путь hotpath свой маршрут в Caddy, заводить новый ради чтения незачем.
+    if body.get("history") is True:
+        try:
+            since_ms = int(body.get("since") or 0)
+        except Exception:
+            since_ms = 0
+        try:
+            events = await _miss_history(group_id, since_ms)
+        except Exception as e:
+            log.warning("miss history %s: %s", group_id, e)
+            return _err(500, "history failed")
+        return ORJSONResponse({"ok": True, "events": events})
+
+    # Клиент копит частые тапы и шлёт их одним запросом; потолок двадцать —
+    # дальше это зажатый палец, а не человек.
+    try:
+        times = int(body.get("count"))
+    except Exception:
+        times = 1
+    if not 1 <= times <= 20:
+        times = 1
+
+    # День недели присылает клиент (1=пн … 7=вс): сервер живёт в UTC, и ночные
+    # нажатия попадали бы во вчерашний день.
+    try:
+        weekday = int(body.get("weekday"))
+    except Exception:
+        weekday = 0
+    if not 1 <= weekday <= 7:
+        weekday = (time.gmtime().tm_wday + 1)
+    wd = str(weekday)
+
+    # Свои типы импульсов; чужое имя не должно растить карту без края.
+    vibe_key = vibe if vibe in ("miss_you", "thinking_of_you", "want_hug", "custom") else "miss_you"
+
+    now_iso = now_pb()
+    rid = _new_id()
+    row = await pg.fetchrow(
+        """
+        INSERT INTO miss_you (id, group_id, user_uid, count, updated_at,
+                              last_vibe, last_vibe_text, by_weekday, by_vibe, updated)
+        VALUES ($1, $2, $3, $4::double precision, $5, $6, $7,
+                jsonb_build_object($8::text, to_jsonb($4::double precision)),
+                jsonb_build_object($9::text, to_jsonb($4::double precision)), $5)
+        ON CONFLICT (group_id, user_uid) DO UPDATE SET
+            count = miss_you.count + $4::double precision,
+            updated_at = $5,
+            updated = $5,
+            last_vibe = $6,
+            last_vibe_text = $7,
+            by_weekday = jsonb_set(
+                COALESCE(miss_you.by_weekday, '{}'::jsonb), ARRAY[$8::text],
+                to_jsonb(COALESCE((miss_you.by_weekday->>$8::text)::double precision, 0)
+                         + $4::double precision)),
+            by_vibe = jsonb_set(
+                COALESCE(miss_you.by_vibe, '{}'::jsonb), ARRAY[$9::text],
+                to_jsonb(COALESCE((miss_you.by_vibe->>$9::text)::double precision, 0)
+                         + $4::double precision))
+        RETURNING *
+        """,
+        rid, group_id, uid, float(times), now_iso, vibe, text, wd, vibe_key,
+    )
+
+    # Ответ — только на импульс этой же пары и не на свой собственный.
+    if reply_to:
+        try:
+            автор = await pg.fetchval(
+                "SELECT user_uid FROM miss_you_events WHERE id = $1 AND group_id = $2",
+                reply_to, group_id)
+        except Exception:
+            автор = None
+        if not автор or автор == uid:
+            reply_to = None
+    try:
+        await _miss_event_add(group_id, uid, vibe, text, times, reply_to)
+    except Exception as e:
+        # История — приятное дополнение: её сбой не должен ронять сам импульс.
+        log.warning("miss_you_events %s: %s", group_id, e)
+
+    rec = _record_json("miss_you", row)
+    await _publish("miss_you", "update", rec)
+    # Уведомление второму. При переезде коллекции в hotpath оно пропало: пуш
+    # слал хук PocketBase на update записи, а хуки переехавших коллекций
+    # больше не срабатывают. Счётчик при этом обновлялся, и со стороны это
+    # выглядело как «сердечко прилетело, а телефон молчит» (жалоба 16.08.2026).
+    теперь_мс = int(time.time() * 1000)
+    if _можно_слать_miss(group_id, теперь_мс):
+        ушло = await _notify_group(
+            group_id, uid, "Скучает по тебе",
+            _miss_reply_push_text(vibe, text) if reply_to else _miss_you_push_text(text),
+            "miss")
+        if ушло:
+            _отметить_miss(group_id, теперь_мс)
+    return ORJSONResponse({"ok": True, "count": _num(row["count"])})
+
+
+# ── Разгрузка PocketBase: частые вопросы с редким ответом ────────────────────
+#
+# Вечер 14.08.2026: 400 запросов в секунду, из них 26 пишущих, а SQLite с
+# цепочкой JS-обработчиков вытягивает около восьми. Разница копилась в очередь,
+# и регистрация висела по тридцать секунд.
+#
+# Два самых частых пишущих запроса почти всегда ничего не меняют: «заходил
+# сегодня» приходит на каждый запуск приложения (9 в секунду), а день
+# засчитывается один раз; «дай ежедневную монетку» — тоже на каждый запуск
+# (5 в секунду), а бонус даётся раз в двадцать часов. Отвечаем на них здесь,
+# читая ответ прямо из базы PocketBase в режиме только чтения — это дёшево и
+# не занимает соединение записи. Настоящее изменение уходит в PocketBase как
+# раньше: логика серии дней и начисления остаётся там, где была.
+
+def _lite_group_streak(group_id: str) -> tuple[str, str] | None:
+    """(участники, дата последнего общего дня) из SQLite PocketBase."""
+    try:
+        row = lite.execute(
+            "SELECT members, COALESCE(streak_last_opened_date, '') FROM `groups` WHERE id = ?",
+            (group_id,),
+        ).fetchone()
+        return (row[0] or "", row[1] or "") if row else None
+    except sqlite3.Error:
+        return None
+
+
+def _lite_user_bonus(uid: str) -> tuple[int, int] | None:
+    """(время прошлого бонуса в мс, монеты) из SQLite PocketBase."""
+    try:
+        row = lite.execute(
+            "SELECT COALESCE(last_daily_bonus_ms, 0), COALESCE(coins, 0) FROM users WHERE id = ?",
+            (uid,),
+        ).fetchone()
+        return (int(row[0] or 0), int(row[1] or 0)) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+async def _proxy_to_pb(path: str, request: Request, body: dict) -> Response:
+    """Отдать запрос PocketBase как есть и вернуть его ответ."""
+    try:
+        r = await pb_client.post(
+            path, json=body,
+            headers={"Authorization": request.headers.get("authorization", "")},
+        )
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type=r.headers.get("content-type", "application/json"))
+    except httpx.HTTPError as e:
+        log.warning("прокси в PocketBase не удался: %s %s", path, e)
+        return _err(503, "Try again later.")
+
+
+@app.post("/api/group/record-activity")
+async def record_activity(request: Request):
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid_auth, groups = auth
+
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad params")
+
+    group_id = str(body.get("groupId") or "").strip()
+    today = str(body.get("today") or "").strip()
+    if not group_id or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", today):
+        return _err(400, "bad params")
+    if group_id not in groups:
+        return ORJSONResponse({"ok": False, "error": "not a member"}, status_code=403)
+
+    if GROUPS_SRC != "pg":
+        row = await asyncio.to_thread(_lite_group_streak, group_id)
+        if row is not None and row[1] == today:
+            # День уже отмечен — PocketBase тут делать нечего.
+            return ORJSONResponse({"ok": True, "already": True})
+        return await _proxy_to_pb("/api/group/record-activity", request, body)
+
+    if body.get("restore") is True:
+        # Возврат сгоревшей серии за ролик. Идёт этим же адресом нарочно:
+        # точка входа держит отдельный маршрут на каждый путь hotpath, а
+        # перезагрузка её Caddy под нагрузкой зависает (25.09.2026).
+        ответ = await _restore_streak_pg(group_id, uid_auth, today)
+        if ответ.status_code == 200:
+            # Партнёр видит возвращённую серию сразу, а не на следующем заходе.
+            asyncio.get_running_loop().create_task(_после_правки_пары(group_id))
+        return ответ
+
+    uid = str(body.get("uid") or "").strip() or uid_auth
+    return await _record_activity_pg(group_id, uid_auth, uid, today)
+
+
+def _общий_день(сегодня: str, ждём: str) -> bool:
+    """Считать ли отметку партнёра тем же общим днём.
+
+    Дату «сегодня» присылает клиент по своим часам, и у пары из разных поясов
+    она расходится каждый вечер: у неё уже 17-е, у него ещё 16-е. Полное
+    совпадение строк такую пару не засчитывало НИКОГДА — второй заход просто
+    перезаписывал ожидание своей датой. По живой базе 16.08.2026 в разных
+    поясах живут 22% активных пар (1799 из 8162), а серия дольше недели была
+    всего у 252 пар из 31 780.
+
+    Поэтому соседний день тоже считается общим — ровно на разницу поясов.
+    Дальше суток не идём: иначе «серия» перестанет значить «мы оба тут».
+    """
+    if not сегодня or not ждём:
+        return False
+    if сегодня == ждём:
+        return True
+    try:
+        a = time.mktime(time.strptime(сегодня, "%Y-%m-%d"))
+        b = time.mktime(time.strptime(ждём, "%Y-%m-%d"))
+    except ValueError:
+        return False
+    return abs(round((a - b) / 86400)) == 1
+
+
+def _день_подряд(сегодня: str, прошлый: str) -> bool:
+    """Прошлый общий день был ровно вчера (иначе серия начинается заново)."""
+    if not прошлый:
+        return False
+    try:
+        a = time.mktime(time.strptime(сегодня, "%Y-%m-%d"))
+        b = time.mktime(time.strptime(прошлый, "%Y-%m-%d"))
+    except ValueError:
+        return False
+    return round((a - b) / 86400) == 1
+
+
+def _record_streak_sqlite(group_id: str, mascot_id: str, streak: int) -> None:
+    """Копия рекорда в старой таблице SQLite. С 19.10.2026 маскоты живут в
+    Postgres, а SQLite держим свежей на случай отката маршрута."""
+    try:
+      with _lite_rw_lock:
+        lite_rw.execute(
+            "UPDATE mascots SET record_streak = ? "
+            "WHERE group_id = ? AND mascot_id = ? AND COALESCE(record_streak, 0) < ?",
+            (streak, group_id, mascot_id, streak))
+        lite_rw.commit()
+    except sqlite3.Error:
+        pass  # рекорд не критичен, серия уже записана
+
+
+async def _record_streak(group_id: str, mascot_id: str, streak: int) -> None:
+    """Рекорд серии живёт в записи маскота. Событие редкое: общий день
+    засчитывается паре раз в сутки. Правка двигает updated и уходит в канал
+    пары, иначе рекорд доезжал бы до телефонов только полной перезагрузкой."""
+    await asyncio.to_thread(_record_streak_sqlite, group_id, mascot_id, streak)
+    try:
+        async with pg.acquire() as c:
+            row = await c.fetchrow(
+                "UPDATE mascots SET record_streak = $1, updated = $2 "
+                "WHERE group_id = $3 AND mascot_id = $4 AND record_streak < $1 "
+                "RETURNING *",
+                float(streak), now_pb(), group_id, mascot_id)
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
+        return  # рекорд не критичен, серия уже записана
+    if row is not None:
+        asyncio.get_running_loop().create_task(
+            _publish("mascots", "update", _record_json("mascots", row)))
+
+
+async def _record_activity_pg(group_id: str, auth_uid: str, uid: str,
+                              today: str):
+    """Отметка общего дня целиком в Postgres.
+
+    Прежний путь открывал транзакцию PocketBase на КАЖДЫЙ заход в приложение
+    (восемь запросов в секунду вечером), и почти все впустую занимали
+    единственное соединение записи. Здесь блокируется одна строка пары, а не
+    вся база, поэтому пары не мешают друг другу вовсе.
+    """
+    async with pg.acquire() as c:
+        async with c.transaction():
+            row = await c.fetchrow(
+                "SELECT members, streak_days, streak_last_opened_date, "
+                "streak_pending_date, streak_pending_uid, active_mascot_id, "
+                "mascot_streaks FROM groups WHERE id = $1 FOR UPDATE", group_id)
+            if row is None:
+                return ORJSONResponse({"ok": False, "error": "not a member"},
+                                      status_code=403)
+            члены = row["members"]
+            if isinstance(члены, str):
+                try:
+                    члены = json.loads(члены)
+                except ValueError:
+                    члены = []
+            if auth_uid not in [str(m) for m in (члены or [])]:
+                return ORJSONResponse({"ok": False, "error": "not a member"},
+                                      status_code=403)
+
+            прошлый = row["streak_last_opened_date"] or ""
+            if прошлый == today:
+                return ORJSONResponse({"ok": True, "already": True})
+
+            ждёт_дату = row["streak_pending_date"] or ""
+            ждёт_кого = row["streak_pending_uid"] or ""
+            # Ожидание с датой уже закрытого (или более раннего) дня — остаток,
+            # а не живая отметка. До 20.09.2026 зачёт его не снимал, и у тысяч
+            # пар оно осталось с датой последнего общего дня. `_общий_день`
+            # принимал его за соседний день, `начало` уезжало на закрытый день,
+            # и серия падала в единицу: в ночи на 21 и 22 сентября так
+            # сбросились около 1100 пар (жалоба #181, «было 12, стало 2»).
+            if ждёт_дату and прошлый and ждёт_дату <= прошлый:
+                ждёт_дату, ждёт_кого = "", ""
+            # Соседний день тоже общий: у пары из разных поясов даты не
+            # совпадают никогда (см. `_общий_день`).
+            оба_сегодня = (bool(ждёт_кого) and ждёт_кого != uid
+                           and _общий_день(today, ждёт_дату))
+            if not оба_сегодня:
+                if not _общий_день(today, ждёт_дату) or not ждёт_кого:
+                    await c.execute(
+                        "UPDATE groups SET streak_pending_date = $1, "
+                        "streak_pending_uid = $2, updated = $3 WHERE id = $4",
+                        today, uid, now_pb(), group_id)
+                return ORJSONResponse({"ok": True, "pending": True})
+
+            # Оба были сегодня — день засчитан.
+            #
+            # Днём серии считаем дату ТОГО, КТО ОТМЕТИЛСЯ ПЕРВЫМ, а не дату
+            # закрытия: партнёр нередко заходит уже после полуночи, и по его
+            # дате общий день уезжал на сутки вперёд. Вчерашний день тогда
+            # выглядел пропущенным, и серия обнулялась у пары, которая была
+            # вместе оба вечера (жалоба 20.09.2026: «мы оба заходили, а серия
+            # сбросилась»; в ту ночь так закрылись 2203 пары из 4188, у 646
+            # серия упала до единицы). Ожидание после зачёта снимаем: иначе
+            # завтрашняя отметка первого совпала бы с уже закрытым днём.
+            начало = min(today, ждёт_дату) if ждёт_дату else today
+            серия = (int(row["streak_days"] or 0) + 1
+                     if _день_подряд(начало, прошлый) else 1)
+            маскот = row["active_mascot_id"] or ""
+            карта = row["mascot_streaks"]
+            if isinstance(карта, str):
+                try:
+                    карта = json.loads(карта)
+                except ValueError:
+                    карта = {}
+            карта = карта if isinstance(карта, dict) else {}
+            серия_маскота = 0
+            if маскот:
+                прежнее = карта.get(маскот) if isinstance(карта.get(маскот), dict) else {}
+                было = int(прежнее.get("s") or 0)
+                подряд = _день_подряд(начало, str(прежнее.get("d") or ""))
+                серия_маскота = было + 1 if подряд else 1
+                запись = {"s": серия_маскота, "d": начало}
+                if not подряд and было >= 2:
+                    # Серия оборвалась: прежнее число помним, чтобы пара могла
+                    # вернуть его за ролик (см. `_возврат_серии`).
+                    запись.update(lost=было, lost_d=начало,
+                                  lost_g=int(row["streak_days"] or 0) if серия == 1 else 0)
+                elif подряд:
+                    for ключ in ПАМЯТЬ_ОБРЫВА:
+                        if ключ in прежнее:
+                            запись[ключ] = прежнее[ключ]
+                карта[маскот] = запись
+            await c.execute(
+                "UPDATE groups SET streak_days = $1, streak_last_opened_date = $2, "
+                "streak_pending_date = '', streak_pending_uid = '', "
+                "mascot_streaks = $3, updated = $4 WHERE id = $5",
+                float(серия), начало, json.dumps(карта), now_pb(), group_id)
+
+    if маскот and серия_маскота:
+        await _record_streak(group_id, маскот, серия_маскота)
+    return ORJSONResponse({"ok": True, "streak": серия,
+                           "mascotStreak": серия_маскота})
+
+
+
+# ── Возврат сгоревшей серии за ролик ─────────────────────────────────────────
+#
+# Просьба из чата 25.09.2026: «а есть восстановление серии как в ТикТоке?».
+# Возвращать можно сколько угодно раз — за каждый обрыв свой ролик, — но не
+# позже трёх дней после обрыва. Серия на экране — серия активного маскота
+# (`mascot_streaks`), общая `streak_days` пары идёт следом.
+
+ОКНО_ВОЗВРАТА = 3
+ПАМЯТЬ_ОБРЫВА = ("lost", "lost_d", "lost_g")
+
+
+def _дней_между(поздний: str, ранний: str) -> int | None:
+    try:
+        a = time.mktime(time.strptime(поздний, "%Y-%m-%d"))
+        b = time.mktime(time.strptime(ранний, "%Y-%m-%d"))
+    except (ValueError, TypeError):
+        return None
+    return round((a - b) / 86400)
+
+
+def _вчера(сегодня: str) -> str:
+    t = time.mktime(time.strptime(сегодня, "%Y-%m-%d")) - 86400 + 3600
+    return time.strftime("%Y-%m-%d", time.localtime(t))
+
+
+def _возврат_серии(серия_группы: int, прошлый: str, запись: dict,
+                   сегодня: str) -> tuple[dict, int, str] | None:
+    """Что станет с серией после ролика: (запись маскота, серия пары, последний
+    общий день пары) или None, если возвращать нечего.
+
+    Обрыв бывает двух видов. Пара уже вернулась, и зачёт дня сбросил серию в
+    единицу — прежнее число лежит в `lost`, его прибавляем. Пара ещё не
+    вернулась — последний общий день позавчера или раньше, на экране 0, а в
+    базе прежнее число: тогда закрываем пропуск вчерашним днём, и сегодняшний
+    общий день продолжит серию.
+    """
+    потеря = int(запись.get("lost") or 0)
+    когда = str(запись.get("lost_d") or "")
+    прошло = _дней_между(сегодня, когда) if когда else None
+    if потеря >= 2 and прошло is not None and 0 <= прошло <= ОКНО_ВОЗВРАТА:
+        новая = {к: з for к, з in запись.items() if к not in ПАМЯТЬ_ОБРЫВА}
+        новая["s"] = int(запись.get("s") or 0) + потеря
+        return новая, серия_группы + int(запись.get("lost_g") or 0), прошлый
+
+    было = int(запись.get("s") or 0)
+    день = str(запись.get("d") or "")
+    пропуск = _дней_между(сегодня, день) if день else None
+    if было >= 2 and пропуск is not None and 2 <= пропуск <= ОКНО_ВОЗВРАТА + 1:
+        вчера = _вчера(сегодня)
+        новая = dict(запись, d=вчера)
+        пропуск_пары = _дней_между(сегодня, прошлый) if прошлый else None
+        if пропуск_пары is not None and 2 <= пропуск_пары <= ОКНО_ВОЗВРАТА + 1:
+            прошлый = вчера
+        return новая, серия_группы, прошлый
+    return None
+
+
+async def _restore_streak_pg(group_id: str, auth_uid: str, today: str):
+    """Вернуть паре сгоревшую серию. Ролик смотрит клиент, сервер только
+    проверяет, что возвращать есть что и срок не вышел."""
+    async with pg.acquire() as c:
+        async with c.transaction():
+            row = await c.fetchrow(
+                "SELECT members, streak_days, streak_last_opened_date, "
+                "active_mascot_id, mascot_streaks FROM groups "
+                "WHERE id = $1 FOR UPDATE", group_id)
+            if row is None:
+                return ORJSONResponse({"ok": False, "error": "not a member"},
+                                      status_code=403)
+            члены = row["members"]
+            if isinstance(члены, str):
+                try:
+                    члены = json.loads(члены)
+                except ValueError:
+                    члены = []
+            if auth_uid not in [str(m) for m in (члены or [])]:
+                return ORJSONResponse({"ok": False, "error": "not a member"},
+                                      status_code=403)
+            маскот = row["active_mascot_id"] or ""
+            карта = row["mascot_streaks"]
+            if isinstance(карта, str):
+                try:
+                    карта = json.loads(карта)
+                except ValueError:
+                    карта = {}
+            карта = карта if isinstance(карта, dict) else {}
+            запись = карта.get(маскот) if маскот else None
+            итог = (_возврат_серии(int(row["streak_days"] or 0),
+                                   row["streak_last_opened_date"] or "",
+                                   запись, today)
+                    if isinstance(запись, dict) else None)
+            if итог is None:
+                return ORJSONResponse({"ok": False, "error": "nothing_to_restore"},
+                                      status_code=409)
+            новая, серия, прошлый = итог
+            карта[маскот] = новая
+            await c.execute(
+                "UPDATE groups SET mascot_streaks = $1, streak_days = $2, "
+                "streak_last_opened_date = $3, updated = $4 WHERE id = $5",
+                json.dumps(карта), float(серия), прошлый, now_pb(), group_id)
+
+    await _record_streak(group_id, маскот, int(новая["s"]))
+    # Поля записи пары целиком: приложение кладёт их в свой кэш сразу, не
+    # дожидаясь события канала.
+    return ORJSONResponse({"ok": True, "streak": int(новая["s"]),
+                           "groupStreak": серия, "mascot_streaks": карта,
+                           "streak_days": серия,
+                           "streak_last_opened_date": прошлый})
+
+КАРТЫ_УЧАСТНИКОВ = ("member_moods", "member_names", "member_avatars",
+                    "member_ailments")
+
+
+def _членство_в_sqlite(uids: list) -> None:
+    """Пересчитать users.group_ids по составу пар — то, что делал хук
+    groups_membership.pb.js на событиях коллекции groups.
+
+    Список ведём в SQLite: правила доступа ВСЕХ коллекций, оставшихся в
+    PocketBase, читают relation users.group_ids, и пустой список закрывает
+    человеку запись начисто (наступали 13.08.2026). Считаем по зеркалу groups
+    в SQLite — оно обновляется той же секундой, что и Postgres.
+    """
+    if not uids:
+        return
+    try:
+      with _lite_rw_lock:
+        for uid in uids:
+            lite_rw.execute(
+                "UPDATE users SET group_ids = COALESCE((SELECT json_group_array(g.id) "
+                "FROM `groups` g WHERE EXISTS (SELECT 1 FROM json_each("
+                "CASE WHEN json_valid(g.members) THEN g.members ELSE '[]' END) je "
+                "WHERE je.value = ?)), '[]') WHERE id = ?", (uid, uid))
+        lite_rw.commit()
+    except sqlite3.Error as e:
+        log.warning("группы участника не пересчитались (%s): %s", uids, e)
+
+
+# Колонки, которых в SQLite PocketBase нет вовсе. Зеркало пишет туда каждое
+# поле карты, и лишнее роняло бы его на каждой паре — а с ним правила доступа
+# всех коллекций. Общий фон чата нужен только самому чату, отчётам и правилам
+# он ни к чему.
+НЕ_ЗЕРКАЛИМ = {"chat_background"}
+ЗЕРКАЛО_КОЛОНКИ = [c for c in COLLECTIONS["groups"]["columns"]
+                   if c not in НЕ_ЗЕРКАЛИМ]
+
+
+def _зеркало_группы_sync(строки: list) -> int:
+    """Положить строки пар из Postgres обратно в SQLite PocketBase.
+
+    Зеркало нужно не ради красоты: правила доступа всех коллекций, оставшихся
+    в PocketBase, ходят через relation users.group_ids -> groups, отчёты
+    админки джойнят пары с пользователями, а хуки читают запись пары напрямую.
+    Пустая или устаревшая таблица тут означает закрытую запись у живых людей.
+    """
+    if not строки:
+        return 0
+    # Одним upsert'ом, а не «UPDATE, не вышло — INSERT»: рабочих процессов у
+    # hotpath несколько, и двое, взявшись за одну пару, ловили друг у друга
+    # UNIQUE constraint failed.
+    вставка = ", ".join(["id"] + [f"`{c}`" for c in ЗЕРКАЛО_КОЛОНКИ])
+    места = ", ".join(["?"] * (len(ЗЕРКАЛО_КОЛОНКИ) + 1))
+    поля = ", ".join(f"`{c}` = excluded.`{c}`" for c in ЗЕРКАЛО_КОЛОНКИ)
+    with _lite_rw_lock:
+        return _зеркало_группы_пишем(строки, вставка, места, поля)
+
+
+def _зеркало_группы_пишем(строки, вставка, места, поля) -> int:
+    сделано = 0
+    # BEGIN только если своей транзакции ещё нет: питоновский sqlite3 открывает
+    # её сам перед первой правкой, и явный BEGIN поверх падает с «cannot start
+    # a transaction within a transaction» — зеркало тогда молча не обновляется.
+    своя = not lite_rw.in_transaction
+    if своя:
+        lite_rw.execute("BEGIN IMMEDIATE")
+    try:
+        for row in строки:
+            значения = []
+            for c in ЗЕРКАЛО_КОЛОНКИ:
+                v = row[c]
+                kind = COLLECTIONS["groups"]["columns"][c]
+                if kind == "json":
+                    значения.append(v if isinstance(v, str) or v is None
+                                    else json.dumps(v, ensure_ascii=False))
+                elif kind == "bool":
+                    значения.append(1 if v else 0)
+                elif kind == "num":
+                    значения.append(float(v or 0))
+                else:
+                    значения.append(v if v is not None else "")
+            lite_rw.execute(
+                f"INSERT INTO `groups` ({вставка}) VALUES ({места}) "
+                f"ON CONFLICT(id) DO UPDATE SET {поля}",
+                (row["id"], *значения))
+            сделано += 1
+        lite_rw.commit()
+    except BaseException:
+        lite_rw.rollback()
+        raise
+    return сделано
+
+
+async def _после_правки_пары(group_id: str, участники: list | None = None,
+                             событие: str = "update") -> None:
+    """Разослать событие пары и, если состав менялся, обновить зеркало и группы.
+
+    Порядок важен: сперва зеркало, потом пересчёт users.group_ids — иначе
+    пересчёт прочитает в SQLite прежний состав и вернёт человеку права на
+    пару, из которой он только что вышел.
+    """
+    async with pg.acquire() as c:
+        row = await c.fetchrow("SELECT * FROM groups WHERE id = $1", group_id)
+    if row is None:
+        return
+    rec = _record_json("groups", row)
+    await _publish("groups", событие, rec)
+    if участники:
+        for попытка in range(3):
+            try:
+                await asyncio.to_thread(_зеркало_группы_sync, [row])
+                break
+            except sqlite3.Error as e:
+                if попытка == 2:
+                    # Не беда: строку подберёт периодическое зеркало, а список
+                    # групп человека — подметальщик sweep_group_ids раз в минуту.
+                    log.warning("зеркало пары %s не обновилось: %s", group_id, e)
+                else:
+                    await asyncio.sleep(0.4 * (попытка + 1))
+        await asyncio.to_thread(_членство_в_sqlite, участники)
+        # Свой кэш состава сбрасываем сразу: этот воркер отдаёт новые права с
+        # первого же запроса. Соседним процессам хватит короткого TTL.
+        for uid in участники:
+            _groups_cache.pop(str(uid), None)
+
+
+@app.post("/api/group/patch-map")
+async def patch_map(request: Request):
+    """Правка карты участника: настроение, имя, аватар, недомогание.
+
+    Было чтение записи, правка карты в памяти и запись обратно внутри
+    транзакции PocketBase. Стало одно выражение над jsonb: гонки двух телефонов
+    больше нет в принципе, а строка блокируется на время самого UPDATE.
+    """
+    if GROUPS_SRC != "pg":
+        return await _proxy_to_pb("/api/group/patch-map", request,
+                                  await request.json())
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    auth_uid, _ = auth
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad params")
+
+    group_id = str(body.get("groupId") or "").strip()
+    field = str(body.get("field") or "").strip()
+    uid = str(body.get("uid") or "").strip()
+    if not group_id or not uid or field not in КАРТЫ_УЧАСТНИКОВ:
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+
+    значение = body.get("value")
+    if значение is None:
+        sql = (f"UPDATE groups SET {field} = COALESCE({field}, '{{}}'::jsonb) - $1, "
+               "updated = $2 WHERE id = $3 AND members @> $4::jsonb RETURNING id")
+        args = [uid, now_pb(), group_id, json.dumps([auth_uid])]
+    else:
+        sql = (f"UPDATE groups SET {field} = jsonb_set("
+               f"COALESCE({field}, '{{}}'::jsonb), ARRAY[$1], $2::jsonb, true), "
+               "updated = $3 WHERE id = $4 AND members @> $5::jsonb RETURNING id")
+        args = [uid, json.dumps(значение), now_pb(), group_id,
+                json.dumps([auth_uid])]
+    async with pg.acquire() as c:
+        got = await c.fetchval(sql, *args)
+    if got is None:
+        return ORJSONResponse({"ok": False, "error": "not a member"}, status_code=403)
+    asyncio.get_running_loop().create_task(_после_правки_пары(group_id))
+    return ORJSONResponse({"ok": True})
+
+
+@app.post("/api/group/increment")
+async def increment_field(request: Request):
+    """Счётчик опыта пары. Остальные счётчики ведёт сервер по факту записи,
+    поэтому старым сборкам отвечаем «сделано» и ничего не трогаем."""
+    if GROUPS_SRC != "pg":
+        return await _proxy_to_pb("/api/group/increment", request,
+                                  await request.json())
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    auth_uid, _ = auth
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad params")
+
+    field = str(body.get("field") or "").strip()
+    if field in ("drawings_count", "memories_count"):
+        return ORJSONResponse({"ok": True, "value": 0, "noop": True})
+    group_id = str(body.get("groupId") or "").strip()
+    try:
+        by = float(body.get("by"))
+    except (TypeError, ValueError):
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+    if not group_id or field != "xp":
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+
+    async with pg.acquire() as c:
+        value = await c.fetchval(
+            "UPDATE groups SET xp = COALESCE(xp, 0) + $1, updated = $2 "
+            "WHERE id = $3 AND members @> $4::jsonb RETURNING xp",
+            by, now_pb(), group_id, json.dumps([auth_uid]))
+    if value is None:
+        return ORJSONResponse({"ok": False, "error": "not a member"}, status_code=403)
+    asyncio.get_running_loop().create_task(_после_правки_пары(group_id))
+    return ORJSONResponse({"ok": True, "value": _num(value)})
+
+
+@app.post("/api/group/leave")
+async def leave_group(request: Request):
+    """Выход из пары: убрать человека из состава и из всех карт, а опустевшую
+    пару пометить распущенной. Записи пары остаются на месте — вернувшийся по
+    коду второго места находит историю там же, где оставил."""
+    if GROUPS_SRC != "pg":
+        return await _proxy_to_pb("/api/group/leave", request,
+                                  await request.json())
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    auth_uid, _ = auth
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad params")
+
+    group_id = str(body.get("groupId") or "").strip()
+    uid = str(body.get("uid") or "").strip()
+    if not group_id or not uid:
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+
+    карты = ", ".join(
+        f"{f} = COALESCE({f}, '{{}}'::jsonb) - $1" for f in КАРТЫ_УЧАСТНИКОВ)
+    async with pg.acquire() as c:
+        row = await c.fetchrow(
+            "UPDATE groups SET members = COALESCE(members, '[]'::jsonb) - $1, "
+            f"{карты}, "
+            "disbanded = (jsonb_array_length(COALESCE(members, '[]'::jsonb) - $1) = 0), "
+            "disbanded_at = CASE WHEN jsonb_array_length("
+            "  COALESCE(members, '[]'::jsonb) - $1) = 0 THEN $2 ELSE disbanded_at END, "
+            "updated = $2 WHERE id = $3 AND members @> $4::jsonb "
+            "RETURNING members",
+            uid, now_pb(), group_id, json.dumps([auth_uid]))
+    if row is None:
+        return ORJSONResponse({"ok": False, "error": "not a member"}, status_code=403)
+    остались = row["members"]
+    if isinstance(остались, str):
+        try:
+            остались = json.loads(остались)
+        except ValueError:
+            остались = []
+    # Ушедшему группы пересчитываем тоже — иначе его правила доступа будут
+    # помнить пару, из которой он вышел.
+    затронуты = [str(m) for m in (остались or []) if m] + [uid]
+    asyncio.get_running_loop().create_task(
+        _после_правки_пары(group_id, затронуты))
+    return ORJSONResponse({"ok": True})
+
+
+@app.post("/api/coins/daily-bonus")
+async def daily_bonus(request: Request):
+    COOLDOWN_MS = 20 * 60 * 60 * 1000
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid, _groups = auth
+
+    seen = await asyncio.to_thread(_lite_user_bonus, uid)
+    if seen is not None:
+        last, coins = seen
+        if last and int(time.time() * 1000) - last < COOLDOWN_MS:
+            return ORJSONResponse({"ok": False, "cooldown": True, "coins": coins})
+    return await _proxy_to_pb("/api/coins/daily-bonus", request, {})
+
+
+# ── Сохранить фигурку на устройство ──────────────────────────────────────────
+
+# Готовим не больше двух роликов разом: ffmpeg на восьмиядерной машине ест
+# ядро целиком, а рядом живут чат и присутствие — их задерживать нельзя.
+_EXPORT_LIMIT = asyncio.Semaphore(2)
+_EXPORT_DIR = "/opt/pocketbase/pb_data/note_export"
+_EXPORT_TOOL = "/opt/pocketbase/tools/note_export.py"
+_EXPORT_PY = "/opt/pocketbase/tools/heicenv/bin/python3"
+_RCLONE = "/usr/local/bin/rclone"
+_BUCKET = "hz:togetherly"  # до 24.10.2026: hk:b86d5542-togetherly-storage
+_MEDIA_COLLECTION = "pbc_2708086759"
+
+
+def _export_build(msg_id: str, media_id: str, name: str, shape: str) -> str | None:
+    """Скачивает исходник, накладывает форму и подпись. Возвращает путь."""
+    os.makedirs(_EXPORT_DIR, exist_ok=True)
+    out = os.path.join(_EXPORT_DIR, f"{msg_id}_{shape}.mp4")
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        return out
+    tmp = tempfile.mkdtemp(prefix="noteexp_src_")
+    src = os.path.join(tmp, name)
+    try:
+        got = subprocess.run(
+            [_RCLONE, "copyto",
+             f"{_BUCKET}/{_MEDIA_COLLECTION}/{media_id}/{name}", src,
+             "--retries", "2", "--low-level-retries", "5"],
+            capture_output=True, timeout=120,
+        )
+        if got.returncode != 0 or not os.path.exists(src):
+            # Молчаливый отказ — худшее, что тут может быть: человек видит
+            # «не получилось сохранить», а в журнале пусто.
+            log.warning("note export %s: rclone rc=%s %s", msg_id,
+                        got.returncode,
+                        got.stderr.decode("utf-8", "replace")[-400:].strip())
+            return None
+        res = subprocess.run(
+            [_EXPORT_PY, _EXPORT_TOOL, "--src", src, "--shape", shape, "--out", out],
+            capture_output=True, timeout=300,
+        )
+        if res.returncode != 0 or not os.path.exists(out):
+            log.warning("note export %s: ffmpeg rc=%s %s", msg_id,
+                        res.returncode,
+                        res.stderr.decode("utf-8", "replace")[-400:].strip())
+            return None
+        log.info("note export %s: готов, %s КБ", msg_id,
+                 os.path.getsize(out) // 1024)
+        return out
+    except Exception as e:
+        log.warning("note export %s: %r", msg_id, e)
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.get("/api/note/export")
+async def note_export(request: Request):
+    """Фигурка для сохранения в галерею: квадрат, форма внутри, подпись.
+
+    Telegram отдаёт свой кружок так же — видео остаётся круглым, а файл обычным
+    квадратным роликом. Готовит ffmpeg на сервере: тащить его в приложение
+    значит прибавить к сборке двенадцать мегабайт ради редкой кнопки.
+
+    Результат кладётся рядом и отдаётся повторно без пересчёта: второе
+    сохранение той же фигурки должно быть мгновенным.
+    """
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    _uid, groups = auth
+
+    msg_id = str(request.query_params.get("msg") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", msg_id or ""):
+        return _err(400, "bad params")
+
+    async with pg.acquire() as c:
+        row = await c.fetchrow(
+            "SELECT group_id, note_url, note_shape FROM chat_messages WHERE id = $1",
+            msg_id,
+        )
+    if row is None:
+        log.warning("note export %s: записи нет в Postgres", msg_id)
+        return _err(404, "not found")
+    # Фигурка принадлежит паре, а не тому, кто знает её id.
+    if str(row["group_id"]) not in groups:
+        log.warning("note export %s: чужая пара %s", msg_id, row["group_id"])
+        return _err(403, "not your message")
+
+    ref = str(row["note_url"] or "")
+    m = re.fullmatch(r"pb://media/([A-Za-z0-9_]+)/(.+)", ref)
+    if not m:
+        log.warning("note export %s: ссылка не pb://media (%s)", msg_id, ref[:80])
+        return _err(422, "not a shape note")
+    shape = str(row["note_shape"] or "circle")
+    if not re.fullmatch(r"[a-zA-Z0-9]{1,24}", shape):
+        shape = "circle"
+
+    async with _EXPORT_LIMIT:
+        path = await asyncio.to_thread(
+            _export_build, msg_id, m.group(1), m.group(2), shape
+        )
+    if not path:
+        return _err(500, "export failed")
+
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"togetherly-{shape}-{msg_id}.mp4",
+    )
+
+
+# ── поиск фильмов ─────────────────────────────────────────────────────────────
+#
+# Приложение искало фильмы прямо в poiskkino одним общим ключом из APK, а его
+# бесплатный тариф — 200 запросов в сутки на всех: к обеду поиск выгорал
+# (19.09.2026). Теперь ищем в Викиданных (CC0, без ключа), а poiskkino зовём
+# только когда там пусто — с ключом на сервере и кэшем. Разбор и сборка
+# живут в movies.py под тестами.
+
+_WD_UA = "Togetherly/1.32 (https://togetherly.day; support@togetherly.day)"
+_POISKKINO_KEY = os.environ.get("POISKKINO_KEY", "TM3RQXB-DCZMAJ5-GF7RGGM-NSKB7JS")
+_MOVIES_TTL = 3 * 86400        # новые фильмы появляются в Викиданных не сразу
+_MOVIES_EMPTY_TTL = 6 * 3600   # пустой ответ помним недолго
+_WD_ENTITY_TTL = 14 * 86400
+_movies_limit = movies.RateLimiter(limit=60, window=600)
+_wd_gate = asyncio.Semaphore(6)
+
+
+async def _wd_fetch(params: dict) -> dict:
+    r = await wd_client.get("https://www.wikidata.org/w/api.php", params=params)
+    r.raise_for_status()
+    data = orjson.loads(r.content)
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(f"wikidata: {data['error']}")
+    return data
+
+
+class _WdCache:
+    async def get(self, ids):
+        if not ids:
+            return {}
+        async with pg.acquire() as c:
+            rows = await c.fetch(
+                "SELECT qid, data FROM wd_cache WHERE qid = ANY($1::text[]) AND updated > $2",
+                list(ids), int(time.time()) - _WD_ENTITY_TTL)
+        return {r["qid"]: orjson.loads(r["data"]) for r in rows}
+
+    async def put(self, items):
+        now = int(time.time())
+        async with pg.acquire() as c:
+            await c.executemany(
+                "INSERT INTO wd_cache (qid, data, updated) VALUES ($1, $2::jsonb, $3) "
+                "ON CONFLICT (qid) DO UPDATE SET data = EXCLUDED.data, updated = EXCLUDED.updated",
+                [(k, orjson.dumps(v).decode(), now) for k, v in items.items()])
+
+
+_wd_search = movies.WikidataSearch(fetch=_wd_fetch, cache=_WdCache())
+
+
+async def _poiskkino(q: str) -> tuple[str, list]:
+    try:
+        r = await wd_client.get(
+            "https://api.poiskkino.dev/v1.4/movie/search",
+            params={"page": "1", "limit": "25", "query": q},
+            headers={"X-API-KEY": _POISKKINO_KEY, "accept": "application/json"})
+        try:
+            body = orjson.loads(r.content)
+        except orjson.JSONDecodeError:
+            body = {}
+    except httpx.HTTPError:
+        return "error", []
+    kind, msg = movies.classify_source(r.status_code, body)
+    if kind != "ok":
+        log.warning("movies: poiskkino %s (%s): %s", kind, r.status_code, msg[:120])
+        return kind, []
+    return "ok", movies.trim_payload(body)["docs"]
+
+
+# ── карточка партнёра и токены Centrifugo (перенос из PocketBase, 19.10.2026) ──
+# Обе вещи шли в PocketBase через JS-хуки: ночью 3 и 6 запросов в секунду, в
+# пик вдвое больше. Логика повторяет user_card.pb.js и centrifugo_tokens.pb.js
+# один в один; сверка с PocketBase — hp_parity_card_tokens.py. Членство в паре
+# смотрим по Postgres (там пары живут), как PocketBase смотрел по `members`.
+
+CENT_TOKEN_HMAC = os.environ.get("CENTRIFUGO_TOKEN_HMAC", "")
+_ROOM_ABC = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _jwt_hs256(claims: dict, secret: str, ttl: int) -> str:
+    """Как `$security.createJWT` у PocketBase: HS256 и `exp` через ttl секунд."""
+    payload = dict(claims, exp=int(time.time()) + ttl)
+    head = _b64url(b'{"alg":"HS256","typ":"JWT"}')
+    body = _b64url(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode())
+    sig = _b64url(hmac.new(secret.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest())
+    return f"{head}.{body}.{sig}"
+
+
+def _room_code(group_id: str) -> str:
+    """Код комнаты просмотра: как codeOf в watch.pb.js — восемь знаков по
+    алфавиту из hex-строки HMAC (`$security.hs256` отдаёт hex)."""
+    digest = hmac.new(CENT_TOKEN_HMAC.encode(), group_id.encode(), hashlib.sha256).hexdigest()
+    return "".join(_ROOM_ABC[ord(ch) % len(_ROOM_ABC)] for ch in digest[:8])
+
+
+def _json_list(v) -> list:
+    """`getStringSlice` у PocketBase: список строк из json-поля."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return []
+    try:
+        parsed = json.loads(v) if isinstance(v, str) else v
+    except ValueError:
+        return [v]
+    if isinstance(parsed, list):
+        return [str(x) for x in parsed]
+    return [str(parsed)] if parsed not in (None, "") else []
+
+
+def _user_card_row(uid: str):
+    with _lite_read_lock:
+        return lite_read.execute(
+            "SELECT id, display_name, avatar_url, banner_url, plus, plus_trial_until, badge, "
+            "frame, gender, birth_date, mascot_sleep, granted_badges, group_ids "
+            "FROM users WHERE id = ?", (uid,)).fetchone()
+
+
+@app.get("/api/user/card")
+async def user_card(request: Request):
+    """Публичная карточка человека из своей пары (перенос user_card.pb.js)."""
+    uid = (request.query_params.get("uid") or "").strip()
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    if not uid:
+        return ORJSONResponse({"ok": False, "error": "no uid"}, status_code=400)
+    me, my_groups = auth
+    row = await asyncio.to_thread(_user_card_row, uid)
+    if row is None:
+        return ORJSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    (rid, display_name, avatar_url, banner_url, plus, trial_until, badge, frame, gender,
+     birth_date, mascot_sleep, granted_badges, group_ids) = row
+    if uid != me and not (set(my_groups) & set(_json_list(group_ids))):
+        return ORJSONResponse({"ok": False, "error": "not in your pair"}, status_code=403)
+    if isinstance(plus, str):
+        plus = plus.strip().lower() in ("1", "true")
+    try:
+        trial = int(float(trial_until or 0))
+    except (TypeError, ValueError):
+        trial = 0
+    sleep = None
+    if mascot_sleep not in (None, "") and str(mascot_sleep).strip():
+        try:
+            sleep = json.loads(mascot_sleep) if isinstance(mascot_sleep, str) else mascot_sleep
+        except ValueError:
+            sleep = mascot_sleep
+    return {
+        "ok": True,
+        "id": rid,
+        "display_name": display_name or "",
+        "avatar_url": avatar_url or "",
+        "banner_url": banner_url or "",
+        "banner_live": bool(plus) or trial > _now_ms(),
+        "badge": badge or "",
+        "frame": frame or "",
+        "gender": gender or "",
+        "birth_date": birth_date or "",
+        "mascot_sleep": sleep,
+        "granted_badges": _json_list(granted_badges),
+        # Часы в приложении — для звания на странице партнёра.
+        "app_seconds": await _app_seconds_of(uid),
+    }
+
+
+# ── Часы в приложении для званий (05.11.2026) ────────────────────────────────
+# Телефон считает секунды, пока приложение на экране, и шлёт их пачкой. Сервер
+# засчитывает не больше реального времени с прошлого отчёта этого телефона:
+# переведённые часы и подделанный запрос звания не дают. Таблицы — app_time.sql.
+
+_APP_TIME_CALL_MAX = 3600
+_APP_TIME_FIRST_MAX = 300
+_APP_TIME_DEVICES = 5
+
+
+def _app_time_grant(sent, last_ms, now_ms):
+    """Сколько присланных секунд засчитать: не больше прошедшего с прошлого
+    отчёта этого телефона (+30 с на сеть) и не больше часа за раз. Первый
+    отчёт телефона — не больше пяти минут."""
+    try:
+        sent = int(sent)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if sent <= 0:
+        return 0
+    if last_ms is None:
+        return min(sent, _APP_TIME_FIRST_MAX)
+    room = max(0, (now_ms - last_ms) // 1000 + 30) if now_ms >= last_ms else 0
+    return int(min(sent, room, _APP_TIME_CALL_MAX))
+
+
+async def _app_seconds_of(uid: str) -> int:
+    try:
+        async with pg.acquire() as c:
+            return int(await c.fetchval("SELECT seconds FROM user_app_time WHERE uid = $1", uid) or 0)
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as e:
+        log.warning("app time read %s: %r", uid, e)
+        return 0
+
+
+@app.post("/api/user/app-time")
+async def app_time(request: Request):
+    """Отчёт телефона: {device, seconds} → {seconds, rank_seen, granted}.
+    seconds = 0 — просто прочитать свои часы."""
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid, _groups = auth
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return ORJSONResponse({"ok": False, "error": "bad body"}, status_code=400)
+    device = str(body.get("device") or "").strip()[:64]
+    if not device:
+        return ORJSONResponse({"ok": False, "error": "no device"}, status_code=400)
+    now = _now_ms()
+    async with pg.acquire() as c:
+        async with c.transaction():
+            last = await c.fetchval(
+                "SELECT reported_at FROM app_time_devices WHERE uid = $1 AND device = $2 FOR UPDATE",
+                uid, device)
+            known = last is not None
+            # Новый телефон сверх пяти не считается: иначе часы набивались бы
+            # первыми отчётами выдуманных телефонов.
+            if not known and await c.fetchval(
+                    "SELECT count(*) FROM app_time_devices WHERE uid = $1", uid) >= _APP_TIME_DEVICES:
+                grant = 0
+            else:
+                grant = _app_time_grant(body.get("seconds"), last, now)
+                await c.execute(
+                    "INSERT INTO app_time_devices (uid, device, reported_at) VALUES ($1, $2, $3) "
+                    "ON CONFLICT (uid, device) DO UPDATE SET reported_at = EXCLUDED.reported_at",
+                    uid, device, now)
+            row = await c.fetchrow(
+                "INSERT INTO user_app_time (uid, seconds) VALUES ($1, $2) "
+                "ON CONFLICT (uid) DO UPDATE SET seconds = user_app_time.seconds + EXCLUDED.seconds "
+                "RETURNING seconds, rank_seen",
+                uid, grant)
+    return {"ok": True, "seconds": int(row["seconds"]), "rank_seen": int(row["rank_seen"]), "granted": grant}
+
+
+@app.post("/api/user/app-time/seen")
+async def app_time_seen(request: Request):
+    """Экран нового звания показан: {rank}. Отметка только растёт, поэтому
+    после переустановки приложения экран не повторяется."""
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid, _groups = auth
+    try:
+        body = await request.json()
+        rank = int(body.get("rank"))
+    except (ValueError, TypeError, AttributeError):
+        return ORJSONResponse({"ok": False, "error": "bad rank"}, status_code=400)
+    if not 0 <= rank <= 99:
+        return ORJSONResponse({"ok": False, "error": "bad rank"}, status_code=400)
+    async with pg.acquire() as c:
+        seen = await c.fetchval(
+            "INSERT INTO user_app_time (uid, rank_seen) VALUES ($1, $2) "
+            "ON CONFLICT (uid) DO UPDATE SET rank_seen = GREATEST(user_app_time.rank_seen, EXCLUDED.rank_seen) "
+            "RETURNING rank_seen",
+            uid, rank)
+    return {"ok": True, "rank_seen": int(seen)}
+
+
+@app.post("/api/centrifugo/connection-token")
+async def cent_connection_token(request: Request):
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    if not CENT_TOKEN_HMAC:
+        return ORJSONResponse({"error": "not configured"}, status_code=500)
+    return {"token": _jwt_hs256({"sub": auth[0]}, CENT_TOKEN_HMAC, 86400)}
+
+
+async def _in_group(uid: str, group_id: str) -> bool:
+    async with pg.acquire() as c:
+        return bool(await c.fetchval(
+            "SELECT 1 FROM groups WHERE id = $1 AND members @> $2::jsonb",
+            group_id, json.dumps([uid])))
+
+
+@app.post("/api/centrifugo/subscription-token")
+async def cent_subscription_token(request: Request):
+    """Пропуск в приватный канал (перенос centrifugo_tokens.pb.js)."""
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid = auth[0]
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        body = {}
+    channel = str(body.get("channel") or "")
+    if not channel:
+        return ORJSONResponse({"error": "channel required"}, status_code=400)
+
+    allowed = False
+    if channel.startswith("pair:") or channel.startswith("draw:"):
+        allowed = await _in_group(uid, channel[5:])
+    elif channel.startswith("user:"):
+        target = channel[5:]
+        if target == uid:
+            allowed = True
+        else:
+            async with pg.acquire() as c:
+                allowed = bool(await c.fetchval(
+                    "SELECT 1 FROM groups WHERE members @> $1::jsonb "
+                    "AND members @> $2::jsonb LIMIT 1",
+                    json.dumps([uid]), json.dumps([target])))
+    elif channel.startswith("loc:"):
+        allowed = uid in channel
+    elif channel.startswith("watch:") and CENT_TOKEN_HMAC:
+        room = channel[6:]
+        async with pg.acquire() as c:
+            mine = await c.fetch(
+                "SELECT id FROM groups WHERE members @> $1::jsonb", json.dumps([uid]))
+        allowed = any(_room_code(r["id"]) == room for r in mine)
+    if not allowed:
+        return ORJSONResponse({"error": "forbidden"}, status_code=403)
+    if not CENT_TOKEN_HMAC:
+        return ORJSONResponse({"error": "not configured"}, status_code=500)
+    claims = {"sub": uid, "channel": channel}
+    if channel.startswith("watch:"):
+        # Служебная подписка приложения в комнате: страница не считает её
+        # вторым зрителем (см. countViewers в room.js).
+        claims["info"] = {"app": 1}
+    return {"token": _jwt_hs256(claims, CENT_TOKEN_HMAC, 86400)}
+
+
+@app.get("/api/movies/search")
+async def movies_search(request: Request):
+    """Фильмы и сериалы по названию, в форме ответа poiskkino.
+
+    Клиент читает ответ прежним разбором. 429 — человек ищет слишком часто,
+    503 с `reason: quota` — Викиданные не ответили, а запасной ключ на сегодня
+    кончился.
+    """
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid, _groups = auth
+
+    q = movies.norm_query(request.query_params.get("q"))
+    lang = str(request.query_params.get("lang") or "ru")[:2].lower()
+    if lang not in movies.LANGS:
+        lang = "en"
+    if not q:
+        return {"docs": [], "source": "empty"}
+
+    key = f"{lang}|{q}"
+    now = int(time.time())
+    async with pg.acquire() as c:
+        row = await c.fetchrow(
+            "SELECT docs, source, updated FROM movie_query_cache WHERE key = $1", key)
+    if row is not None:
+        docs = orjson.loads(row["docs"])
+        ttl = _MOVIES_TTL if docs else _MOVIES_EMPTY_TTL
+        if movies.cache_fresh(row["updated"], now, ttl):
+            return {"docs": docs, "source": "cache"}
+
+    if not _movies_limit.allow(uid):
+        return _err(429, "too many searches")
+
+    docs, source, wd_failed = [], "wikidata", False
+    try:
+        async with _wd_gate:
+            docs = await asyncio.wait_for(_wd_search.search(q, lang), 20)
+    except Exception as e:  # noqa: BLE001 — любой сбой Викиданных уводит в запас
+        wd_failed = True
+        log.warning("movies: викиданные %r: %s", q, e)
+
+    quota = False
+    if not docs and len(q) >= 3:
+        kind, pdocs = await _poiskkino(q)
+        if kind == "ok":
+            docs, source = pdocs, "poiskkino"
+        quota = kind == "quota"
+
+    if not docs and wd_failed:
+        return _err(503, "movie search failed", {"reason": "quota" if quota else "source"})
+    if not docs:
+        source = "none"
+
+    async with pg.acquire() as c:
+        await c.execute(
+            "INSERT INTO movie_query_cache (key, docs, source, updated) "
+            "VALUES ($1, $2::jsonb, $3, $4) ON CONFLICT (key) DO UPDATE "
+            "SET docs = EXCLUDED.docs, source = EXCLUDED.source, updated = EXCLUDED.updated",
+            key, orjson.dumps(docs).decode(), source, now)
+    return {"docs": docs, "source": source}
+
+
+@app.get("/internal/count")
+async def internal_count(col: str, group_id: str = "", mode: str = ""):
+    """Счётчики для серверной кухни (couple_stats.pb.js, insights_aggregate.py).
+
+    Без параметров — «сколько групп пользуются» (DISTINCT group_id, живые
+    записи), mode=rows — «сколько всего строк» (как COUNT(*) в прежнем SQLite).
+    Наружу не выходит: сервис слушает 127.0.0.1, а Caddy маршрутизирует сюда
+    только /api/collections/<горячие>/records*.
+    """
+    if col not in COLLECTIONS:
+        return _err(404, "The requested resource wasn't found.")
+    has_deleted = "deleted" in COLLECTIONS[col]["columns"]
+    not_deleted = "AND NOT deleted" if has_deleted else ""
+    async with pg.acquire() as c:
+        if group_id:
+            n = await c.fetchval(
+                f"SELECT COUNT(*) FROM {col} WHERE group_id = $1 {not_deleted}",
+                group_id,
+            )
+        elif mode == "rows":
+            n = await c.fetchval(f"SELECT COUNT(*) FROM {col}")
+        else:
+            n = await c.fetchval(
+                f"SELECT COUNT(DISTINCT group_id) FROM {col} WHERE TRUE {not_deleted}"
+            )
+    return {"n": n}
+
+
+# Локальное время автора отметки: UTC + пояс из `tz` (пустой пояс у легаси
+# означает «в строке уже часы автора» — сдвиг не нужен). Повтор moodLocal
+# из couple_stats.pb.js на диалекте Postgres.
+_TS_OK = r"timestamp ~ '^\d{4}-\d{2}-\d{2}'"
+_TS_UTC = "replace(replace(timestamp,'T',' '),'Z','')::timestamp"
+_MOOD_LOCAL = (
+    f"({_TS_UTC} + CASE WHEN tz ~ '^[+-][0-9]{{2}}:[0-9]{{2}}$' "
+    "THEN tz::interval ELSE interval '0' END)"
+)
+_UTC_NOW = "(now() at time zone 'utc')"
+
+
+@app.post("/internal/record")
+async def internal_record(request: Request):
+    """Серверная запись без токена: для хуков PB, которые сами кладут записи
+    в вынесенные коллекции (салют из gifts.pb.js создаёт воспоминание).
+    Наружу закрыто — Caddy сюда не маршрутизирует, слушаем только петлю."""
+    try:
+        body = await request.json()
+        col = str(body.pop("collection", ""))
+        assert col in COLLECTIONS
+    except Exception:
+        return _err(400, "Failed to create record.")
+    meta = COLLECTIONS[col]
+    rid = str(body.get("id") or "") or _new_id()
+    cols, vals = ["id"], [rid]
+    for field, kind in meta["columns"].items():
+        v = body.get(field)
+        cols.append(field)
+        if kind in ("auto", "created"):
+            vals.append(now_pb())
+        elif kind == "json":
+            vals.append(json.dumps(v) if not isinstance(v, (str, type(None))) else v)
+        elif kind == "num":
+            vals.append(float(v or 0))
+        elif kind == "bool":
+            vals.append(bool(v))
+        elif kind == "date":
+            vals.append(str(v).replace("T", " ") if v else "")
+        else:
+            vals.append(str(v) if v is not None else "")
+    ph = ", ".join(f"${i + 1}" for i in range(len(vals)))
+    async with pg.acquire() as c:
+        try:
+            row = await c.fetchrow(
+                f"INSERT INTO {col} ({', '.join(cols)}) VALUES ({ph}) RETURNING *", *vals)
+        except asyncpg.UniqueViolationError:
+            return _err(400, "Failed to create record.", {
+                "id": {"code": "validation_not_unique", "message": "Value must be unique."}})
+    rec = _record_json(col, row)
+    if col == "groups":
+        # у пары событие идёт вместе с пересчётом членства и зеркалом
+        участники = rec.get("members") if isinstance(rec.get("members"), list) else []
+        asyncio.get_running_loop().create_task(
+            _после_правки_пары(rid, [str(m) for m in участники], событие="create"))
+    else:
+        asyncio.get_running_loop().create_task(_publish(col, "create", rec))
+    asyncio.get_running_loop().create_task(_after_create(col, rec))
+    return rec
+
+
+@app.post("/internal/group-write")
+async def internal_group_write(request: Request):
+    """Правка записи пары для серверной кухни: хуки PocketBase, скрипты.
+
+    Нужен потому, что после переезда пары событий коллекции `groups` в
+    PocketBase больше не происходит: хук, сохраняющий запись у себя, попадёт в
+    зеркало, а зеркало односторонее. Поэтому все, кто раньше звал
+    findRecordById + save, зовут этот маршрут и пишут прямо в Postgres.
+
+    Тело: {group_id, mode: patch|create, set, inc, map_set, map_del, arr_add,
+    members_changed}. Доступ только с самой машины — наружу /internal Caddy не
+    маршрутизирует, но проверяем и здесь.
+    """
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad body")
+
+    group_id = str(body.get("group_id") or "").strip()
+    if not group_id:
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+    колонки = COLLECTIONS["groups"]["columns"]
+
+    def тип(f):
+        return колонки.get(f)
+
+    sets, args = [], []
+
+    def добавить(v):
+        args.append(v)
+        return f"${len(args)}"
+
+    for f, v in (body.get("set") or {}).items():
+        k = тип(f)
+        if k is None or k == "auto":
+            continue
+        if k == "json":
+            sets.append(f"{f} = {добавить(json.dumps(v) if v is not None else None)}::jsonb")
+        elif k == "num":
+            sets.append(f"{f} = {добавить(float(v or 0))}")
+        elif k == "bool":
+            sets.append(f"{f} = {добавить(bool(v))}")
+        else:
+            sets.append(f"{f} = {добавить(str(v) if v is not None else '')}")
+    for f, v in (body.get("inc") or {}).items():
+        if тип(f) == "num":
+            sets.append(f"{f} = GREATEST(0, COALESCE({f}, 0) + {добавить(float(v or 0))})")
+    for f, карта in (body.get("map_set") or {}).items():
+        if тип(f) != "json" or not isinstance(карта, dict):
+            continue
+        выражение = f"COALESCE({f}, '{{}}'::jsonb)"
+        for ключ, значение in карта.items():
+            выражение = (f"jsonb_set({выражение}, ARRAY[{добавить(str(ключ))}], "
+                         f"{добавить(json.dumps(значение))}::jsonb, true)")
+        sets.append(f"{f} = {выражение}")
+    for f, ключи in (body.get("map_del") or {}).items():
+        if тип(f) != "json" or not isinstance(ключи, list):
+            continue
+        выражение = f"COALESCE({f}, '{{}}'::jsonb)"
+        for ключ in ключи:
+            выражение = f"({выражение} - {добавить(str(ключ))})"
+        sets.append(f"{f} = {выражение}")
+    for f, значения in (body.get("arr_add") or {}).items():
+        if тип(f) != "json" or not isinstance(значения, list):
+            continue
+        выражение = f"COALESCE({f}, '[]'::jsonb)"
+        for знач in значения:
+            один = добавить(json.dumps([знач]))
+            выражение = (f"(CASE WHEN {выражение} @> {один}::jsonb THEN {выражение} "
+                         f"ELSE {выражение} || {один}::jsonb END)")
+        sets.append(f"{f} = {выражение}")
+
+    sets.append(f"updated = {добавить(now_pb())}")
+    режим = str(body.get("mode") or "patch")
+    async with pg.acquire() as c:
+        if режим == "create":
+            есть = await c.fetchval("SELECT 1 FROM groups WHERE id = $1", group_id)
+            if not есть:
+                await c.execute(
+                    "INSERT INTO groups (id, created_at, updated) VALUES ($1, $2, $2)",
+                    group_id, now_pb())
+        row = await c.fetchrow(
+            f"UPDATE groups SET {', '.join(sets)} WHERE id = ${len(args) + 1} "
+            "RETURNING *", *args, group_id)
+    if row is None:
+        return ORJSONResponse({"ok": False, "error": "no group"}, status_code=404)
+
+    rec = _record_json("groups", row)
+    участники = rec.get("members") if body.get("members_changed") else None
+    участники = [str(m) for m in участники] if isinstance(участники, list) else None
+    if body.get("members_changed"):
+        # состав пары трогали — зеркало и списки групп людей обязаны догнать
+        # немедленно, от них зависят правила доступа в PocketBase
+        добавочные = [str(u) for u in (body.get("also_recount") or []) if u]
+        try:
+            await asyncio.to_thread(_зеркало_группы_sync, [row])
+        except sqlite3.Error as e:
+            log.warning("зеркало пары %s: %s", group_id, e)
+        await asyncio.to_thread(_членство_в_sqlite,
+                                (участники or []) + добавочные)
+    asyncio.get_running_loop().create_task(_publish("groups", "update", rec))
+    return ORJSONResponse({"ok": True, "record": rec})
+
+
+def _поля_пары_из_sqlite(group_id: str, поля: list) -> tuple | None:
+    строка = ", ".join(f"`{f}`" for f in поля)
+    return lite.execute(
+        f"SELECT {строка}, COALESCE(updated,'') FROM `groups` WHERE id = ?",
+        (group_id,)).fetchone()
+
+
+@app.post("/internal/group-sync")
+async def internal_group_sync(request: Request):
+    """Подтянуть в Postgres поля пары, которые только что записал хук PocketBase.
+
+    Хуки (приём приглашения, дни рождения, покупки, пара с пустым местом)
+    остались работать со своей записью в PocketBase: так сохраняются их
+    транзакции, событие realtime и пересчёт users.group_ids. Здесь мы лишь
+    переносим ИЗМЕНЁННЫЕ поля в Postgres, откуда их теперь читает приложение.
+
+    Переносим точечно, а не строку целиком: между сохранением хука и этим
+    вызовом приложение могло поправить в Postgres что-то своё (настроение,
+    счётчик), и полная заливка стёрла бы эту правку.
+    """
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad body")
+
+    group_id = str(body.get("group_id") or "").strip()
+    колонки = COLLECTIONS["groups"]["columns"]
+    поля = [f for f in (body.get("fields") or [])
+            if f in колонки and колонки[f] != "auto"]
+    if not group_id or not поля:
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+
+    row = await asyncio.to_thread(_поля_пары_из_sqlite, group_id, поля)
+    if row is None:
+        return ORJSONResponse({"ok": False, "error": "no group"}, status_code=404)
+
+    значения, sets = [], []
+    for i, f in enumerate(поля):
+        v = row[i]
+        kind = колонки[f]
+        if kind == "json":
+            s = v if isinstance(v, str) or v is None else json.dumps(v)
+            значения.append(s if (s or "").strip() else None)
+            sets.append(f"{f} = ${len(значения)}::jsonb")
+        elif kind == "num":
+            значения.append(float(v or 0))
+            sets.append(f"{f} = ${len(значения)}")
+        elif kind == "bool":
+            значения.append(bool(v))
+            sets.append(f"{f} = ${len(значения)}")
+        else:
+            значения.append(str(v) if v is not None else "")
+            sets.append(f"{f} = ${len(значения)}")
+    # Время правки берём из SQLite: тогда зеркало видит, что базы согласованы,
+    # и не понесёт строку обратно.
+    значения.append(row[len(поля)] or now_pb())
+    sets.append(f"updated = ${len(значения)}")
+    значения.append(group_id)
+
+    async with pg.acquire() as c:
+        готово = await c.fetchval(
+            f"UPDATE groups SET {', '.join(sets)} WHERE id = ${len(значения)} "
+            "RETURNING id", *значения)
+        if готово is None:
+            # Пара только что заведена хуком — заносим её в Postgres целиком.
+            все_поля = list(колонки)
+            полная = await asyncio.to_thread(
+                _поля_пары_из_sqlite, group_id,
+                [f for f in все_поля if f != "updated"])
+            if полная is None:
+                return ORJSONResponse({"ok": False, "error": "no group"},
+                                      status_code=404)
+            await _поднять_из_sqlite([group_id])
+    return ORJSONResponse({"ok": True})
+
+
+АЗБУКА_КОДА = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _новый_код() -> str:
+    return "".join(secrets.choice(АЗБУКА_КОДА) for _ in range(8))
+
+
+@app.get("/internal/groups-of")
+async def internal_groups_of(request: Request, uid: str = "", live: int = 1):
+    """Пары человека — тем же смыслом, что фильтр members ~ uid у PocketBase."""
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    if not uid:
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+    условие = " AND disbanded = false" if live else ""
+    async with pg.acquire() as c:
+        rows = await c.fetch(
+            f"SELECT * FROM groups WHERE members @> $1::jsonb{условие} "
+            "ORDER BY updated DESC LIMIT 20", json.dumps([uid]))
+    return ORJSONResponse({"ok": True,
+                           "items": [_record_json("groups", r) for r in rows]})
+
+
+@app.post("/internal/waiting-create")
+async def internal_waiting_create(request: Request):
+    """Завести пару, где второго ещё нет: его место держит заглушка.
+
+    Проверка «живой пары ещё нет» и выдача свободного кода делаются здесь же,
+    одной транзакцией: иначе два быстрых нажатия заводили две пары.
+    """
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad body")
+    uid = str(body.get("uid") or "").strip()
+    имя_заглушки = str(body.get("placeholder_name") or "").strip()[:60]
+    if not uid or not имя_заглушки:
+        return ORJSONResponse({"success": False, "message": "Впишите имя"},
+                              status_code=400)
+
+    async with pg.acquire() as c:
+        async with c.transaction():
+            свои = await c.fetch(
+                "SELECT members, claim_token FROM groups WHERE members @> $1::jsonb "
+                "AND disbanded = false LIMIT 5", json.dumps([uid]))
+            for r in свои:
+                состав = r["members"]
+                if isinstance(состав, str):
+                    try:
+                        состав = json.loads(состав)
+                    except ValueError:
+                        состав = []
+                if len(состав or []) > 1 or (r["claim_token"] or ""):
+                    return ORJSONResponse(
+                        {"success": False, "message": "У вас уже есть пара"},
+                        status_code=400)
+            код = ""
+            for _ in range(12):
+                кандидат = _новый_код()
+                занят = await c.fetchval(
+                    "SELECT 1 FROM groups WHERE claim_token = $1", кандидат)
+                if not занят:
+                    код = кандидат
+                    break
+            if not код:
+                return ORJSONResponse(
+                    {"success": False, "message": "Не удалось выдать код"},
+                    status_code=500)
+            gid = _new_id()
+            сейчас = now_pb()
+            await c.execute(
+                "INSERT INTO groups (id, members, member_names, member_avatars, "
+                "max_members, relationship_type, custom_relationship_types, "
+                "memories_count, drawings_count, start_date, created_at, "
+                "disbanded, waiting_mode, placeholder_name, placeholder_avatar, "
+                "return_date, claim_token, updated) VALUES "
+                "($1, $2::jsonb, $3::jsonb, $4::jsonb, 2, 'couple', '[]'::jsonb, "
+                "0, 0, $5, $5, false, true, $6, $7, $8, $9, $5)",
+                gid, json.dumps([uid]),
+                json.dumps({uid: str(body.get("my_name") or "")}),
+                json.dumps({uid: str(body.get("my_avatar") or "")}),
+                сейчас, имя_заглушки, str(body.get("placeholder_avatar") or ""),
+                str(body.get("return_date") or ""), код)
+    await _после_правки_пары(gid, [uid], событие="create")
+    return ORJSONResponse({"success": True, "pairId": gid, "code": код})
+
+
+@app.post("/internal/waiting-reset")
+async def internal_waiting_reset(request: Request):
+    """Выдать новый код второго места (код утёк, расставание).
+
+    Занятое место кодом не освобождается: это отдельное решение и отдельная
+    кнопка — роспуск пары.
+    """
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad body")
+    group_id = str(body.get("group_id") or "").strip()
+    uid = str(body.get("uid") or "").strip()
+    if not group_id or not uid:
+        return ORJSONResponse({"success": False, "message": "Не указана пара"},
+                              status_code=400)
+
+    async with pg.acquire() as c:
+        async with c.transaction():
+            row = await c.fetchrow(
+                "SELECT members FROM groups WHERE id = $1 FOR UPDATE", group_id)
+            if row is None:
+                return ORJSONResponse({"success": False, "message": "Пара не найдена"},
+                                      status_code=404)
+            состав = row["members"]
+            if isinstance(состав, str):
+                try:
+                    состав = json.loads(состав)
+                except ValueError:
+                    состав = []
+            состав = [str(m) for m in (состав or []) if m]
+            if uid not in состав:
+                return ORJSONResponse({"success": False, "message": "Это не ваша пара"},
+                                      status_code=403)
+            if len(состав) > 1:
+                return ORJSONResponse({"success": False, "message": "Место уже занято"},
+                                      status_code=400)
+            код = ""
+            for _ in range(12):
+                кандидат = _новый_код()
+                занят = await c.fetchval(
+                    "SELECT 1 FROM groups WHERE claim_token = $1", кандидат)
+                if not занят:
+                    код = кандидат
+                    break
+            if not код:
+                return ORJSONResponse({"success": False, "message": "Не удалось выдать код"},
+                                      status_code=500)
+            await c.execute(
+                "UPDATE groups SET claim_token = $1, claim_uid = '', claim_name = '', "
+                "claim_at = 0, waiting_mode = true, updated = $2 WHERE id = $3",
+                код, now_pb(), group_id)
+    asyncio.get_running_loop().create_task(_после_правки_пары(group_id))
+    return ORJSONResponse({"success": True, "code": код})
+
+
+@app.get("/internal/group-read")
+async def internal_group_read(request: Request, id: str = "", claim_token: str = ""):
+    """Запись пары для серверной кухни: по id или по коду второго места.
+
+    Хуки читают пару отсюда, а не из SQLite: зеркало отстаёт на минуты, и
+    решение, принятое по нему (место занято, заявка уже есть), было бы принято
+    по вчерашним данным.
+    """
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    if id:
+        sql, args = "SELECT * FROM groups WHERE id = $1", [id]
+    elif claim_token:
+        # Код второго места ищем только у живых пар: у распущенных он остаётся
+        # формально годным и уводил вернувшегося в пару без участников.
+        sql = ("SELECT * FROM groups WHERE claim_token = $1 AND disbanded = false "
+               "LIMIT 1")
+        args = [claim_token]
+    else:
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+    async with pg.acquire() as c:
+        row = await c.fetchrow(sql, *args)
+    if row is None:
+        return ORJSONResponse({"ok": False, "error": "no group"}, status_code=404)
+    return ORJSONResponse({"ok": True, "record": _record_json("groups", row)})
+
+
+@app.post("/internal/pair-claim-approve")
+async def internal_pair_claim_approve(request: Request):
+    """Хозяйка пары подтверждает: «это он». Место занимается, код гасится.
+
+    Атомарно по строке пары: два одновременных подтверждения не пустят в пару
+    двоих, а повтор того же нажатия не задвоит участника.
+    """
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad body")
+    group_id = str(body.get("group_id") or "").strip()
+    претендент = str(body.get("claim_uid") or "").strip()
+    имя = str(body.get("claim_name") or "")
+    аватар = str(body.get("claim_avatar") or "")
+    if not group_id or not претендент:
+        return ORJSONResponse({"ok": False, "error": "bad params"}, status_code=400)
+
+    async with pg.acquire() as c:
+        async with c.transaction():
+            row = await c.fetchrow(
+                "SELECT members, max_members FROM groups WHERE id = $1 FOR UPDATE",
+                group_id)
+            if row is None:
+                return ORJSONResponse({"ok": False, "error": "no group"},
+                                      status_code=404)
+            состав = row["members"]
+            if isinstance(состав, str):
+                try:
+                    состав = json.loads(состав)
+                except ValueError:
+                    состав = []
+            состав = [str(m) for m in (состав or []) if m]
+            if претендент not in состав:
+                предел = int(row["max_members"] or 2) or 2
+                if len(состав) >= предел:
+                    return ORJSONResponse({"ok": False, "error": "full"},
+                                          status_code=400)
+                состав.append(претендент)
+            await c.execute(
+                "UPDATE groups SET members = $1::jsonb, "
+                "member_names = jsonb_set(COALESCE(member_names, '{}'::jsonb), "
+                "  ARRAY[$2], $3::jsonb, true), "
+                "member_avatars = jsonb_set(COALESCE(member_avatars, '{}'::jsonb), "
+                "  ARRAY[$2], $4::jsonb, true), "
+                "waiting_mode = false, claim_token = '', claim_uid = '', "
+                "claim_name = '', claim_at = 0, updated = $5 WHERE id = $6",
+                json.dumps(состав), претендент, json.dumps(имя),
+                json.dumps(аватар), now_pb(), group_id)
+    await _после_правки_пары(group_id, состав)
+    return ORJSONResponse({"ok": True, "members": состав})
+
+
+@app.post("/internal/pair-accept")
+async def internal_pair_accept(request: Request):
+    """Приём кода приглашения целиком в Postgres.
+
+    Раньше это жило в invite.pb.js и держалось на транзакциях PocketBase: они
+    сериализовали параллельные приёмы на единственном соединении записи. В
+    Postgres та же гарантия даётся блокировкой одной строки пары, поэтому
+    приёмы разных пар больше не стоят друг за другом.
+
+    Ветвление сохранено один в один: код привязан к паре → войти; у
+    приглашающего есть живая пара с местом → войти; есть общая распущенная →
+    поднять; иначе завести новую.
+    """
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        return _err(404, "The requested resource wasn't found.")
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "bad body")
+
+    хозяин = str(body.get("owner_uid") or "").strip()
+    я = str(body.get("my_uid") or "").strip()
+    код_группы = str(body.get("code_group_id") or "").strip()
+    имена = {хозяин: str(body.get("owner_name") or "Partner"),
+             я: str(body.get("my_name") or "")}
+    аватары = {хозяин: str(body.get("owner_avatar") or ""),
+               я: str(body.get("my_avatar") or "")}
+    if not хозяин or not я or хозяин == я:
+        return ORJSONResponse({"success": False, "message": "bad params"},
+                              status_code=400)
+
+    async with pg.acquire() as c:
+        async with c.transaction():
+            async def войти(gid: str):
+                row = await c.fetchrow(
+                    "SELECT members, max_members, disbanded FROM groups "
+                    "WHERE id = $1 FOR UPDATE", gid)
+                if row is None:
+                    return None
+                состав = row["members"]
+                if isinstance(состав, str):
+                    try:
+                        состав = json.loads(состав)
+                    except ValueError:
+                        состав = []
+                состав = [str(m) for m in (состав or []) if m]
+                # Роспуск пары НЕ чистит состав: `disbandGroup` в приложении
+                # ставит один флаг, чтобы пару можно было поднять со всей
+                # историей. Значит у распущенной пары в составе так и лежат
+                # двое — на 07.09.2026 таких 3809, за одну неделю прибавилось
+                # 640. Считать их место занятым нельзя.
+                распущена = bool(row["disbanded"])
+                if я in состав:
+                    # Повтор приёма своего же кода: пара уже собрана. Отвечаем
+                    # успехом с тем же id — раньше человек ловил тут «Код не
+                    # найден» поверх состоявшейся пары, 517 отказов за сутки.
+                    if распущена:
+                        # Пара распущена, а я в её составе: поднимаем. Раньше
+                        # здесь возвращался успех без снятия флага — человек
+                        # видел «Подключились», а пары по-прежнему не было.
+                        await c.execute(
+                            "UPDATE groups SET waiting_mode = false, "
+                            "claim_token = '', claim_uid = '', claim_name = '', "
+                            "claim_at = 0, disbanded = false, disbanded_at = '', "
+                            "updated = $1 WHERE id = $2", now_pb(), gid)
+                        return {"success": True, "message": "Reconnected!",
+                                "pairId": gid, "restored": True, "_members": состав}
+                    return {"success": True, "message": "Connected!", "pairId": gid}
+                предел = int(row["max_members"] or 2) or 2
+                if len(состав) >= предел:
+                    if распущена:
+                        # Место держат ушедшие. Отказ здесь обрывал разбор:
+                        # `итог` переставал быть None, и ветки ниже — живая
+                        # пара приглашающего и подъём общей распущенной — не
+                        # пробовались вовсе. Человек читал «Группа заполнена»
+                        # про пару, которой нет; жалоба @a_cringe 04.09.2026.
+                        return None
+                    return {"success": False, "message": "Группа заполнена"}
+                состав.append(я)
+                await c.execute(
+                    "UPDATE groups SET members = $1::jsonb, "
+                    "member_names = jsonb_set(COALESCE(member_names, '{}'::jsonb), "
+                    "  ARRAY[$2], $3::jsonb, true), "
+                    "member_avatars = jsonb_set(COALESCE(member_avatars, '{}'::jsonb), "
+                    "  ARRAY[$2], $4::jsonb, true), "
+                    # Место занято — значит ждать больше некого. Флаг гасили
+                    # только приёмом кода ВТОРОГО МЕСТА, а партнёр входит и
+                    # обычным приглашением: пара оставалась «ждущей» навсегда,
+                    # экран связи показывал «Ждём человека» поверх живой пары,
+                    # и выйти оттуда было нельзя — отмена ожидания честно
+                    # отвечала «Место уже занято» (809 живых пар на 20.08.2026).
+                    "waiting_mode = false, claim_token = '', claim_uid = '', "
+                    "claim_name = '', claim_at = 0, "
+                    "disbanded = false, updated = $5 WHERE id = $6",
+                    json.dumps(состав), я, json.dumps(имена[я]),
+                    json.dumps(аватары[я]), now_pb(), gid)
+                return {"success": True, "message": "Joined the group!",
+                        "pairId": gid, "_members": состав}
+
+            итог = None
+            if код_группы:
+                итог = await войти(код_группы)
+            if итог is None:
+                # живая пара приглашающего, где есть место
+                строки = await c.fetch(
+                    "SELECT id FROM groups WHERE members @> $1::jsonb "
+                    "AND disbanded = false ORDER BY updated DESC LIMIT 5",
+                    json.dumps([хозяин]))
+                for r in строки:
+                    итог = await войти(r["id"])
+                    if итог and итог.get("success"):
+                        break
+                    итог = None
+            if итог is None:
+                # общая распущенная пара — поднимаем её со всей историей
+                строка = await c.fetchrow(
+                    "SELECT id FROM groups WHERE members @> $1::jsonb "
+                    "AND members @> $2::jsonb ORDER BY updated DESC LIMIT 1",
+                    json.dumps([хозяин]), json.dumps([я]))
+                if строка is not None:
+                    await c.execute(
+                        "UPDATE groups SET members = $1::jsonb, "
+                        "member_names = COALESCE(member_names, '{}'::jsonb) || $2::jsonb, "
+                        "member_avatars = COALESCE(member_avatars, '{}'::jsonb) || $3::jsonb, "
+                        # Та же причина, что и выше: поднятая пара с живым
+                        # партнёром никого не ждёт.
+                        "waiting_mode = false, claim_token = '', claim_uid = '', "
+                        "claim_name = '', claim_at = 0, "
+                        "disbanded = false, disbanded_at = '', updated = $4 "
+                        "WHERE id = $5",
+                        json.dumps([хозяин, я]), json.dumps(имена),
+                        json.dumps(аватары), now_pb(), строка["id"])
+                    итог = {"success": True, "message": "Reconnected!",
+                            "pairId": строка["id"], "restored": True,
+                            "_members": [хозяин, я]}
+            if итог is None:
+                # заводим новую пару
+                gid = _new_id()
+                await c.execute(
+                    "INSERT INTO groups (id, members, member_names, member_avatars, "
+                    "max_members, relationship_type, custom_relationship_types, "
+                    "memories_count, drawings_count, start_date, created_at, "
+                    "disbanded, updated) VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, "
+                    "2, 'couple', '[]'::jsonb, 0, 0, $5, $5, false, $5)",
+                    gid, json.dumps([хозяин, я]), json.dumps(имена),
+                    json.dumps(аватары), now_pb())
+                итог = {"success": True, "message": "Connected!", "pairId": gid,
+                        "_members": [хозяин, я], "_new": True}
+
+    участники = итог.pop("_members", None)
+    новая = итог.pop("_new", False)
+    if итог.get("success"):
+        # Событие обязано быть «create» именно у новой пары: клиент
+        # приглашающего ждёт появления записи, а правку существующей он
+        # отфильтрует — и пара не появится у него до перезапуска приложения
+        # (ровно та жалоба, что разбиралась 02.08.2026).
+        await _после_правки_пары(итог["pairId"], участники or [хозяин, я],
+                                 событие="create" if новая else "update")
+    return ORJSONResponse(итог)
+
+
+@app.get("/internal/online")
+async def internal_online(uid: str):
+    """На связи ли человек — присутствие живёт в Postgres с 14.08.2026.
+    Спрашивает apns_push.js, чтобы не слать пуш тому, у кого открыт экран."""
+    online = await _online_uids([uid]) if uid else set()
+    return {"online": uid in online}
+
+
+_GEO_PATH = os.environ.get("HOTPATH_GEOIP", "/opt/hotpath/geo/GeoLite2-City.mmdb")
+_geo_reader = None
+
+
+def _страна(ip: str) -> str:
+    """Код страны по адресу (`UA`), пусто — не знаем. База GeoLite2 — та же,
+    что у Umami (копия в /opt/hotpath/geo, освежается вместе с её образом)."""
+    global _geo_reader
+    if not ip:
+        return ""
+    try:
+        if _geo_reader is None:
+            import maxminddb
+            _geo_reader = maxminddb.open_database(_GEO_PATH)
+        rec = _geo_reader.get(ip) or {}
+        return str(((rec.get("country") or {}).get("iso_code")) or "").upper()
+    except Exception:
+        return ""
+
+
+@app.get("/internal/geo")
+async def internal_geo(ip: str = ""):
+    """Страна по адресу запроса. Спрашивает chest.pb.js: там, где реклама
+    Яндекса недоступна (Украина), сундук открывается без ролика и без Плюса."""
+    return {"country": _страна(ip.strip())}
+
+
+@app.get("/internal/profiles")
+async def internal_profiles(group_ids: str = "", limit: int = 60, offset: int = 0):
+    """Лента профилей для админки (`/modapi/pb-profiles` в moderation.pb.js).
+
+    Фильтр по группам приходит уже развёрнутым списком: разворачивать огрызок id
+    по таблице groups остаётся на стороне PB — она живёт в SQLite."""
+    limit = max(1, min(200, limit))
+    offset = max(0, offset)
+    gids = [g for g in group_ids.split(",") if g]
+    async with pg.acquire() as c:
+        if group_ids and not gids:
+            return {"items": [], "total": 0}
+        where, args = "TRUE", []
+        if gids:
+            args.append(gids)
+            where = "group_id = ANY($1)"
+        rows = await c.fetch(
+            "SELECT group_id, user_uid, display_name, status, message, mood_label, "
+            f"music_title, music_artist, avatar_url, updated FROM widget_data WHERE {where} "
+            f"ORDER BY updated DESC LIMIT {limit} OFFSET {offset}", *args)
+        total = await c.fetchval(f"SELECT COUNT(*) FROM widget_data WHERE {where}", *args)
+    return {"items": [dict(r) for r in rows], "total": total}
+
+
+@app.get("/internal/product-stats")
+async def internal_product_stats():
+    """Продуктовые срезы по вынесенным коллекциям — для insights_aggregate.py."""
+    async with pg.acquire() as c:
+        async def val(sql):
+            return await c.fetchval(sql) or 0
+        moods = await c.fetch(
+            "SELECT mood_label AS k, COUNT(*)::int AS c FROM widget_data "
+            "WHERE mood_label <> '' GROUP BY 1 ORDER BY c DESC LIMIT 30")
+        return {
+            "memory_authors": await val(
+                "SELECT COUNT(DISTINCT author_uid) FROM memories WHERE NOT deleted"),
+            "memories_rows": await val("SELECT COUNT(*) FROM memories"),
+            "memories_groups": await val(
+                "SELECT COUNT(DISTINCT group_id) FROM memories WHERE NOT deleted"),
+            "widget_rows": await val("SELECT COUNT(*) FROM widget_data"),
+            "widget_groups": await val("SELECT COUNT(DISTINCT group_id) FROM widget_data"),
+            "widget_with_photo": await val(
+                "SELECT COUNT(*) FROM widget_data WHERE photo_url <> ''"),
+            "widget_with_message": await val(
+                "SELECT COUNT(*) FROM widget_data WHERE message <> ''"),
+            "widget_with_music": await val(
+                "SELECT COUNT(*) FROM widget_data WHERE music_title <> ''"),
+            "widget_with_mood": await val(
+                "SELECT COUNT(*) FROM widget_data WHERE mood_label <> ''"),
+            "widget_with_status": await val(
+                "SELECT COUNT(*) FROM widget_data WHERE status <> ''"),
+            "mood_labels": [dict(r) for r in moods],
+        }
+
+
+@app.get("/internal/couple-agg")
+async def couple_agg(group_id: str):
+    """Агрегаты чата и настроений для couple_stats.pb.js — одним ответом.
+
+    Повторяют прежние SQLite-запросы хука один в один (включая недельный ритм
+    с воскресеньем-нулём и месяцы по локальному времени автора отметки)."""
+    if not group_id:
+        return _err(400, "Something went wrong while processing your request.")
+    ml = _MOOD_LOCAL
+    async with pg.acquire() as c:
+        async def val(sql, *a):
+            return await c.fetchval(sql, *a) or 0
+
+        async def rows(sql, *a):
+            return [dict(r) for r in await c.fetch(sql, *a)]
+
+        out = {
+            "memories_total": await val(
+                "SELECT COUNT(*) FROM memories WHERE group_id=$1 AND NOT deleted", group_id),
+            "by_member_memories": await rows(
+                "SELECT author_uid AS uid, COUNT(*)::int AS c FROM memories "
+                "WHERE group_id=$1 AND NOT deleted GROUP BY 1", group_id),
+            "timeline_memories": await rows(
+                "SELECT substr(created_at,1,7) AS m, COUNT(*)::int AS c FROM memories "
+                "WHERE group_id=$1 AND NOT deleted "
+                f"AND replace(replace(created_at,'T',' '),'Z','')::timestamp >= {_UTC_NOW} - interval '12 months' "
+                "GROUP BY 1 ORDER BY 1", group_id),
+            "weekday_memories": await rows(
+                "SELECT extract(dow from replace(replace(created_at,'T',' '),'Z','')::timestamp)::int AS d, "
+                "COUNT(*)::int AS c FROM memories WHERE group_id=$1 AND NOT deleted "
+                "AND created_at ~ '^\\d{4}-\\d{2}-\\d{2}' GROUP BY 1", group_id),
+            "memory_types": await rows(
+                "SELECT COALESCE(type,'') AS k, COUNT(*)::int AS c FROM memories "
+                "WHERE group_id=$1 AND NOT deleted GROUP BY 1 ORDER BY c DESC", group_id),
+            "memories30": await val(
+                "SELECT COUNT(*) FROM memories WHERE group_id=$1 AND NOT deleted "
+                f"AND replace(replace(created_at,'T',' '),'Z','')::timestamp >= {_UTC_NOW} - interval '30 days'",
+                group_id),
+            "memories90": await val(
+                "SELECT COUNT(*) FROM memories WHERE group_id=$1 AND NOT deleted "
+                f"AND replace(replace(created_at,'T',' '),'Z','')::timestamp >= {_UTC_NOW} - interval '90 days'",
+                group_id),
+            "first_memory": await val(
+                "SELECT MIN(created_at) FROM memories WHERE group_id=$1 AND NOT deleted",
+                group_id) or "",
+            "canvases": await val(
+                "SELECT COUNT(DISTINCT canvas_id) FROM canvas_meta WHERE group_id=$1", group_id),
+            "messages": await val(
+                "SELECT COUNT(*) FROM chat_messages WHERE group_id=$1 AND NOT deleted", group_id),
+            "moods": await val(
+                "SELECT COUNT(*) FROM mood_entries WHERE group_id=$1", group_id),
+            "by_member_messages": await rows(
+                "SELECT user_uid AS uid, COUNT(*)::int AS c FROM chat_messages "
+                "WHERE group_id=$1 AND NOT deleted GROUP BY 1", group_id),
+            "by_member_moods": await rows(
+                "SELECT user_uid AS uid, COUNT(*)::int AS c FROM mood_entries "
+                "WHERE group_id=$1 GROUP BY 1", group_id),
+            "timeline_messages": await rows(
+                "SELECT to_char(to_timestamp(ts/1000) at time zone 'utc','YYYY-MM') AS m, "
+                "COUNT(*)::int AS c FROM chat_messages WHERE group_id=$1 AND NOT deleted "
+                "AND ts >= (extract(epoch from now()) - 31536000)*1000 "
+                "GROUP BY 1 ORDER BY 1", group_id),
+            "timeline_moods": await rows(
+                f"SELECT to_char({ml},'YYYY-MM') AS m, COUNT(*)::int AS c FROM mood_entries "
+                f"WHERE group_id=$1 AND {_TS_OK} AND {_TS_UTC} >= {_UTC_NOW} - interval '12 months' "
+                "GROUP BY 1 ORDER BY 1", group_id),
+            "weekday_messages": await rows(
+                "SELECT extract(dow from to_timestamp(ts/1000) at time zone 'utc')::int AS d, "
+                "COUNT(*)::int AS c FROM chat_messages WHERE group_id=$1 AND NOT deleted "
+                "GROUP BY 1", group_id),
+            "hour_messages": await rows(
+                "SELECT extract(hour from to_timestamp(ts/1000) at time zone 'utc')::int AS h, "
+                "COUNT(*)::int AS c FROM chat_messages WHERE group_id=$1 AND NOT deleted "
+                "GROUP BY 1", group_id),
+            "mood_daily": await rows(
+                f"SELECT to_char({ml},'YYYY-MM-DD') AS d, user_uid AS uid, mood_id AS id, "
+                f"COUNT(*)::int AS c FROM mood_entries WHERE group_id=$1 AND {_TS_OK} "
+                f"AND {_TS_UTC} >= {_UTC_NOW} - interval '90 days' "
+                "GROUP BY 1, 2, 3 ORDER BY 1", group_id),
+            "mood_top": await rows(
+                "SELECT mood_id AS id, user_uid AS uid, COUNT(*)::int AS c FROM mood_entries "
+                "WHERE group_id=$1 GROUP BY 1, 2 ORDER BY c DESC LIMIT 24", group_id),
+            "messages30": await val(
+                "SELECT COUNT(*) FROM chat_messages WHERE group_id=$1 AND NOT deleted "
+                "AND ts >= (extract(epoch from now()) - 2592000)*1000", group_id),
+            "messages90": await val(
+                "SELECT COUNT(*) FROM chat_messages WHERE group_id=$1 AND NOT deleted "
+                "AND ts >= (extract(epoch from now()) - 7776000)*1000", group_id),
+            "moods30": await val(
+                f"SELECT COUNT(*) FROM mood_entries WHERE group_id=$1 AND {_TS_OK} "
+                f"AND {_TS_UTC} >= {_UTC_NOW} - interval '30 days'", group_id),
+            "active_days30_count": await val(
+                "SELECT COUNT(DISTINCT d) FROM ("
+                "  SELECT to_char(to_timestamp(ts/1000) at time zone 'utc','YYYY-MM-DD') AS d "
+                "  FROM chat_messages WHERE group_id=$1 AND NOT deleted "
+                "  AND ts >= (extract(epoch from now()) - 2592000)*1000 "
+                f" UNION SELECT to_char({ml},'YYYY-MM-DD') FROM mood_entries "
+                f" WHERE group_id=$1 AND {_TS_OK} AND {_TS_UTC} >= {_UTC_NOW} - interval '30 days' "
+                "  UNION SELECT substr(created_at,1,10) FROM memories "
+                "  WHERE group_id=$1 AND NOT deleted "
+                f" AND replace(replace(created_at,'T',' '),'Z','')::timestamp >= {_UTC_NOW} - interval '30 days'"
+                ") q", group_id),
+            "active_days30": [r["d"] for r in await rows(
+                "SELECT DISTINCT to_char(to_timestamp(ts/1000) at time zone 'utc','YYYY-MM-DD') AS d "
+                "FROM chat_messages WHERE group_id=$1 AND NOT deleted "
+                "AND ts >= (extract(epoch from now()) - 2592000)*1000 "
+                f"UNION SELECT DISTINCT to_char({ml},'YYYY-MM-DD') FROM mood_entries "
+                f"WHERE group_id=$1 AND {_TS_OK} AND {_TS_UTC} >= {_UTC_NOW} - interval '30 days'",
+                group_id)],
+        }
+    return out
+
+
+# ── коллекции, которые читаются прямо из SQLite PocketBase ──────────────────
+# Подарки пишут хуки PocketBase, а люди только читают (правила записи у
+# коллекции пустые). Под наплывом 18.10.2026 эти чтения шли 9 раз в секунду и
+# стояли в очереди пула PocketBase. Копия в Postgres не годится: приложение
+# перечитывает подарки сразу после события в канале пары, и копия с
+# задержкой не показала бы только что пришедший подарок. Поэтому hotpath
+# читает ту же базу своим соединением (sqlite_read.py), записи остаются за
+# PocketBase, а запрос, который наш разбор не знает, уходит ему же.
+# Значение — правило чтения PocketBase: `group` — «только своя пара»,
+# `public` — пустое правило (каталог). Кроме подарков, маршрут Caddy ведёт сюда
+# только GET: запись этих коллекций (с файлами, хуками, рассылкой) остаётся
+# за PocketBase, а hotpath на неё отвечает 403.
+SQLITE_READ = {
+    "gifts": "group",
+    "watch_history": "group", "canvas_catalogue": "group",
+    "memory_comments": "group", "watch_videos": "group", "custom_moods": "group",
+    "catalog_items": "public",
+    # Профиль: правило PB `id = @request.auth.id` — только своя запись.
+    # Пароль и tokenKey в схеме скрытые, в ответ не попадают.
+    "users": "self",
+}
+_sqlite_meta: dict[str, tuple[str, dict]] = {}   # имя -> (id коллекции, поля)
+# Каталог приложение тянет целиком на каждом запуске, и сборка ответа в
+# Python стоила 28 мс процессора против 16 у PocketBase. Ответ один на всех,
+# поэтому готовый живёт 30 секунд (замер 19.10.2026).
+_ready_lists = ReadyCache()
+lite_read: sqlite3.Connection | None = None
+_lite_read_lock = threading.Lock()
+
+
+async def _pb_passthrough(request: Request) -> Response:
+    """Отдать чтение самому PocketBase: адрес клиента едет в
+    X-Forwarded-For, как через Caddy, — иначе лимиты PB сочли бы всех одним."""
+    keep = ("authorization", "x-forwarded-for", "accept-language", "user-agent")
+    headers = {k: v for k, v in request.headers.items() if k.lower() in keep}
+    r = await pb_client.get(request.url.path, params=request.query_params, headers=headers)
+    return Response(content=r.content, status_code=r.status_code,
+                    media_type=r.headers.get("content-type", "application/json"))
+
+
+def _sqlite_list_sync(col, conds, uid, groups, sort, page, per_page, skip_total):
+    collection_id, fields = _sqlite_meta[col]
+    sql, args, count_sql, count_args = build_list(
+        col, fields, conds, groups, sort, page, per_page, sortable=set(fields),
+        scope=SQLITE_READ[col], uid=uid)
+    with _lite_read_lock:
+        cur = lite_read.execute(sql, args)
+        names = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        total = -1 if skip_total else lite_read.execute(count_sql, count_args).fetchone()[0]
+    return [serialize(r, names, fields, collection_id, col) for r in rows], total
+
+
+def _sqlite_get_sync(col, rid, uid, groups):
+    collection_id, fields = _sqlite_meta[col]
+    if SQLITE_READ[col] == "public":
+        sql, args = f"SELECT * FROM {col} WHERE id = ?", [rid]
+    elif SQLITE_READ[col] == "self":
+        if not uid or rid != uid:
+            return None  # чужой профиль PocketBase прячет тем же 404
+        sql, args = f"SELECT * FROM {col} WHERE id = ?", [rid]
+    elif not groups:
+        return None
+    else:
+        marks = ", ".join("?" for _ in groups)
+        sql = f"SELECT * FROM {col} WHERE id = ? AND group_id IN ({marks})"
+        args = [rid, *sorted(groups)]
+    with _lite_read_lock:
+        cur = lite_read.execute(sql, args)
+        names = [d[0] for d in cur.description]
+        row = cur.fetchone()
+    return serialize(row, names, fields, collection_id, col) if row else None
+
+
+async def _sqlite_auth(col: str, request: Request):
+    """Кто читает: (uid, пары, ошибка). У общедоступной коллекции вход не
+    нужен."""
+    if SQLITE_READ[col] == "public":
+        return "", frozenset(), None
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return "", None, _err(429, "Try again later.")
+    if auth is None:
+        return "", None, _err(401, "The request requires valid record authorization token.")
+    return auth[0], auth[1], None
+
+
+async def _sqlite_list(col: str, request: Request):
+    q = request.query_params
+    if q.get("expand") or q.get("fields"):
+        return await _pb_passthrough(request)
+    uid, groups, denied = await _sqlite_auth(col, request)
+    if denied:
+        return denied
+    _, fields = _sqlite_meta[col]
+    try:
+        page = max(1, int(q.get("page", "1")))
+        per_page = min(1000, max(1, int(q.get("perPage", "30"))))
+        conds = _parse_filter(q.get("filter", ""), set(fields))
+    except ValueError:
+        # Запрос, который разбор не знает (ИЛИ, вложенные скобки у старых
+        # сборок): пусть ответит сам PocketBase, как раньше.
+        return await _pb_passthrough(request)
+    for key in q.get("sort", "").split(","):
+        name = key.strip().lstrip("+-")
+        if name and name not in fields:
+            # Несуществующее поле или особый ключ (`@random`): у PocketBase
+            # свой ответ на это (400 или своя сортировка), пусть даёт его сам.
+            return await _pb_passthrough(request)
+    skip_total = q.get("skipTotal", "") in ("1", "true", "True")
+    public = SQLITE_READ[col] == "public"
+    key = f"{col}?{request.url.query}"
+    if public:
+        ready = _ready_lists.get(key, time.monotonic())
+        if ready is not None:
+            return Response(content=ready, media_type="application/json")
+    items, total = await asyncio.to_thread(
+        _sqlite_list_sync, col, conds, uid, groups, q.get("sort", ""), page, per_page,
+        skip_total)
+    body = {
+        "page": page, "perPage": per_page, "totalItems": total,
+        "totalPages": -1 if skip_total else (total + per_page - 1) // per_page,
+        "items": items,
+    }
+    if not public:
+        return body
+    data = orjson.dumps(body)
+    _ready_lists.put(key, data, time.monotonic())
+    return Response(content=data, media_type="application/json")
+
+
+async def _sqlite_get(col: str, rid: str, request: Request):
+    if request.query_params.get("expand") or request.query_params.get("fields"):
+        return await _pb_passthrough(request)
+    uid, groups, denied = await _sqlite_auth(col, request)
+    if denied:
+        return denied
+    rec = await asyncio.to_thread(_sqlite_get_sync, col, rid, uid, groups)
+    if rec is None:
+        return _err(404, "The requested resource wasn't found.")
+    return rec
+
+
+@app.get("/api/collections/{col}/records")
+async def list_records(col: str, request: Request):
+    if col in SQLITE_READ:
+        return await _sqlite_list(col, request)
+    meta = COLLECTIONS.get(col)
+    if meta is None:
+        return _err(404, "The requested resource wasn't found.")
+    scope = meta.get("scope", "group")
+    if scope == "public":
+        # Пустое правило PB: читать можно и без входа (настройки приложения
+        # спрашиваются ещё до того, как поднимется сессия).
+        uid, groups = "", frozenset()
+    else:
+        try:
+            auth = await _auth(request)
+        except Exception:
+            # Икота слоя аутентификации (SQLite занят) — пусть клиент повторит.
+            return _err(429, "Try again later.")
+        if auth is None:
+            return _err(401, "The request requires valid record authorization token.")
+        uid, groups = auth
+
+    q = request.query_params
+    try:
+        page = max(1, int(q.get("page", "1")))
+        per_page = min(1000, max(1, int(q.get("perPage", "30"))))
+    except ValueError:
+        return _err(400, "Something went wrong while processing your request.")
+    skip_total = q.get("skipTotal", "") in ("1", "true", "True")
+
+    try:
+        conds = _parse_filter(q.get("filter", ""), meta["filterable"])
+    except ValueError:
+        return _err(400, "Something went wrong while processing your request.")
+
+    where, args = [], []
+    filtered_group = None
+    for field, op, val in conds:
+        if op == "~":
+            if meta["columns"].get(field) == "json":
+                args.append(json.dumps([val]))
+                where.append(f"{field} @> ${len(args)}::jsonb")
+            elif field in meta.get("searchable", ()):
+                args.append(_like_pattern(str(val)))
+                where.append(f"{field} ILIKE ${len(args)} ESCAPE '\\'")
+            else:
+                return _err(400, "Something went wrong while processing your request.")
+            continue
+        args.append(_coerce(col, field, val))
+        where.append(f"{field} {op} ${len(args)}")
+        if field == "group_id" and op == "=":
+            filtered_group = val
+    # listRule PB. По умолчанию — «только свои группы»; у presence правило
+    # мягче (любой залогиненный), у геопозиции ключ не группа, а канал.
+    empty = {
+        "page": page, "perPage": per_page,
+        "totalItems": -1 if skip_total else 0,
+        "totalPages": -1 if skip_total else 0,
+        "items": [],
+    }
+    if scope in ("authed", "public"):
+        pass  # ограничений нет
+    elif scope == "members":
+        # Правило записи пары: members ?~ @request.auth.id. Условие ставим
+        # ВСЕГДА, даже когда клиент уже прислал такой фильтр сам, — дубль
+        # безвреден (тот же индекс), а забытая проверка отдала бы чужую пару.
+        args.append(json.dumps([uid]))
+        where.append(f"members @> ${len(args)}::jsonb")
+    elif scope == "channel":
+        chan = next((v for f, op, v in conds if f == "channel" and op == "="), None)
+        if chan is not None:
+            if uid not in str(chan) and str(chan) not in groups:
+                return empty
+        else:
+            # без явного канала отдаём только свои: личные плюс парные
+            args.append(list(groups))
+            where.append(f"(channel LIKE '%' || ${len(args) + 1} || '%' OR channel = ANY(${len(args)}))")
+            args.append(uid)
+    elif filtered_group is not None:
+        if filtered_group not in groups:
+            return empty
+    else:
+        args.append(list(groups))
+        where.append(f"group_id = ANY(${len(args)})")
+    if scope == "own_or_shared":
+        # Отметки цикла: свои целиком, партнёрские — только открытые им.
+        args.append(uid)
+        where.append(f"(user_uid = ${len(args)} OR shared)")
+
+    hold = _hold_cond(meta, uid, args)
+    if hold:
+        where.append(hold)
+
+    order = meta["default_sort"]
+    sort = q.get("sort", "")
+    if sort:
+        keys = []
+        for k in sort.split(","):
+            k = k.strip()
+            desc = k.startswith("-")
+            name = k.lstrip("+-")
+            if name in meta["sortable"]:
+                keys.append(f"{name} {'DESC' if desc else 'ASC'}")
+        if keys:
+            order = ", ".join(keys) + ", id ASC"
+
+    where_sql = " AND ".join(where) or "TRUE"
+    sql = (
+        f"SELECT * FROM {col} WHERE {where_sql} "
+        f"ORDER BY {order} LIMIT {per_page} OFFSET {(page - 1) * per_page}"
+    )
+    async with pg.acquire() as c:
+        rows = await c.fetch(sql, *args)
+        if skip_total:
+            total = -1
+            pages = -1
+        else:
+            total = await c.fetchval(
+                f"SELECT COUNT(*) FROM {col} WHERE {where_sql}", *args
+            )
+            pages = (total + per_page - 1) // per_page
+    return {
+        "page": page, "perPage": per_page, "totalItems": total,
+        "totalPages": pages, "items": [_record_json(col, r) for r in rows],
+    }
+
+
+@app.get("/api/collections/{col}/records/{rid}")
+async def get_record(col: str, rid: str, request: Request):
+    """Чтение одной записи (getOne у клиента).
+
+    Заведено ради записи пары: приём приглашения читает группу именно так
+    (`collection('groups').getOne(pairId)`), и без этого маршрута ответом на
+    вступление в пару приходил бы 404.
+    """
+    if col in SQLITE_READ:
+        return await _sqlite_get(col, rid, request)
+    meta = COLLECTIONS.get(col)
+    if meta is None:
+        return _err(404, "The requested resource wasn't found.")
+    scope = meta.get("scope", "group")
+    if scope == "public":
+        uid, groups = "", frozenset()
+    else:
+        try:
+            auth = await _auth(request)
+        except Exception:
+            return _err(429, "Try again later.")
+        if auth is None:
+            return _err(401, "The request requires valid record authorization token.")
+        uid, groups = auth
+
+    if scope in ("authed", "public"):
+        cond, args = "TRUE", [rid]
+    elif scope == "own_or_shared":
+        cond, args = "group_id = ANY($2) AND (user_uid = $3 OR shared)", [
+            rid, list(groups), uid]
+    elif scope == "members":
+        cond, args = "members @> $2::jsonb", [rid, json.dumps([uid])]
+    elif scope == "channel":
+        cond, args = "(channel LIKE '%' || $2 || '%' OR channel = ANY($3))", [
+            rid, uid, list(groups)]
+    else:
+        cond, args = "group_id = ANY($2)", [rid, list(groups)]
+    hold = _hold_cond(meta, uid, args)
+    if hold:
+        cond = f"{cond} AND {hold}"
+    async with pg.acquire() as c:
+        row = await c.fetchrow(f"SELECT * FROM {col} WHERE id = $1 AND {cond}", *args)
+    if row is None:
+        # Чужое и несуществующее PocketBase прячет одним 404.
+        return _err(404, "The requested resource wasn't found.")
+    return _record_json(col, row)
+
+
+def _read_only(meta: dict):
+    """Коллекции, которые людям только читать: правило записи у PB пустое
+    (null), и он отвечает так."""
+    if meta.get("read_only"):
+        return _err(403, "Only superusers can perform this action.")
+    return None
+
+
+_READ_ONLY_META = {"read_only": True}
+
+
+@app.post("/api/collections/{col}/records")
+async def create_record(col: str, request: Request):
+    meta = _READ_ONLY_META if col in SQLITE_READ else COLLECTIONS.get(col)
+    if meta is None:
+        return _err(404, "The requested resource wasn't found.")
+    denied = _read_only(meta)
+    if denied:
+        return denied
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid, groups = auth
+
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "Failed to create record.")
+
+    scope = meta.get("scope", "group")
+    if scope in ("group", "own_or_shared"):
+        if str(body.get("group_id") or "") not in groups:
+            # createRule не прошёл — PB в этом случае тоже отвечает 400.
+            return _err(400, "Failed to create record.")
+    elif scope == "members":
+        # Завести пару можно только с собой внутри — как createRule у PB.
+        сам = body.get("members")
+        if not isinstance(сам, list) or uid not in [str(m) for m in сам]:
+            return _err(400, "Failed to create record.")
+    elif scope == "channel":
+        chan = str(body.get("channel") or "")
+        if uid not in chan and chan not in groups:
+            return _err(400, "Failed to create record.")
+    owner_field = meta.get("create_owner_field")
+    if owner_field and str(body.get(owner_field) or "") != uid:
+        # У memories и widget_data createRule требует авторства записи.
+        return _err(400, "Failed to create record.")
+
+    rid = str(body.get("id") or "") or _new_id()
+    if col == "widget_data":
+        # widget_plus.pb.js: значок Togetherly+ на карточке ставит СЕРВЕР,
+        # иначе его можно приписать себе голым API.
+        body["plus"] = await asyncio.to_thread(_user_has_plus, uid)
+    if col == "chat_messages":
+        # Сбитые часы телефона больше не перемешивают переписку: см.
+        # время_сообщения.
+        body["ts"] = время_сообщения(body.get("ts"), int(time.time() * 1000), body.get("sent_at"))
+    if col == "memories":
+        # Запись с часами из будущего висела бы над всей лентой: см.
+        # даты_воспоминания.
+        даты_воспоминания(body, int(time.time() * 1000))
+    cols, vals = ["id"], [rid]
+    for field, kind in meta["columns"].items():
+        if kind in ("auto", "created"):
+            # autodate PB: время ставит сервер, присланное клиентом не берём.
+            cols.append(field)
+            vals.append(now_pb())
+            continue
+        v = body.get(field)
+        cols.append(field)
+        if kind in ("json", "jsontext"):
+            if v is None:
+                vals.append(None)
+            elif kind == "jsontext" and isinstance(v, str):
+                vals.append(v if v.strip() else None)
+            else:
+                vals.append(json.dumps(v))
+        elif kind == "num":
+            vals.append(float(v or 0))
+        elif kind == "bool":
+            vals.append(bool(v))
+        elif kind == "date":
+            # PB нормализует дату к «YYYY-MM-DD HH:MM:SS.mmmZ» — клиент шлёт
+            # ISO с «T» (PairTime.write), подстрочные срезы ждут пробел.
+            vals.append(str(v).replace("T", " ") if v else "")
+        else:
+            vals.append(str(v) if v is not None else "")
+    ph = ", ".join(f"${i + 1}" for i in range(len(vals)))
+    async with pg.acquire() as c:
+        try:
+            row = await c.fetchrow(
+                f"INSERT INTO {col} ({', '.join(cols)}) VALUES ({ph}) RETURNING *",
+                *vals,
+            )
+        except asyncpg.UniqueViolationError:
+            # Идемпотентный повтор из очереди: клиент читает это как «уже есть».
+            return _err(400, "Failed to create record.", {
+                "id": {"code": "validation_not_unique", "message": "Value must be unique."}
+            })
+    rec = _record_json(col, row)
+    # Придержанное «к утру» не рассылаем и не пушим: это сделает
+    # `_deliver_worker`, когда придёт срок.
+    if not _held(meta, rec):
+        asyncio.get_running_loop().create_task(_publish(col, "create", rec))
+        asyncio.get_running_loop().create_task(_after_create(col, rec))
+    return rec
+
+
+@app.patch("/api/collections/{col}/records/{rid}")
+async def update_record(col: str, rid: str, request: Request):
+    meta = _READ_ONLY_META if col in SQLITE_READ else COLLECTIONS.get(col)
+    if meta is None:
+        return _err(404, "The requested resource wasn't found.")
+    denied = _read_only(meta)
+    if denied:
+        return denied
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid, groups = auth
+    try:
+        body = await request.json()
+        assert isinstance(body, dict)
+    except Exception:
+        return _err(400, "Failed to update record.")
+
+    if col == "memories" and ("sticker_put" in body or "sticker_del" in body):
+        return await _наклейка_воспоминания(rid, body, uid, groups)
+
+    # Страж пары (перенос groups_guard.pb.js). Правило коллекции пускает
+    # участника писать в запись любое поле, поэтому обычным PATCH можно было
+    # вписать в пару третий аккаунт — и он получал переписку, ленту и карту.
+    # Клиент состав только СОКРАЩАЕТ (выход из пары), добавляют серверные пути.
+    if col == "groups":
+        ЗАКРЫТЫЕ = ("claim_token", "claim_uid", "claim_name", "claim_at",
+                    "waiting_mode")
+        for f in ЗАКРЫТЫЕ:
+            if f in body:
+                # Код второго места и заявку на него пишет только сервер:
+                # иначе участник подменит код своим и уведёт чужую заявку.
+                return _err(403, f"read-only pairing field: {f}")
+        if "members" in body:
+            новый = body.get("members")
+            if not isinstance(новый, list):
+                return _err(403, "members must be a list")
+            async with pg.acquire() as c:
+                текущий = await c.fetchval(
+                    "SELECT members FROM groups WHERE id = $1", rid)
+            if isinstance(текущий, str):
+                try:
+                    текущий = json.loads(текущий)
+                except ValueError:
+                    текущий = []
+            текущий = [str(m) for m in (текущий or [])]
+            for m in новый:
+                if str(m) not in текущий:
+                    return _err(403, "cannot add members directly")
+
+    # Страж чата (перенос chat_guard.pb.js): не-автор правит только реакции
+    # и отметку «послушал». Смотрим ТЕЛО запроса, как и хук.
+    if meta["guard"] == "chat":
+        async with pg.acquire() as c:
+            author = await c.fetchval(
+                f"SELECT user_uid FROM {col} WHERE id = $1", rid
+            )
+        if author and author != uid:
+            for f in body:
+                if f not in ("reactions", "voice_heard_at", "note_seen_at",
+                             "note_hearts", "id"):
+                    return _err(403, "only the author can edit this message")
+
+    # Страж желаний (перенос wishes_guard.pb.js): не-автор только ставит
+    # отметку «сбылось», остальное в чужом желании правит автор.
+    if meta["guard"] == "wishes":
+        async with pg.acquire() as c:
+            author = await c.fetchval(
+                f"SELECT author_uid FROM {col} WHERE id = $1", rid
+            )
+        if author and author != uid:
+            for f in body:
+                if f not in ("done", "done_at", "done_by", "done_note", "id"):
+                    return _err(403, "only the author can edit this wish")
+
+    if col == "widget_data":
+        # Значок Togetherly+ сервер ставит на каждой правке, как делал
+        # widget_plus.pb.js до переезда: приложение поле `plus` не шлёт, и
+        # купивший после того, как карточка завелась, оставался для партнёра
+        # без Плюса (23.10.2026: 673 из 773 купивших). Флаг берётся у хозяина
+        # карточки — править её может и партнёр.
+        async with pg.acquire() as c:
+            owner = await c.fetchval(
+                "SELECT user_uid FROM widget_data WHERE id = $1", rid
+            )
+        body["plus"] = await asyncio.to_thread(_user_has_plus, owner or uid)
+    if col == "memories":
+        # Очередь шлёт запись целиком и при правке: без этого телефон со
+        # сбитыми часами вернул бы будущую дату, исправленную при создании.
+        даты_воспоминания(body, int(time.time() * 1000))
+    sets, args = [], []
+    for field, kind in meta["columns"].items():
+        if kind == "auto":
+            args.append(now_pb())
+            sets.append(f"{field} = ${len(args)}")
+            continue
+        if kind == "created" or field not in body:
+            # Время создания правкой не меняется, как autodate у PB.
+            continue
+        v = body[field]
+        if col == "memories" and field == "data" and isinstance(v, dict):
+            # Наклейки пишет только своя операция (_наклейка_воспоминания).
+            # Очередь шлёт запись целиком при правке, реакции и закладке, и
+            # её копия наклеек бывает старой — а у сборок до наклеек их нет
+            # вовсе. Поэтому в правке они всегда остаются серверными.
+            args.append(json.dumps(v))
+            n = len(args)
+            sets.append(
+                f"data = CASE WHEN data ? 'stickers' "
+                f"THEN jsonb_set(${n}::jsonb, '{{stickers}}', data->'stickers') "
+                f"ELSE ${n}::jsonb - 'stickers' END")
+            continue
+        if kind in ("json", "jsontext"):
+            if v is None:
+                args.append(None)
+            elif kind == "jsontext" and isinstance(v, str):
+                args.append(v if v.strip() else None)
+            else:
+                args.append(json.dumps(v))
+        elif kind == "num":
+            args.append(float(v or 0))
+        elif kind == "bool":
+            args.append(bool(v))
+        elif kind == "date":
+            args.append(str(v).replace("T", " ") if v else "")
+        else:
+            args.append(str(v) if v is not None else "")
+        sets.append(f"{field} = ${len(args)}")
+    args.append(rid)
+    owner_upd = meta.get("update_owner_field")
+    if owner_upd:
+        args.append(uid)
+        cond = f"{owner_upd} = ${len(args)}"
+    elif meta.get("scope") == "members":
+        args.append(json.dumps([uid]))
+        cond = f"members @> ${len(args)}::jsonb"
+    else:
+        args.append(list(groups))
+        cond = f"group_id = ANY(${len(args)})"
+    sql = (
+        f"UPDATE {col} SET {', '.join(sets) or 'id = id'} "
+        f"WHERE id = ${len(args) - 1} AND {cond} RETURNING *"
+    )
+    async with pg.acquire() as c:
+        row = await c.fetchrow(sql, *args)
+    if row is None:
+        # Чужое и несуществующее PB прячет одним 404.
+        return _err(404, "The requested resource wasn't found.")
+    rec = _record_json(col, row)
+    if col == "groups" and "members" in body:
+        # Состав пары сократили (человек вышел сам, когда серверный роут не
+        # ответил) — зеркало и списки групп обязаны догнать сразу, иначе
+        # правила доступа в PocketBase будут помнить прежнюю пару.
+        участники = rec.get("members") if isinstance(rec.get("members"), list) else []
+        asyncio.get_running_loop().create_task(
+            _после_правки_пары(rid, [str(m) for m in участники] + [uid]))
+    else:
+        # Правка придержанного сообщения партнёру не уходит — иначе оно
+        # приехало бы к нему раньше срока.
+        if not _held(meta, rec):
+            asyncio.get_running_loop().create_task(_publish(col, "update", rec))
+            asyncio.get_running_loop().create_task(_after_update(col, rec))
+    return rec
+
+
+async def _наклейка_воспоминания(rid: str, тело: dict, uid: str, groups):
+    """Поставить, переставить или убрать наклейку на записи пары.
+
+    Строка блокируется на время правки: двое клеят одновременно, и каждый
+    читает уже чужую новую наклейку, а не затирает её своей копией карты.
+    Отказ отвечает кодом и словом в `message`: `limit` (своих уже три),
+    `not_yours` (чужую не переставить и не убрать), `bad_sticker`.
+    """
+    сейчас = int(time.time() * 1000)
+    async with pg.acquire() as c:
+        async with c.transaction():
+            row = await c.fetchrow(
+                "SELECT data, author_uid FROM memories WHERE id = $1 "
+                "AND group_id = ANY($2) AND NOT coalesce(deleted, false) "
+                "FOR UPDATE", rid, list(groups))
+            if row is None:
+                return _err(404, "The requested resource wasn't found.")
+            данные = row["data"]
+            if isinstance(данные, str):
+                try:
+                    данные = json.loads(данные)
+                except ValueError:
+                    данные = {}
+            if not isinstance(данные, dict):
+                данные = {}
+            было = данные.get("stickers")
+            автор = row["author_uid"] or str(данные.get("authorUid") or "")
+            новые, отказ = применить_наклейку(
+                было if isinstance(было, dict) else {}, тело, uid, автор, сейчас)
+            if отказ:
+                код = {"limit": 409, "not_yours": 403}.get(отказ, 400)
+                return _err(код, отказ)
+            row = await c.fetchrow(
+                "UPDATE memories SET data = jsonb_set(coalesce(data, "
+                "'{}'::jsonb), '{stickers}', $2::jsonb), updated = $3 "
+                "WHERE id = $1 RETURNING *",
+                rid, json.dumps(новые), now_pb())
+    rec = _record_json("memories", row)
+    asyncio.get_running_loop().create_task(_publish("memories", "update", rec))
+    return rec
+
+
+@app.delete("/api/collections/{col}/records/{rid}")
+async def delete_record(col: str, rid: str, request: Request):
+    meta = _READ_ONLY_META if col in SQLITE_READ else COLLECTIONS.get(col)
+    if meta is None:
+        return _err(404, "The requested resource wasn't found.")
+    denied = _read_only(meta)
+    if denied:
+        return denied
+    try:
+        auth = await _auth(request)
+    except Exception:
+        return _err(429, "Try again later.")
+    if auth is None:
+        return _err(401, "The request requires valid record authorization token.")
+    uid, groups = auth
+    if meta["delete_guard"] == "author":
+        # Автор у чата в user_uid, у желаний в author_uid.
+        author_field = meta.get("author_field", "user_uid")
+        async with pg.acquire() as c:
+            author = await c.fetchval(f"SELECT {author_field} FROM {col} WHERE id = $1", rid)
+        if author and author != uid:
+            what = "wish" if col == "wishes" else "message"
+            return _err(403, f"only the author can delete this {what}")
+    owner_del = meta.get("update_owner_field")
+    async with pg.acquire() as c:
+        if owner_del:
+            row = await c.fetchrow(
+                f"DELETE FROM {col} WHERE id = $1 AND {owner_del} = $2 RETURNING *", rid, uid)
+        elif meta.get("scope") == "members":
+            row = await c.fetchrow(
+                f"DELETE FROM {col} WHERE id = $1 AND members @> $2::jsonb RETURNING *",
+                rid, json.dumps([uid]))
+        else:
+            row = await c.fetchrow(
+                f"DELETE FROM {col} WHERE id = $1 AND group_id = ANY($2) RETURNING *",
+                rid, list(groups))
+    if row is None:
+        return _err(404, "The requested resource wasn't found.")
+    rec = _record_json(col, row)
+    asyncio.get_running_loop().create_task(_publish(col, "delete", rec))
+    _after_delete(col, rec)
+    return Response(status_code=204)
+
+
+# ── запуск ───────────────────────────────────────────────────────────────────
+
+
+async def _deliver_worker() -> None:
+    """Выпускает сообщения «к утру», чей срок пришёл.
+
+    Раз в двадцать секунд: срок наступил — `ts` становится сроком (сообщение
+    встаёт в ленте туда, когда пришло), `deliver_at` обнуляется, `updated`
+    двигается (дельта-синхронизация клиента его подберёт), дальше рассылка и
+    пуш ровно как у свежего сообщения. Правкой, а не созданием: клиент кладёт
+    оба события одинаково, а автор запись уже знает.
+    """
+    while True:
+        await asyncio.sleep(20)
+        try:
+            async with pg.acquire() as c:
+                rows = await c.fetch(
+                    "UPDATE chat_messages SET ts = deliver_at, deliver_at = 0, updated = $2 "
+                    "WHERE deliver_at > 0 AND deliver_at <= $1 RETURNING *",
+                    float(_now_ms()), now_pb())
+            for row in rows:
+                rec = _record_json("chat_messages", row)
+                await _publish("chat_messages", "update", rec)
+                await _after_create("chat_messages", rec)
+            if rows:
+                log.info("к утру: выпущено %d", len(rows))
+        except Exception as e:  # noqa: BLE001 — воркер не должен умирать
+            log.warning("к утру: сбой выпуска: %s", e)
+
+
+def _app_config_rows_sync() -> list:
+    fields = ", ".join(["id"] + list(COLLECTIONS["app_config"]["columns"]))
+    return lite.execute(f"SELECT {fields} FROM app_config").fetchall()
+
+
+def _app_config_value(kind: str, v):
+    if kind == "json":
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        return v if isinstance(v, str) else json.dumps(v)
+    if kind == "num":
+        return float(v or 0)
+    if kind == "bool":
+        return bool(v)
+    return str(v) if v is not None else ""
+
+
+async def _app_config_worker() -> None:
+    """Копия настроек приложения из SQLite в Postgres, раз в 15 секунд.
+
+    Правят их руками (`UPDATE app_config SET chest_enabled = 0`), и читают их
+    хуки PocketBase, поэтому правда остаётся в SQLite, а приложение читает
+    копию из hotpath. Выключателю хватает задержки в 15 секунд.
+    """
+    kinds = COLLECTIONS["app_config"]["columns"]
+    fields = list(kinds)
+    marks = ", ".join(f"${i + 1}" for i in range(len(fields) + 1))
+    sets = ", ".join(f"{f} = EXCLUDED.{f}" for f in fields)
+    sql = (f"INSERT INTO app_config (id, {', '.join(fields)}) VALUES ({marks}) "
+           f"ON CONFLICT (id) DO UPDATE SET {sets}")
+    while True:
+        try:
+            rows = await asyncio.to_thread(_app_config_rows_sync)
+            async with pg.acquire() as c:
+                async with c.transaction():
+                    for row in rows:
+                        vals = [row[0]] + [
+                            _app_config_value(kinds[f], v) for f, v in zip(fields, row[1:])]
+                        await c.execute(sql, *vals)
+                    await c.execute(
+                        "DELETE FROM app_config WHERE NOT (id = ANY($1::text[]))",
+                        [r[0] for r in rows])
+        except Exception as e:
+            log.warning("копия настроек отложена: %s", e)
+        await asyncio.sleep(15)
+
+
+def _plus_uids_sync() -> frozenset:
+    rows = lite.execute("SELECT id FROM users WHERE plus = 1").fetchall()
+    return frozenset(r[0] for r in rows)
+
+
+async def _plus_flag_worker() -> None:
+    """Значок Togetherly+ в карточках widget_data догоняет покупку и возврат.
+
+    Правка карточки сверяет флаг сама (update_record), но карточку купившего
+    приложение правит, только когда он сам меняет статус, настроение или фото.
+    Партнёр часами видел бы «без Плюса», а плитка совместной ленты вела бы его
+    на покупку. Раз в минуту список купивших сравнивается с прошлым; у тех, чей
+    Плюс появился или пропал, карточки выравниваются, `updated` двигается
+    (дельта-синхронизация подберёт), и правка уходит паре. Первый проход после
+    запуска выравнивает все карточки.
+    """
+    known: frozenset | None = None
+    while True:
+        try:
+            now_ids = await asyncio.to_thread(_plus_uids_sync)
+            stamp = now_pb()
+            async with pg.acquire() as c:
+                if known is None:
+                    gained = await c.fetch(
+                        "UPDATE widget_data SET plus = true, updated = $2 "
+                        "WHERE user_uid = ANY($1::text[]) AND plus IS NOT TRUE RETURNING *",
+                        list(now_ids), stamp)
+                    lost = await c.fetch(
+                        "UPDATE widget_data SET plus = false, updated = $2 "
+                        "WHERE plus IS TRUE AND NOT (user_uid = ANY($1::text[])) RETURNING *",
+                        list(now_ids), stamp)
+                else:
+                    gained = await c.fetch(
+                        "UPDATE widget_data SET plus = true, updated = $2 "
+                        "WHERE user_uid = ANY($1::text[]) AND plus IS NOT TRUE RETURNING *",
+                        list(now_ids - known), stamp) if now_ids - known else []
+                    lost = await c.fetch(
+                        "UPDATE widget_data SET plus = false, updated = $2 "
+                        "WHERE user_uid = ANY($1::text[]) AND plus IS TRUE RETURNING *",
+                        list(known - now_ids), stamp) if known - now_ids else []
+            known = now_ids
+            for row in list(gained) + list(lost):
+                await _publish("widget_data", "update", _record_json("widget_data", row))
+            if gained or lost:
+                log.info("значок Togetherly+: включён в %d карточках, снят в %d",
+                         len(gained), len(lost))
+        except Exception as e:  # noqa: BLE001 — воркер не должен умирать
+            log.warning("значок Togetherly+: сверка отложена: %s", e)
+        await asyncio.sleep(60)
+
+
+def _claim_background_role() -> bool:
+    """Фоновые задачи (счётчики, зеркало присутствия) должен вести ОДИН процесс.
+
+    Сервис работает в несколько рабочих процессов — иначе один Python упирается
+    в одно ядро, а через него идёт всё присутствие (поймано живьём 14.08.2026:
+    процесс на 100% ядра, очередь запросов, 121 тысяча висящих потоков в Caddy).
+    Роль забирает тот, кому достался файловый замок; остальные только отвечают
+    на запросы."""
+    global _bg_lock_fd
+    try:
+        _bg_lock_fd = os.open("/tmp/hotpath.bg.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(_bg_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+@app.on_event("startup")
+async def _startup():
+    # Уровень ставится ЗДЕСЬ, а не рядом с basicConfig: uvicorn поднимает свою
+    # конфигурацию логов уже после импорта модуля и сбрасывает выставленное
+    # раньше. Публикаций в Centrifugo идёт под сотню в секунду, и поток
+    # «HTTP Request … 200 OK» забивал journald полумиллионом строк в час.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    global pg, cent_client, push_client, pb_client, wd_client, lite, lite_rw, auth_secret
+    global lite_read
+    pg = await asyncpg.create_pool(PG_DSN, min_size=2, max_size=10)
+    cent_client = httpx.AsyncClient(base_url=CENT_API, timeout=3.0)
+    # Редкие записи уходят в PocketBase как есть. Таймаут щедрый: под
+    # нагрузкой он отвечает секунды, и обрывать раньше клиента незачем.
+    pb_client = httpx.AsyncClient(
+        base_url=os.environ.get("PB_URL", "http://127.0.0.1:8090"), timeout=40.0)
+    push_client = httpx.AsyncClient(timeout=10.0)
+    # Викиданные просят представиться: без своего User-Agent они режут запросы.
+    wd_client = httpx.AsyncClient(timeout=12.0, headers={"User-Agent": _WD_UA})
+    # read-only к базе PocketBase: tokenKey, group_ids, members, presence, токены.
+    lite = sqlite3.connect(f"file:{PB_DB}?mode=ro", uri=True, check_same_thread=False)
+    lite.execute("PRAGMA busy_timeout=5000")
+    # Своё соединение для чтения подарков и прочего из SQLITE_READ: auth на
+    # `lite` не должна ждать списка подарков.
+    lite_read = sqlite3.connect(f"file:{PB_DB}?mode=ro", uri=True, check_same_thread=False)
+    lite_read.execute("PRAGMA busy_timeout=5000")
+    for name in SQLITE_READ:
+        _sqlite_meta[name] = load_fields(lite_read, name)
+    # запись — только точечные вещи: messages_count и чистка мёртвых пуш-токенов.
+    lite_rw = sqlite3.connect(PB_DB, timeout=10, check_same_thread=False)
+    lite_rw.execute("PRAGMA busy_timeout=10000")
+    auth_secret = json.loads(
+        lite.execute(
+            "SELECT options FROM _collections WHERE name = 'users'"
+        ).fetchone()[0]
+    )["authToken"]["secret"]
+    роль = _claim_background_role()
+    if роль:
+        log.info("этот процесс ведёт фоновые задачи (пары: %s)", GROUPS_SRC)
+    работники = {
+        "счётчики": _counter_worker,
+        "присутствие": _presence_mirror_worker,
+        "зеркало пар": _зеркало_воркер,
+        "к утру": _deliver_worker,
+        "настройки": _app_config_worker,
+        "плюс": _plus_flag_worker,
+    }
+    for задача in _задачи_процесса(фоновая_роль=роль, пары=GROUPS_SRC):
+        asyncio.get_running_loop().create_task(работники[задача]())
+
+
+def _задачи_процесса(фоновая_роль: bool, пары: str) -> list[str]:
+    """Какие фоновые задачи запускает этот рабочий процесс.
+
+    Прибавки счётчиков пары копит каждый процесс в своём словаре, поэтому и
+    сбрасывать их должен каждый. Пока сброс вёл один процесс с фоновой ролью,
+    прибавки остальных не доходили до базы никогда (с 14.08 по 01.11.2026):
+    в профиле стоял ноль воспоминаний, достижения не открывались. Исключение —
+    пары в SQLite: там посторонний коммит протухает снапшоты PocketBase, и
+    сброс остаётся за одним процессом. Остальное фоновое ведёт один."""
+    задачи = []
+    if фоновая_роль or пары == "pg":
+        задачи.append("счётчики")
+    if фоновая_роль:
+        задачи += ["присутствие", "зеркало пар", "к утру", "настройки", "плюс"]
+    return задачи
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    if _counter_deltas:
+        try:
+            if GROUPS_SRC == "pg":
+                await _flush_counters_pg(dict(_counter_deltas))
+            else:
+                _flush_counters_sync(dict(_counter_deltas))
+        except (sqlite3.Error, asyncpg.PostgresError, OSError):
+            pass
+    await pg.close()
+    await cent_client.aclose()
+    await push_client.aclose()
+    await wd_client.aclose()
+    lite.close()
+    lite_rw.close()
+
+
+if __name__ == "__main__":
+    # Рабочих процессов по числу ядер минус два (PocketBase и Caddy тоже едят).
+    workers = int(os.environ.get("HOTPATH_WORKERS", "0")) or max(2, (os.cpu_count() or 4) - 2)
+    uvicorn.run("hotpath:app", host="127.0.0.1", port=LISTEN_PORT,
+                log_level="warning", workers=workers,
+                # Быстрый цикл событий и разбор HTTP на C вместо чистого
+                # Python: та же работа обходится примерно на четверть дешевле.
+                loop="uvloop", http="httptools",
+                # Держим соединение открытым дольше: Caddy переиспользует его
+                # вместо того, чтобы плодить новые под каждый запрос.
+                timeout_keep_alive=30,
+                # Надзиратель uvicorn убивает рабочего, не ответившего на пинг
+                # за этот срок. С умолчанием в 5 с под вечерней нагрузкой
+                # 19.10.2026 рабочих убивало раз в полминуты посреди запросов,
+                # и точка входа отдавала до 80 тысяч 502 в час.
+                timeout_worker_healthcheck=60)

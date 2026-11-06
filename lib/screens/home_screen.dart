@@ -1,0 +1,5178 @@
+import 'dart:async';
+import '../utils/safe_launch.dart';
+import 'dart:io';
+import 'package:in_app_update/in_app_update.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import '../widgets/storage_image.dart';
+import 'package:exif/exif.dart';
+import 'package:flutter/material.dart';
+import '../widgets/common/ad_result.dart';
+import '../widgets/common/ailment_icon.dart';
+import '../widgets/common/email_typo_prompt.dart';
+import '../widgets/common/tab_fade.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'package:geocoding/geocoding.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:home_widget/home_widget.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:sentry_flutter/sentry_flutter.dart';
+import '../utils/photo_crop.dart';
+import '../utils/photo_orientation.dart';
+import '../utils/safe_pick.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../models/love_prompt.dart';
+import '../models/memory.dart';
+import '../models/widget_tap_dedup.dart';
+import '../models/gift.dart';
+import '../models/gift_effect.dart';
+import '../models/incoming_gifts.dart';
+import '../models/sound_clip.dart';
+import '../services/pb_data_service.dart';
+import '../services/widget_diagnostics.dart';
+import 'gifts/gift_receive_sheet.dart';
+import '../services/achievement_service.dart';
+import '../widgets/achievements/achievement_unlock.dart';
+import 'achievements_screen.dart';
+import '../models/pair_data.dart';
+import '../models/user_data.dart';
+import '../models/mood_entry.dart';
+import '../models/mood_widget_payload.dart';
+import '../models/onboarding_progress.dart';
+import '../models/quiet_partner.dart';
+import '../services/invite_reminder_service.dart';
+import '../services/miss_you_repository.dart';
+import '../services/pb_realtime_service.dart';
+import '../widgets/home/love_test_card.dart';
+import '../widgets/home/invite_prompt_card.dart';
+import '../widgets/home/waiting_home_card.dart';
+import '../widgets/home/onboarding_card.dart';
+import '../models/mascot_anim.dart';
+import '../models/mascot_sleep.dart';
+import '../services/catalog_service.dart';
+import '../services/app_time_service.dart';
+import '../services/push_arrivals.dart';
+import '../widgets/auth/login_nudge.dart';
+import '../widgets/auth/partner_reset_sheet.dart';
+import '../widgets/rank/new_rank_dialog.dart';
+import '../widgets/rank/oldtimer_dialog.dart';
+import '../widgets/mascot/pixel_mascot_view.dart';
+import '../widgets/home/quiet_partner_card.dart';
+import '../widgets/home/daily_tasks_card.dart';
+import '../widgets/chest/chest_home_card.dart';
+import '../widgets/home/wishes_card.dart';
+import '../services/shared_link_service.dart';
+import 'wishes_screen.dart';
+import 'invite_partner_screen.dart';
+import '../services/deep_link_service.dart';
+import '../services/media_service.dart';
+import '../services/love_test_service.dart';
+import '../services/memory_repository.dart';
+import '../services/pocketbase_service.dart';
+import '../services/pb_push_service.dart';
+import '../services/push_background_service.dart';
+import '../services/widget_background_refresh_service.dart';
+import '../services/background_reliability_service.dart';
+import '../services/pb_auth_service.dart';
+import '../services/presence_service.dart';
+import '../services/centrifugo_service.dart';
+import '../services/locale_service.dart';
+import '../services/rate_limiter_service.dart';
+import '../services/hint_calm.dart';
+import '../services/mascot_guide_service.dart';
+import '../services/hint_queue.dart';
+import '../services/ui_prefs.dart';
+import '../services/update_service.dart';
+import '../l10n/palette_names.dart';
+import '../theme/app_theme.dart';
+import '../theme/motion.dart';
+import '../theme/theme_scope.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'canvas_create_flow.dart';
+import '../widgets/common/ad_banner.dart';
+import '../widgets/common/animations.dart';
+import '../widgets/common/hint_bubble.dart';
+import '../widgets/common/m3_loading.dart';
+import 'home/widgets/mood_picker_dialog.dart';
+import 'home/widgets/relationship_type_dialog.dart';
+import 'home/home_header.dart';
+import 'home/home_action_buttons.dart';
+import 'home/home_memory_preview.dart';
+import 'home/home_bottom_nav.dart';
+import 'connect_partner_screen.dart';
+import 'together/watch_home_screen.dart';
+import 'expandable_timer_card.dart';
+import 'chat_screen.dart';
+import 'love_test_screen.dart';
+import 'live_map_screen.dart';
+import 'memory_lane_screen.dart';
+import 'together/together_launcher.dart';
+import '../services/reels/reels_invite.dart';
+import '../widgets/common/app_dialog.dart';
+import 'mini_mood_calendar.dart';
+import 'mood_calendar_screen.dart';
+import 'plus_screen.dart';
+import 'profile_screen.dart';
+import '../theme/profile_theme.dart';
+import '../services/cycle_service.dart';
+import '../services/daily_task_service.dart';
+import '../services/apns_service.dart';
+import '../services/fcm_service.dart';
+import '../services/platform_tag.dart';
+import '../widgets/plus/plus_promo_rule.dart';
+import '../widgets/plus/plus_promo_sheet.dart';
+import '../models/streak_restore.dart';
+import '../services/plus_service.dart';
+import '../services/rewarded_ad_service.dart';
+import '../services/home_widget_service.dart';
+import '../services/level_service.dart';
+import '../services/catalog_widget_sync.dart';
+import '../services/mood_service.dart';
+import '../services/timer_service.dart';
+import '../services/notif_prefs_sync.dart';
+import '../services/pair_widget_payload.dart';
+import '../services/widget_service.dart';
+import '../models/mascot.dart';
+import '../services/canvas_storage_service.dart';
+import 'draw_screen.dart';
+import '../services/mascot_service.dart';
+import '../services/live_location_service.dart';
+import '../widgets/active_mascot_widget.dart';
+import '../models/cloud_mascot.dart' show CloudEvent, kCloudMascotId;
+import '../widgets/mascot/cloud_mascot_view.dart' show CloudEvents, CloudMascotView;
+import '../widgets/common/coin_reward_toast.dart';
+import 'home/widgets/live_map_card.dart';
+import 'mascot_gallery_screen.dart';
+import 'widget_screen.dart';
+
+import 'draw_gallery_screen.dart';
+import '../services/celebration_notification_service.dart';
+import '../services/days_together_notification_service.dart';
+import '../services/mood_notification_service.dart';
+import '../widgets/celebration_banner.dart';
+import '../widgets/app_sheet.dart';
+import '../widgets/avatar_widget.dart';
+import '../widgets/home_layout_editor.dart';
+import '../models/home_layout.dart';
+import '../services/home_layout_service.dart';
+import '../models/avatar_frame.dart';
+import '../services/frame_gift_service.dart';
+import '../services/gifts_service.dart';
+import '../widgets/note_editor_sheet.dart';
+import '../services/pb_media_service.dart';
+import '../services/widget_anim_service.dart';
+import 'snap_capture_screen.dart';
+import '../services/offline/media_view_cache.dart';
+import '../dict_strings.dart' show trKey;
+import '../services/room_window_flag.dart';
+import '../services/wallet_teaser.dart';
+import '../services/media_save_queue.dart';
+import 'wallet_wait_screen.dart';
+import '../widgets/common/gift_image.dart';
+import '../widgets/common/coin_image.dart';
+import '../widgets/season/season_backdrop_layer.dart';
+import '../widgets/theme/theme_pattern_layer.dart';
+import '../widgets/theme/theme_preview_countdown.dart';
+import '../widgets/unfold/unfold_route.dart';
+
+
+class HomeScreen extends StatefulWidget {
+  final UserData userData;
+  const HomeScreen({super.key, required this.userData});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  // -- Theme --
+  AppTheme get _t => widget.userData.theme;
+  Color get primary => _t.primary;
+  Color get primaryLight => _t.primaryLight;
+
+  // -- State --
+  int _selectedNavIndex = 0;
+  bool _showTodayButton = false;
+
+  // Слот подсказки на главной: список первых действий и напоминание о
+  // затихшем партнёре. Флаги локальные — сервер о них ничего не знает.
+  bool _onboardingDismissed = false;
+  bool _widgetPinned = false;
+  int? _partnerSeenAtMs;
+  int? _quietNudgeAt;
+  bool _quietSending = false;
+  StreamSubscription<dynamic>? _partnerPresenceSub;
+
+  /// Сколько суток партнёр не заходил, если пора об этом сказать. null — не
+  /// пора: он заходил недавно, пары нет, отметки визита нет или мы уже
+  /// напоминали сегодня.
+  int? get _quietDays {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (!QuietPartner.shouldPrompt(
+      isPaired: _pairData.isPaired,
+      partnerSeenAtMs: _partnerSeenAtMs,
+      nowMs: now,
+      lastNudgeAtMs: _quietNudgeAt,
+    )) {
+      return null;
+    }
+    return QuietPartner.quietDays(
+      partnerSeenAtMs: _partnerSeenAtMs,
+      nowMs: now,
+    );
+  }
+
+  // Боковая кнопка навбара: стрелка → (открыть Ленту, дефолт) либо плюс +
+  // (сразу создать пин). Хранится в [UiPrefs]; переключается удержанием кнопки
+  // или тумблером в настройках. _sideBtnKey нужен для позиционирования
+  // одноразовой подсказки про удержание.
+  bool _sideActionIsArrow = true;
+  final GlobalKey _sideBtnKey = GlobalKey();
+
+  /// Кнопка чата в нижней панели — источник перехода в переписку.
+  final GlobalKey<UnfoldSourceState> _chatSourceKey =
+      GlobalKey<UnfoldSourceState>();
+
+  /// Цели подсказок: кнопка фото (удержание пишет ролик) и счётчик «Скучаю».
+  final GlobalKey _postBtnKey = GlobalKey();
+  final GlobalKey _missKey = GlobalKey();
+
+  /// Цели подсказок Ту: карандаш и плюс над таймером, календарь, блок маскота.
+  final GlobalKey _timerEditKey = GlobalKey();
+  final GlobalKey _timerAddKey = GlobalKey();
+  final GlobalKey _calendarBtnKey = GlobalKey();
+  final GlobalKey _mascotKey = GlobalKey();
+
+  /// Сезонный фон под главной (призрак за стеклом): ему нажатия в пустое место.
+  final _backdropKey = GlobalKey<SeasonBackdropLayerState>();
+
+  void _pressBackdrop(Offset global) {
+    final box = _backdropKey.currentContext?.findRenderObject();
+    if (box is! RenderBox) return;
+    _backdropKey.currentState?.press(box.globalToLocal(global));
+  }
+  // Одноразовый флаг: открыть настройки парного виджета при входе на вкладку
+  // «Виджеты» (тап по парному виджету рабочего стола). Гасится в _buildWidgetsTab.
+  bool _openPairEditorOnWidgetsTab = false;
+
+  StreamSubscription? _deepLinkSub;
+  StreamSubscription<String>? _sharedLinkSub;
+  StreamSubscription<Uri>? _widgetActionSub;
+  final WidgetTapDedup _widgetTaps = WidgetTapDedup();
+
+  // -- Pair data --
+  final PairData _pairData = PairData();
+
+  // -- Timer service --
+  final TimerService _timerService = TimerService();
+
+  // -- Mood service --
+  final MoodService _moodService = MoodService();
+
+  // -- Widget service --
+  final WidgetService _widgetService = WidgetService();
+
+  // -- Mascot service --
+  final MascotService _mascotService = MascotService();
+
+  /// Ролик за возврат сгоревшей серии; грузится, когда возвращать есть что.
+  final RewardedAdService _restoreAd = RewardedAdService();
+  bool _restoreListening = false;
+  bool _restoreSheetOpen = false;
+  AppLifecycleListener? _appLifecycleListener;
+
+  // -- Memory Lane real-time --
+  final MediaService _fb = MediaService();
+  final CanvasStorageService _storage = CanvasStorageService.instance;
+  List<Memory> _recentMemories = [];
+  StreamSubscription? _memorySub;
+  StreamSubscription? _achievementSub;
+
+  // -- User location (for distance calc) --
+  double? _userLat;
+  double? _userLng;
+  bool _wasPaired = false;
+
+  /// Раздел подарков включён на сервере. По умолчанию выключен: если конфиг не
+  /// прочитался, лучше не показывать кнопку, чем показать неработающую.
+  bool _giftsEnabled = false;
+
+  /// Раздел «Хочу с тобой» включён на сервере. По умолчанию включён: он
+  /// бесплатный и ничего не тратит, а спрятать уже заведённый список из-за
+  /// непрочитанного конфига хуже, чем показать его лишний раз.
+  bool _wishesEnabled = true;
+
+  /// Подарки, которые ждут моего действия: задутой свечи, открытой коробки.
+  List<Map<String, dynamic>> _incomingGifts = const [];
+  RtUnsub? _giftsUnsub;
+
+  /// Подарок «Солнце»: утро встречает рассветом и строчкой от партнёра.
+  bool get _sunriseOn => isEffectActive(
+      (PocketBaseService().currentUser?.data['sunrise_until'] as num?)?.toInt(),
+      DateTime.now());
+
+  String _lastPairId = '';
+  int _pairChangedGeneration = 0;
+
+  // Debounce для _syncHomeWidgets: PairData notifyListeners срабатывает на
+  // КАЖДОЕ изменение group doc (mood, status, timer, memories, missYouCount),
+  // и каждый syncAllBoundWidgets внутри делает refreshRelationshipStats →
+  // 3 Firestore reads. Без дебаунса один действие пользователя выливалось в
+  // 5+ каскадных вызовов = 15+ лишних reads. Собираем все события за окно
+  // в один вызов.
+  Timer? _syncWidgetsDebounce;
+
+  // Дебаунс mood-виджета: на каждое изменение календаря/настроения партнёра
+  // _onMoodServiceChanged вызывал syncMood, который копирует PNG-ассеты и
+  // пишет 30+ значений в SharedPreferences. При каскаде событий — заметные
+  // I/O лаги. Не Firestore reads, но UX-критично на слабых телефонах.
+  Timer? _syncMoodWidgetDebounce;
+  Timer? _moodStreakRewardDebounce;
+  StreamSubscription<({ReelsInvite invite, bool opened})>? _reelsInviteSub;
+  StreamSubscription<void>? _pairResetSub;
+
+  /// Партнёр зовёт в совместную ленту. По касанию на пуш входим сразу, а
+  /// зов, пришедший при открытом приложении, спрашивает листом: человек мог
+  /// быть посреди чата или рисунка.
+  Future<void> _onReelsInvite(({ReelsInvite invite, bool opened}) e) async {
+    if (!mounted) return;
+    final invite = e.invite;
+    if (!e.opened) {
+      final s = LocaleService.current;
+      final go = await AppDialog.confirm(
+        context,
+        title: s.reelsInvitedBy(invite.name.isEmpty ? s.partner : invite.name, invite.source.title),
+        message: s.reelsTogetherHint,
+        confirmLabel: s.reelsJoin,
+        cancelLabel: s.reelsLater,
+        icon: Icons.swipe_up_rounded,
+      );
+      if (!go || !mounted) return;
+    }
+    await TogetherLauncher.open(context, pairId: invite.groupId, reels: true, reelsSource: invite.source);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _pairData.addListener(_onPairChanged);
+    widget.userData.addListener(_onUserChanged);
+    AppTimeService.instance.seconds.addListener(_onAppTimeChanged);
+    HomeLayoutService.instance.addListener(_onLayoutChanged);
+    PlusService.instance.addListener(_onLayoutChanged);
+    unawaited(HomeLayoutService.instance.ensureLoaded());
+    _moodService.addListener(_onMoodServiceChanged);
+    _timerService.addListener(_onTimerServiceChanged);
+    // Единая точка входа для всех пикеров настроения — MoodService.setMoodForToday.
+    // Без bindServices сервис не сможет синхронизировать pair/widget при выборе.
+    _moodService.bindServices(
+      pairData: _pairData,
+      widgetService: _widgetService,
+    );
+    _timerService.init();
+    _initPairData();
+    _loadSideActionPref();
+    _loadPromptState();
+    _loadGiftsFlag();
+    WalletTeaser.restore();
+    RoomWindowFlag.restore();
+    // Главная открыта вошедшим: телефон запоминает гида, если он включён.
+    MascotGuideService.instance.restore().then((_) => MascotGuideService.instance.signedIn());
+    _loadWishesFlag();
+    _loadIncomingGifts();
+    _listenGifts();
+    // Подарок сезона сборка узнаёт из каталога: доехал он позже списка
+    // подарков — карточка встаёт сразу, а не с первой случайной перерисовкой.
+    CatalogService.instance.addListener(_onCatalogForGifts);
+    // Зов в совместную ленту: касание по пушу открывает ленту сразу, а пуш,
+    // пришедший, пока человек в приложении, предлагает войти листом.
+    _reelsInviteSub = ReelsInviteBus.instance.invites.listen(_onReelsInvite);
+    unawaited(ReelsInviteBus.instance.init());
+    // Партнёр забыл пароль и просит код: лист с кодом по пушу, при открытии
+    // и при возврате в приложение (касание пуша приводит сюда же).
+    _pairResetSub = PushArrivals.instance
+        .of('pair_reset')
+        .listen((_) => _checkPartnerReset());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkPartnerReset());
+
+    // Присутствие: «я жив» летит в канал пары через Centrifugo, а в базу
+    // уходит редкая отметка «был в сети». До 14 августа 2026 это была запись
+    // каждые двенадцать секунд с каждого телефона — почти весь поток записи
+    // сервера уходил на неё.
+    PresenceService().start(groupId: _pairData.pairId);
+
+    // Платформа последнего входа. Нужна поддержке: на iOS Togetherly+ не
+    // существует, и человек с покупкой видит открытые фичи, ни разу не
+    // встретив её названия. Пары для этого не требуется, поэтому здесь, а не
+    // в привязке к группе.
+    unawaited(PlatformTag.sync());
+
+    // Токен пушей мог приехать раньше входа: на первом запуске система отдаёт
+    // его, пока человек ещё регистрируется, и записывать его тогда некуда.
+    // Здесь сессия уже есть.
+    unawaited(ApnsService.instance.syncAfterLogin());
+    unawaited(FcmService.instance.syncAfterLogin());
+
+    // Выключатели уведомлений живут в телефоне, а пуш шлёт сервер по колонкам
+    // `users.notif_*` — булевым, то есть у нового аккаунта нулевым. Отправлял
+    // их только экран профиля: кто не открывал вкладку «Профиль», не получал
+    // ни сообщений чата, ни настроения, ни «Скучаю», хотя все тумблеры в
+    // приложении показаны включёнными (обращение №133, 06.09.2026).
+    unawaited(NotifPrefsSync.pushToServer());
+
+    // Check if launched from homescreen widget > open Widgets tab
+    _checkWidgetLaunch();
+    HomeWidget.widgetClicked.listen(_onWidgetClicked);
+    // Тот же тап по виджету, пришедший ссылкой: на iPhone схему `loveapp://`
+    // разбирает app_links, и до `widgetClicked` она не доходит.
+    _widgetActionSub = DeepLinkService().widgetActionStream.listen((uri) {
+      // Та же ссылка лежит и в буфере холодного старта: без очистки следующая
+      // главная открыла бы её ещё раз (TOG-13).
+      DeepLinkService().consumePendingWidgetAction();
+      _handleWidgetUri(uri);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final pending = DeepLinkService().consumePendingWidgetAction();
+      if (pending != null && mounted) _handleWidgetUri(pending);
+    });
+
+    // Listen to deep link invites
+    _sharedLinkSub = SharedLinkService.instance.linkStream.listen(_openSharedLink);
+    // Ссылка могла прийти до того, как главная смонтировалась: на холодном
+    // старте «Поделиться» опережает первый кадр.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final pending = SharedLinkService.instance.consumePending();
+      if (pending != null && pending.isNotEmpty) _openSharedLink(pending);
+    });
+    // Почта аккаунта с опечаткой (gmail.con и подобные) — предложить исправить.
+    // С паузой: на старте главная и так открывает ссылки и подсказки.
+    Future<void>.delayed(const Duration(seconds: 4), () {
+      if (mounted) unawaited(maybeAskToFixEmailTypo(context, widget.userData));
+    });
+
+    _deepLinkSub = DeepLinkService().inviteCodeStream.listen((code) {
+      if (mounted) _openConnectTabForInvite();
+    });
+    // На холодном старте ссылка приходит раньше, чем смонтируется главная:
+    // поток своё событие уже отдал, а код лежит в буфере DeepLinkService.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && DeepLinkService().hasPendingInviteCode) {
+        _openConnectTabForInvite();
+      }
+    });
+
+    // Fetch user location for distance display
+    _fetchUserLocation();
+
+    // Check for Play Store update after a brief delay
+    if (Platform.isAndroid) {
+      Future.delayed(const Duration(seconds: 2), _checkForUpdate);
+    }
+
+    // Ежедневный бонус и разовые награды — через 4с после старта
+    Future.delayed(const Duration(seconds: 4), _tryClaimStartupRewards);
+
+    // Сохранение в галерею, оборванное закрытием приложения, продолжается
+    // сразу при запуске, а не когда человек дойдёт до ленты. Пауза — чтобы
+    // поднялась сессия: ссылкам на файлы нужен файловый токен.
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) unawaited(MediaSaveQueue.instance.resume());
+    });
+
+    // Одноразовая подсказка про удержание боковой кнопки — после первого кадра
+    // и небольшой задержки (даём навбару отрисоваться и паре загрузиться).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Future.delayed(const Duration(milliseconds: 1600), _queueHints);
+      // Просьба исключить из оптимизации батареи — без неё Android рвёт фоновый
+      // сокет и виджеты/уведомления приходят только при открытии приложения.
+      // Показываем с задержкой, чтобы не перекрыть подсказку и дать паре
+      // загрузиться. Сервис сам решает, показывать ли (Android, не слишком часто).
+      Future.delayed(const Duration(milliseconds: 4000), () {
+        if (!mounted || !_pairData.isPaired) return;
+        unawaited(
+          BackgroundReliabilityService.instance.maybePrompt(context),
+        );
+      });
+    });
+
+    // Пересчёт расписания уведомлений о праздниках при каждом старте.
+    Future.microtask(() async {
+      await CelebrationNotificationService.instance.rescheduleOnAppStart();
+      // Постоянный счётчик «дней вместе» (если включён) — пересчитать число.
+      await DaysTogetherNotificationService.instance.rescheduleOnAppStart();
+
+      // Самоотчёт о контейнере виджетов (только iPhone). Виджеты там стоят
+      // пустыми, а по снимкам экрана не понять, чего не хватает: записей,
+      // файлов фото или самого таймлайна. Телефон тестера далеко, поэтому
+      // сводка уезжает в Bugsink сама — человеку довольно открыть приложение.
+      // Ни текстов, ни ссылок, ни имён в ней нет, только длины и наличие файла.
+      //
+      // Спрашиваем сервер: разбор кончился 23.08.2026, а отчёт продолжал
+      // уходить с каждого открытия главной — 719 событий в сутки, больше
+      // половины всего потока панели. Включается обратно PATCH-ем конфига.
+      unawaited(PbDataService().fetchWidgetDiagEnabled().then((on) {
+        if (on) unawaited(WidgetDiagnostics.report());
+      }));
+    });
+
+    _appLifecycleListener = AppLifecycleListener(
+      onResume: () {
+        // Сессия могла остаться без записи профиля: токен живой, имени и
+        // аватара нет. Само это не проходит, поэтому пробуем на каждом
+        // возврате — сервис сам решит, надо ли и не рано ли (session_restore).
+        unawaited(PbAuthService().ensureProfileLoaded());
+        _checkPartnerReset();
+        if (_pairData.isPaired) {
+          _mascotService.recordDailyActivity();
+          HomeWidgetService.instance.refreshPhotoOfDay(_pairData.pairId);
+        }
+        // Re-sync the love widget so partner's latest status/mood appears
+        // immediately when the user returns to the home screen.
+        _widgetService.syncNow();
+        // Обновляем число в постоянном счётчике «дней вместе» (могла смениться
+        // дата за полночь). No-op, если фича выключена.
+        unawaited(DaysTogetherNotificationService.instance.refresh());
+        // Togetherly+ мог открыться прямо сейчас: человек ушёл платить на
+        // lava.top и вернулся в приложение. Перечитываем флаг с сервера, чтобы
+        // купленное заработало здесь же, без перезапуска.
+        unawaited(PlusService.instance.refresh());
+        // Lock-screen mood-уведомление: освежаем при возврате (день мог
+        // смениться за полночь, настроение могло поменяться вне приложения).
+        unawaited(_refreshLockScreenMoodNotification());
+        // Попытка ежедневного бонуса при возврате в приложение
+        _tryClaimDailyBonus();
+        // Человек мог только что поставить виджет с рабочего стола.
+        unawaited(_checkWidgetOnScreen());
+      },
+    );
+  }
+
+  /// Код из ссылки или QR принимает вкладка «Связь» (индекс 2 в `_buildBody`):
+  /// экран сам заберёт код из буфера DeepLinkService и заведёт под него новую
+  /// связь, если пара уже есть. Раньше вкладка открывалась только без пары, и
+  /// человек с парой, открыв ссылку подруги, оставался на главной с таймером
+  /// своей пары, а код молча ждал в буфере (обращение 272, 15.10.2026).
+  void _openConnectTabForInvite() {
+    if (_selectedNavIndex == 2) return;
+    setState(() => _selectedNavIndex = 2);
+  }
+
+  /// Ссылка из «Поделиться»: открываем «Хочу с тобой» и сразу форму вещи.
+  ///
+  /// Без пары раздела нет вовсе — тогда молчим: человек делится товаром, а
+  /// получает экран подключения, и это выглядит поломкой, а не подсказкой.
+  void _openSharedLink(String url) {
+    if (!mounted || url.isEmpty) return;
+    if (!_pairData.isPaired || _pairData.pairId.isEmpty) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => WishesScreen(
+          theme: _t,
+          groupId: _pairData.pairId,
+          myUid: PocketBaseService().userId ?? '',
+          myName: widget.userData.displayName,
+          partnerUid: _pairData.partnerUid,
+          partnerName: _pairData.partnerDisplayName,
+          myAvatarUrl: widget.userData.avatarUrl,
+          partnerAvatarUrl: _pairData.partnerAvatarUrl,
+          sharedUrl: url,
+        ),
+        settings: const RouteSettings(name: '/wishes'),
+      ),
+    );
+  }
+
+  /// Часы в приложении выросли — может, пришло новое звание. Экран звания
+  /// показываем только поверх главной: не посреди чата или рисования.
+  void _onAppTimeChanged() {
+    if (!mounted || !(ModalRoute.of(context)?.isCurrent ?? true)) return;
+    unawaited(maybeShowNewRank(context));
+  }
+
+  @override
+  void dispose() {
+    AppTimeService.instance.seconds.removeListener(_onAppTimeChanged);
+    unawaited(_reelsInviteSub?.cancel());
+    unawaited(_pairResetSub?.cancel());
+    final giftsOff = _giftsUnsub;
+    _giftsUnsub = null;
+    if (giftsOff != null) unawaited(giftsOff());
+    CatalogService.instance.removeListener(_onCatalogForGifts);
+    if (_restoreListening) _mascotService.removeListener(_onMascotForRestore);
+    _restoreAd.dispose();
+    _syncWidgetsDebounce?.cancel();
+    _syncMoodWidgetDebounce?.cancel();
+    _moodStreakRewardDebounce?.cancel();
+    _deepLinkSub?.cancel();
+    _sharedLinkSub?.cancel();
+    _widgetActionSub?.cancel();
+    _memorySub?.cancel();
+    _achievementSub?.cancel();
+    _partnerPresenceSub?.cancel();
+    PbPushService().stop();
+    _appLifecycleListener?.dispose();
+    _mascotService.dispose();
+    _timerService.removeListener(_onTimerServiceChanged);
+    _pairData.removeListener(_onPairChanged);
+    widget.userData.removeListener(_onUserChanged);
+    HomeLayoutService.instance.removeListener(_onLayoutChanged);
+    PlusService.instance.removeListener(_onLayoutChanged);
+    _moodService.removeListener(_onMoodServiceChanged);
+    _widgetService.dispose();
+    _pairData.dispose();
+    super.dispose();
+  }
+
+  /// Преобразует запись календаря в MemberMood для шапки.
+  /// MoodEntry — каноничный источник для сегодня; HomeHeader исторически
+  /// принимает MemberMood, поэтому здесь маппим.
+  /// Пол партнёра для подписей его настроения; пусто — общая подпись.
+  String get _partnerGender => _widgetService.firstPartnerData?.gender ?? '';
+
+  MemberMood _memberMoodFromEntry(MoodEntry? entry, String gender) {
+    if (entry == null) return const MemberMood();
+    return MemberMood(
+      imagePath: entry.imagePath,
+      label: entry.labelFor(gender),
+      updatedAt: entry.timestamp,
+    );
+  }
+
+  Future<void> _initPairData() async {
+    await _pairData.init(myName: widget.userData.displayName);
+  }
+
+  /// Проверяет, запущено ли приложение кликом на виджет
+  Future<void> _checkWidgetLaunch() async {
+    try {
+      final uri = await HomeWidget.initiallyLaunchedFromHomeWidget();
+      if (uri != null) {
+        _handleWidgetUri(uri);
+      }
+    } catch (e) {
+      debugPrint('HomeWidget initial launch check failed: $e');
+    }
+  }
+
+  /// Обработчик клика на виджет рабочего стола
+  void _onWidgetClicked(Uri? uri) {
+    if (uri != null) {
+      _handleWidgetUri(uri);
+    }
+  }
+
+  void _handleWidgetUri(Uri uri) {
+    // Одно нажатие доходит сюда несколькими путями: без фильтра лист заметки
+    // открывался по разу на каждый, и «назад» жали несколько раз (TOG-13).
+    if (!_widgetTaps.admit(uri, DateTime.now())) return;
+    // loveapp://widgets → вкладка виджетов (index 1)
+    // loveapp://widgets/pair → ещё и сразу раскрыть настройки парного виджета
+    if (uri.host == 'widgets' || uri.toString().contains('widgets')) {
+      final wantPairEditor = uri.pathSegments.contains('pair');
+      if (mounted) {
+        setState(() {
+          _selectedNavIndex = 1;
+          if (wantPairEditor) _openPairEditorOnWidgetsTab = true;
+        });
+      }
+    }
+    // loveapp://home → главная (index 0)
+    else if (uri.host == 'home') {
+      if (mounted) {
+        setState(() => _selectedNavIndex = 0);
+      }
+    }
+    // loveapp://memory_lane → открыть Memory Lane (с общим навбаром)
+    else if (uri.host == 'memory_lane') {
+      if (mounted && _pairData.isPaired) {
+        _openMemoryLane();
+      }
+    }
+    // loveapp://map → карта «Где мы»: тап по виджету с картой. На холодном
+    // старте пара приезжает позже ссылки — тогда откроем, как только она
+    // появится (_onPairChanged).
+    else if (uri.host == 'map') {
+      if (mounted && _pairData.isPaired) {
+        _openLiveMapFromWidget();
+      } else {
+        _pendingMapOpen = true;
+      }
+    }
+    // loveapp://mood?id=happy → отметить настроение с виджета-плиток.
+    //
+    // Так работают только виджеты iPhone: на Android отметка уходит фоновым
+    // интентом, не открывая приложение, а у iOS фонового исполнения для
+    // виджетов нет — тап открывает приложение, и запись идёт здесь.
+    else if (uri.host == 'mood' && (uri.queryParameters['id'] ?? '').isNotEmpty) {
+      final moodId = uri.queryParameters['id']!;
+      if (_pairData.isPaired) {
+        unawaited(
+          HomeWidgetService.instance.applyMoodFromWidget(
+            groupId: _pairData.pairId,
+            moodId: moodId,
+          ),
+        );
+      }
+    }
+    // loveapp://miss → сказать «скучаю» с виджета.
+    else if (uri.host == 'miss') {
+      if (_pairData.isPaired) {
+        unawaited(_sendQuietNudge());
+      }
+    }
+    // loveapp://draw?canvas=… → холст с рабочего стола. Открываем именно тот
+    // рисунок, что на виджете: без номера человек попадёт в галерею и будет
+    // искать его глазами.
+    else if (uri.host == 'draw') {
+      if (mounted && _pairData.isPaired) {
+        unawaited(_openCanvasFromWidget(uri.queryParameters['canvas'] ?? ''));
+      }
+    }
+    // loveapp://note → правка общего листика (печатать в виджете iOS не даёт).
+    else if (uri.host == 'note') {
+      if (mounted && _pairData.isPaired) {
+        unawaited(showNoteEditorSheet(context, groupId: _pairData.pairId));
+      }
+    }
+    // loveapp://mood → открыть Mood Calendar
+    else if (uri.host == 'mood') {
+      if (mounted && _pairData.isPaired) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => MoodCalendarScreen(
+              pairData: _pairData,
+              moodService: _moodService,
+              widgetService: _widgetService,
+              theme: _t,
+              userData: widget.userData,
+            ),
+            settings: const RouteSettings(name: '/mood_calendar'),
+          ),
+        );
+      }
+    }
+  }
+
+  /// Нажали на виджет «Где мы», а пара ещё не загрузилась.
+  bool _pendingMapOpen = false;
+
+  void _openLiveMapFromWidget() {
+    _pendingMapOpen = false;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => LiveMapScreen(
+          pairId: _pairData.pairId,
+          partnerUid: _pairData.partnerUid,
+          partnerName: _pairData.partnerDisplayName,
+          partnerAvatarUrl: _pairData.partnerAvatarUrl,
+          myAvatarUrl: widget.userData.avatarUrl,
+          theme: _t,
+        ),
+        settings: const RouteSettings(name: '/live_map'),
+      ),
+    );
+  }
+
+  void _onPairChanged() {
+    if (!mounted) return;
+    if (_pendingMapOpen && _pairData.isPaired) _openLiveMapFromWidget();
+    // Пара появилась или сменилась — присутствию нужен её канал. Вызов
+    // идемпотентный: тот же groupId ничего не перезапускает.
+    PresenceService().start(groupId: _pairData.pairId);
+    unawaited(_handlePairChanged());
+    // Появилась пара → можно показать одноразовую подсказку про боковую кнопку.
+    unawaited(_queueHints());
+  }
+
+  /// Когда меняется дефолтный таймер — синхронизируем все виджеты,
+  /// чтобы «Дни вместе» подхватил новый таймер так же, как таймер-виджет.
+  void _onTimerServiceChanged() {
+    if (!mounted || !_pairData.isPaired) return;
+    _scheduleSyncHomeWidgets();
+    // Уведомление-счётчик «дней вместе» считает от даты ОСНОВНОГО (дефолтного)
+    // таймера — той же, что видна в приложении; системный таймер хранит дату
+    // пары (≈сегодня) и дал бы 0, если основным сделан пользовательский таймер.
+    // При правке даты обновляем уведомление. null НЕ передаём (иначе снялось бы).
+    final start = _timerService.defaultTimer?.startDate ??
+        _timerService.systemTimer?.startDate ??
+        _pairData.startDate;
+    if (start != null) {
+      unawaited(
+        DaysTogetherNotificationService.instance.onStartDateChanged(start),
+      );
+    }
+    // Достижения по сроку отношений считают от той же даты, что счётчик дней —
+    // иначе показывали бы «7 дней» паре с годами отношений.
+    AchievementService.instance.setCoupleStart(start);
+  }
+
+  Future<void> _handlePairChanged() async {
+    if (!mounted) return;
+    // Increment generation so stale concurrent calls can self-cancel.
+    final generation = ++_pairChangedGeneration;
+
+    final isPaired = _pairData.isPaired;
+    final isSolo = _pairData.isSolo;
+    final currentPairId = _pairData.pairId;
+
+    // Detect if group changed (even within paired mode)
+    final groupChanged = _lastPairId != currentPairId;
+    _lastPairId = currentPairId;
+
+    // Re-subscribe to memories ONLY when the group/pairing state actually
+    // changed. PairData notifies on every group-doc field update (mood,
+    // status, memoriesUpdatedAt, etc.), and each restart re-reads the
+    // limit window from Firestore — a major source of read amplification.
+    if (groupChanged || _wasPaired != isPaired) {
+      _startMemoryListener();
+      _updatePartnerPush(isPaired);
+      // Кого слушать на предмет «давно не заходил» — знаем только теперь.
+      _watchPartnerPresence();
+      // Второй шанс у приглашения ровно один — следующий день: 81,5% пар
+      // складываются в первый час, а одиночка после дня установки почти не
+      // возвращается. Пара появилась — напоминание снимаем.
+      unawaited(isPaired
+          ? InviteReminderService.instance.cancel()
+          : InviteReminderService.instance.scheduleIfSolo());
+      // Подписка на подарки живёт по тем же правилам, что и пуши: пара
+      // грузится асинхронно, и на момент initState её ещё нет. Если не
+      // переподнять здесь, подарок доезжает только пушем — без анимации
+      // получения. Плюс перечитываем входящие: базовый список для сравнения
+      // «пришло ли новое» в _onGiftEvent должен быть уже актуальным.
+      unawaited(_listenGifts());
+      unawaited(_loadLoveTestState());
+      unawaited(_loadIncomingGifts());
+    }
+
+    // isPaired check does NOT require startDate — mood/widget services bind
+    // to the group regardless of whether startDate is set yet.
+    if (isPaired) {
+      // Rebind services only when group actually changed or pairing state flipped.
+      // Restarting listenToPartner() on every trivial PairData change causes a
+      // cascade: Firestore re-emits → MoodService notifies → _onMoodServiceChanged
+      // → pairData.setMood → PairData notifies → _handlePairChanged again → loop.
+      if (groupChanged || _wasPaired != isPaired) {
+        // Таймеры от прежней пары отвязывает сам bindToGroup ниже. Отвязка
+        // через соло писала в виджет таймера пустоту на каждом запуске
+        // (TOG-24).
+        _moodService.unbindFromGroup();
+        await _widgetService.unbindFromGroup();
+        if (generation != _pairChangedGeneration) return;
+
+        // Bind timer service to group for Firestore sync
+        await _timerService.bindToGroup(_pairData.pairId);
+        if (generation != _pairChangedGeneration) return;
+
+        // Bind mood service to group for Firestore sync
+        _moodService.bindToGroup(_pairData.pairId);
+
+        // Календарь цикла: раздел показывается только женскому полу, но
+        // привязку делаем всегда — партнёрские отметки нужны и мужчине,
+        // когда она разрешила их видеть.
+        // Togetherly+ — серверный флаг: перечитываем при каждом входе, чтобы
+        // покупка с сайта открылась сама, без перезапуска приложения.
+        unawaited(PlusService.instance.refresh().then((_) {
+          // Ежемесячные монеты владельцам: сервер сам решит, прошёл ли месяц.
+          unawaited(PlusService.instance.claimMonthlyCoins());
+        }));
+
+        unawaited(CycleService.instance.bind(
+          groupId: _pairData.pairId,
+          partnerUid: _pairData.partnerUid,
+        ));
+
+        // Задания дня: набор считается из даты и пары, с сервера нужен только
+        // прогресс — он приезжает в записи группы.
+        DailyTaskService.instance.bind(groupId: _pairData.pairId);
+        unawaited(DailyTaskService.instance.refresh());
+
+        // Bind widget service to group for Firestore sync
+        await _widgetService.bindToGroup(_pairData.pairId);
+        if (generation != _pairChangedGeneration) return;
+        for (final p in _pairData.partners) {
+          _widgetService.listenToPartner(p.uid);
+          // Subscribe to partner moods so MoodWidgetProvider stays updated
+          _moodService.listenToPartner(p.uid);
+        }
+
+        // Bind mascot service only on actual group change.
+        // recordDailyActivity makes a Firestore read+write on each call;
+        // calling it on every group-doc update (e.g. memoriesUpdatedAt) causes
+        // a cascade: write → group listener fires → _handlePairChanged → write …
+        _bindMascotService(_pairData.pairId);
+
+        // Возобновляем фоновый шеринг геопозиции (карта «Где мы»), если
+        // пользователь его включал. Идемпотентно; при выключенном флаге — no-op.
+        unawaited(
+          LiveLocationService.instance.resumeIfEnabled(
+            _pairData.pairId,
+            partnerUid: _pairData.partnerUid,
+          ),
+        );
+      }
+
+      // Create system timer only when startDate is known.
+      if (_pairData.startDate != null) {
+        if (generation != _pairChangedGeneration) return;
+        await _timerService.createSystemTimer(
+          startDate: _pairData.startDate!,
+          relationshipLabel: _pairData.relationshipLabel,
+          relationshipEmoji: _pairData.relationshipEmoji,
+          partnerName: _pairData.partnerDisplayName,
+        );
+        // Title устанавливается только при создании таймера (первый вход в пару).
+        // Дальнейшие изменения статуса отношений не меняют название — пользователь
+        // может свободно редактировать его через UI.
+        // updateSystemTimerTitle был удалён, т.к. перезаписывал ручные правки.
+        // Старые пары получили название с английским «with» — чиним предлог
+        // один раз, только если название осталось ровно таким, каким его
+        // сгенерировало приложение.
+        await _timerService.migrateSystemTimerTitle(
+          relationshipLabel: _pairData.relationshipLabel,
+          partnerName: _pairData.partnerDisplayName,
+        );
+
+        // Постоянный счётчик «дней вместе»: считаем от даты СИСТЕМНОГО таймера
+        // (её пользователь может редактировать — это та же дата, что в видимом
+        // круге и в десктоп-виджете «Дни вместе»), а НЕ от даты создания пары
+        // (_pairData.startDate) — иначе уведомление расходится с тем, что видно.
+        unawaited(
+          DaysTogetherNotificationService.instance.onStartDateChanged(
+            _timerService.defaultTimer?.startDate ??
+                _timerService.systemTimer?.startDate ??
+                _pairData.startDate,
+          ),
+        );
+      }
+
+      // Синхронизируем виджеты рабочего стола с актуальными данными
+      _scheduleSyncHomeWidgets();
+    } else if (isSolo) {
+      // Solo mode: load local timers and sync widget
+      await _timerService.unbindFromGroup();
+      if (generation != _pairChangedGeneration) return;
+      _moodService.unbindFromGroup();
+      await _widgetService.unbindFromGroup();
+      _mascotService.unbind();
+      // Sync widgets for solo mode (already done in unbindFromGroup)
+      _scheduleSyncHomeWidgets();
+    } else {
+      await _timerService.unbindFromGroup();
+      if (generation != _pairChangedGeneration) return;
+      _moodService.unbindFromGroup();
+      await _widgetService.unbindFromGroup();
+      _mascotService.unbind();
+      // Sync widgets for single user mode (no group)
+      _scheduleSyncHomeWidgets();
+    }
+
+    // Нет пары → убрать постоянный счётчик «дней вместе» из шторки.
+    if (!isPaired) {
+      unawaited(
+        DaysTogetherNotificationService.instance.onStartDateChanged(null),
+      );
+      // Нет пары → гасим фоновый шеринг геопозиции и убираем свою точку.
+      unawaited(
+        LiveLocationService.instance.stopSharing(removePoint: true),
+      );
+    }
+
+    // Auto-navigate to home tab when user just joined a group.
+    // Пара распалась — виджет обязан забыть её целиком, вместе с картинками.
+    // Отвязка от группы этим признаком не является: экран зовёт её и при
+    // переключении между связями, и очистка на ней затирала имена с
+    // настроениями у человека с двумя связями (18.08.2026).
+    if (shouldClearPairWidget(wasPaired: _wasPaired, isPaired: isPaired)) {
+      unawaited(_widgetService.clearPairWidgetData());
+    }
+
+    final justPaired = !_wasPaired && isPaired;
+    _wasPaired = isPaired;
+
+    // Разовая награда за приглашение партнёра — триггерим в МОМЕНТ образования
+    // пары, а не только на старте (_tryClaimStartupRewards). Иначе свежеподклю-
+    // чившийся пользователь видит задание выполненным, но монеты не приходят до
+    // перезапуска приложения. Эта точка достигается только пережившим generation-
+    // check вызовом, поэтому проблемы прерывания (см. _tryClaimStartupRewards) нет.
+    // Идемпотентно: серверный флаг partnerInviteRewardGranted + локальный кеш —
+    // повторный вызов вместе со стартовым безопасен.
+    if (justPaired) {
+      unawaited(_tryClaimPartnerInviteReward());
+    }
+
+    // Авто-прыжок на главную при появлении пары убран: он срабатывал и при
+    // переключении карусели групп (тап по подключённой связи/аватарке кидал на
+    // главную). Остаёмся на экране «Подключение» — там красивый connected-вид.
+    if (mounted) setState(() {});
+  }
+
+  void _bindMascotService(String groupId) {
+    // Окно сна живёт в профиле: сервис маскота до него не дотягивается, а
+    // виджету рабочего стола оно нужно, чтобы уложить персонажа вовремя.
+    _mascotService.sleepResolver = widget.userData.sleepOf;
+    _mascotService.bindToGroup(groupId);
+    if (!_restoreListening) {
+      _restoreListening = true;
+      _mascotService.addListener(_onMascotForRestore);
+    }
+    // Record that someone opened the app today (streak tracking).
+    _mascotService.recordDailyActivity();
+  }
+
+  static const String _kStreakRestoreSeen = 'streak_restore_seen';
+
+  /// Серия сгорела и её можно вернуть — приложение один раз на каждый обрыв
+  /// спрашивает «Вернуть серию?». Реклама включается только по «Да»; дальше
+  /// предложение живёт кнопкой у маскота.
+  Future<void> _onMascotForRestore() async {
+    final offer = _mascotService.restoreOffer;
+    if (offer == null || _restoreSheetOpen || !mounted) return;
+    if (!PlusService.instance.active && !_restoreAd.isReady) {
+      unawaited(_restoreAd.load());
+    }
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getString(_kStreakRestoreSeen) == offer.key) return;
+    await prefs.setString(_kStreakRestoreSeen, offer.key);
+    if (!mounted || _restoreSheetOpen) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_openStreakRestore());
+    });
+  }
+
+  /// Вопрос «Вернуть серию?»: «Да, посмотреть рекламу» — и серия
+  /// возвращается у обоих. С Плюсом без рекламы.
+  Future<void> _openStreakRestore() async {
+    final offer = _mascotService.restoreOffer;
+    if (offer == null || _restoreSheetOpen || !mounted) return;
+    final s = LocaleService.current;
+    final cs = ProfileTheme.themeFor(_t).colorScheme;
+    final plus = PlusService.instance.active;
+    if (!plus && !_restoreAd.isReady) unawaited(_restoreAd.load());
+
+    _restoreSheetOpen = true;
+    final agreed = await showModalSheet<bool>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      backgroundColor: cs.surfaceContainer,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 4, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  color: cs.primaryContainer,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.local_fire_department_rounded,
+                  color: cs.onPrimaryContainer,
+                  size: 30,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(s.streakRestoreTitle,
+                  style: Theme.of(ctx).textTheme.headlineSmall),
+              const SizedBox(height: 8),
+              Text(
+                plus
+                    ? s.streakRestoreBodyPlus(offer.days)
+                    : s.streakRestoreBody(offer.days),
+                style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(
+                      color: cs.onSurfaceVariant,
+                    ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  icon: Icon(plus
+                      ? Icons.local_fire_department_rounded
+                      : Icons.play_arrow_rounded),
+                  label: Text(
+                      plus ? s.streakRestoreYes : s.streakRestoreWatch),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: Text(s.streakRestoreNo),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    _restoreSheetOpen = false;
+    if (agreed != true || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+
+    if (!plus) {
+      if (!_restoreAd.isReady) {
+        unawaited(_restoreAd.load());
+        messenger.showSnackBar(SnackBar(
+          content: Text(s.streakRestoreNoAd),
+          behavior: SnackBarBehavior.floating,
+        ));
+        return;
+      }
+      final earned =
+          await _restoreAd.show(uid: PocketBaseService().userId ?? '');
+      unawaited(_restoreAd.load());
+      if (!earned) {
+        if (mounted) await showAdNotEarned(context);
+        return;
+      }
+    }
+
+    final ok = await _mascotService.restoreStreak();
+    // Итог — когда экран рекламы уже закрылся.
+    if (!plus) await untilAppVisible();
+    if (!mounted) return;
+    messenger.showSnackBar(SnackBar(
+      content: Text(ok
+          ? s.streakRestored(_mascotService.activeStreak)
+          : s.streakRestoreFailed),
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  void _openMascotGallery() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MascotGalleryScreen(
+          mascotService: _mascotService,
+          theme: _t,
+          myUid: widget.userData.uid,
+          user: widget.userData,
+        ),
+        settings: const RouteSettings(name: '/mascot_gallery'),
+      ),
+    );
+  }
+
+  /// Планирует sync виджетов с дебаунсом 350ms. PairData notifyListeners
+  /// срабатывает кучу раз за короткий промежуток (mood + status + timer +
+  /// memoriesUpdatedAt и т.д.) — собираем всё в один вызов.
+  void _scheduleSyncHomeWidgets() {
+    _syncWidgetsDebounce?.cancel();
+    _syncWidgetsDebounce = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted) return;
+      _syncHomeWidgets();
+    });
+  }
+
+  /// Синхронизирует виджеты рабочего стола.
+  /// Вызов дешёвый — обновляет данные виджета только при необходимости.
+  Future<void> _syncHomeWidgets() async {
+    // Allow single user mode (no group) to sync personal widgets
+
+    final hws = HomeWidgetService.instance;
+    final myName = widget.userData.displayName;
+    final partnerName = _pairData.partnerDisplayName;
+
+    final myGender = widget.userData.gender?.name ?? '';
+    final partnerGender = _widgetService.firstPartnerData?.gender ?? '';
+
+    await hws.syncAllBoundWidgets(
+      activeGroupId: _pairData.pairId,
+      activeTimers: _timerService.timers,
+      activeSysTimer: _timerService.systemTimer,
+      activeStartDate: _pairData.startDate,
+      anniversary: _pairData.anniversaryDate,
+      coupleNames: '$myName & $partnerName',
+      emoji: _pairData.relationshipEmoji,
+      myAvatarUrl: widget.userData.avatarUrl,
+      partnerAvatarUrl: _pairData.partnerAvatarUrl,
+      // Виджеты красятся активной темой, а не зашитым фиолетовым.
+      scheme: ProfileTheme.themeFor(_t).colorScheme,
+      myGender: myGender,
+      partnerGender: partnerGender,
+      relationshipStatusId: _pairData.relationshipStatusId,
+      isRomantic:
+          _pairData.relationshipType == RelationshipType.couple ||
+          _pairData.relationshipType == RelationshipType.married,
+      themeIndex: widget.userData.themeId,
+    );
+
+    // Sync the mood widget from today's Mood Calendar entries
+    await _syncMoodWidget();
+
+    // Виджеты нового каталога («Вместе», плитки настроения, кольцо и календарь
+    // лет) раньше наполнялись только экраном «Виджеты». Кто ставил их из
+    // системной галереи, видел пустые плитки — на iOS насовсем, там фонового
+    // обновления нет.
+    await CatalogWidgetSync.sync(
+      pair: _pairData,
+      moods: _moodService,
+      myName: widget.userData.displayName,
+      myAvatarUrl: widget.userData.avatarUrl,
+      myUid: widget.userData.uid,
+      systemTimer: _timerService.systemTimer,
+      defaultTimer: _timerService.defaultTimer,
+      memoriesCount: _recentMemories.length,
+      timers: _timerService.timers,
+      theme: _t,
+    );
+  }
+
+  /// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ (MoodWidgetProvider) пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
+  /// Mood Calendar пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ пїЅ пїЅ пїЅпїЅпїЅпїЅпїЅ, пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ.
+  Future<void> _syncMoodWidget() async {
+    if (!_pairData.isPaired) return;
+    final today = DateTime.now();
+
+    // пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
+    final myEntries = _moodService.myEntriesForDay(today);
+    final myEntry = myEntries.isNotEmpty ? myEntries.first : null;
+
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
+    final partnerUid = _pairData.partners.isNotEmpty
+        ? _pairData.partners.first.uid
+        : '';
+    final partnerEntries = partnerUid.isNotEmpty
+        ? _moodService.partnerEntriesForDay(partnerUid, today)
+        : <MoodEntry>[];
+    final partnerEntry = partnerEntries.isNotEmpty
+        ? partnerEntries.first
+        : null;
+
+    // Записи за сегодня главнее, но если их нет — берём последнее известное
+    // настроение из widget_data. Раньше пустой список MoodService означал ноль,
+    // и половина партнёра оставалась пустым контуром, хотя на экране «Виджеты»
+    // (он рисуется из widget_data) стояло «Оценка 5 из 5». Именно это увидела
+    // тестер на iPhone 17.08.2026. Правило — в moodHalfPayload, под тестами.
+    final myWd = _widgetService.myData;
+    final partnerWd = _widgetService.firstPartnerData;
+    final mine = moodHalfPayload(
+      entry: myEntry,
+      widgetMoodEmoji: myWd?.moodEmoji ?? '',
+      widgetMoodLabel: myWd?.moodLabel ?? '',
+      gender: widget.userData.gender?.name ?? '',
+    );
+    final theirs = moodHalfPayload(
+      entry: partnerEntry,
+      widgetMoodEmoji: partnerWd?.moodEmoji ?? '',
+      widgetMoodLabel: partnerWd?.moodLabel ?? '',
+      gender: partnerWd?.gender ?? '',
+    );
+
+    if (mine.isEmpty && theirs.isEmpty) {
+      debugPrint(
+        'HomeWidgetService.syncMood skipped in HomeScreen: no mood entries today',
+      );
+      return;
+    }
+
+    await HomeWidgetService.instance.syncMood(
+      groupId: _pairData.pairId,
+      moodEmojiAssetPath: mine.imagePath,
+      moodLabel: mine.label,
+      moodScore: mine.score,
+      moodColor: mine.colorHex,
+      userName: widget.userData.displayName,
+      partnerMoodEmojiAssetPath: theirs.imagePath,
+      partnerMoodLabel: theirs.label,
+      partnerMoodColor: theirs.colorHex,
+      partnerMoodScore: theirs.score,
+      partnerUserName: _pairData.partnerDisplayName,
+      noMoodText: LocaleService.current.noMoodRecorded,
+      nameFallbackMe: LocaleService.current.me,
+      nameFallbackPartner: LocaleService.current.partner,
+      ratingPrefix: LocaleService.current.moodScorePrefix,
+    );
+  }
+
+  /// Lock-screen mood-уведомление (Android) живёт отдельно от десктоп-виджета и
+  /// раньше обновлялось ТОЛЬКО с экрана виджетов → если настроение задавали в
+  /// другом месте (главный экран/календарь), оно застывало на «Настроение не
+  /// задано». Держим его в синхроне с настроением здесь — как десктоп-виджет.
+  /// No-op, если пары нет или фича выключена.
+  Future<void> _refreshLockScreenMoodNotification() async {
+    if (!_pairData.isPaired) return;
+    final enabled =
+        await HomeWidgetService.instance.getLockScreenMoodEnabled();
+    if (!enabled) return;
+    final today = DateTime.now();
+    final myEntries = _moodService.myEntriesForDay(today);
+    final myEntry = myEntries.isNotEmpty ? myEntries.first : null;
+    final partnerUid =
+        _pairData.partners.isNotEmpty ? _pairData.partners.first.uid : '';
+    final partnerEntries = partnerUid.isNotEmpty
+        ? _moodService.partnerEntriesForDay(partnerUid, today)
+        : <MoodEntry>[];
+    final partnerEntry =
+        partnerEntries.isNotEmpty ? partnerEntries.first : null;
+    await MoodNotificationService.instance.show(
+      myMood: myEntry?.labelFor(MoodGenders.mine) ?? '',
+      myName: widget.userData.displayName,
+      partnerMood: partnerEntry?.labelFor(_partnerGender) ?? '',
+      partnerName: _pairData.partnerDisplayName,
+    );
+  }
+
+  void _startMemoryListener() {
+    _memorySub?.cancel();
+    final groupId = _pairData.pairId;
+    if (groupId.isEmpty || !_pairData.isPaired) {
+      _recentMemories = [];
+      unawaited(AchievementService.instance.stop());
+      _achievementSub?.cancel();
+      _achievementSub = null;
+      return;
+    }
+    // Достижения пары: следим за счётчиками группы; на разблокировку — оверлей.
+    unawaited(AchievementService.instance.start(groupId));
+    // Сразу отдаём настоящую дату начала (та же, что у счётчика дней), чтобы
+    // первый расчёт срока не показал «7 дней» вместо реальных лет вместе.
+    AchievementService.instance.setCoupleStart(
+      _timerService.defaultTimer?.startDate ??
+          _timerService.systemTimer?.startDate ??
+          _pairData.startDate,
+    );
+    _achievementSub ??= AchievementService.instance.unlocks.listen((a) {
+      if (!mounted) return;
+      // На главной достижение приходит нижним листом. Поверх чата, холста или
+      // чужого листа он оборвал бы дело, поэтому там — островок.
+      AchievementUnlock.show(
+        context,
+        a,
+        homeOnTop: () => mounted && (ModalRoute.of(context)?.isCurrent ?? true),
+        stats: () => AchievementService.instance.stats.value,
+        onSeeAll: () {
+          if (!mounted) return;
+          Navigator.push(
+            context,
+            MaterialPageRoute<void>(
+              builder: (_) => AchievementsScreen(theme: _t),
+              settings: const RouteSettings(name: '/achievements'),
+            ),
+          );
+        },
+      );
+    });
+    // PocketBase live-лента (SSE). Берём 10 свежих для превью на главной —
+    // watch отдаёт всё новым-сверху, ограничиваем take(10) как прежний limit.
+    _memorySub = MemoryRepository().watch(groupId).listen(
+      (memories) {
+        if (mounted) {
+          // Превью на главной не имеет PIN-гейта/sealed-рендера — прячем
+          // секретные и ещё запечатанные капсулы, чтобы не светить контент.
+          setState(() => _recentMemories = memories
+              .where((m) => !m.sealedNow() && !m.isSecret)
+              .take(10)
+              .toList());
+        }
+      },
+      onError: (e) => debugPrint('home: memory watch error: $e'),
+    );
+  }
+
+  /// Уведомления о партнёре (SSE chat/mood/miss_you → локальные баннеры).
+  ///
+  /// Android: доставку держит [PushBackgroundService] — foreground-сервис с
+  /// отдельным изолятом, который продолжает слушать сервер даже когда
+  /// приложение свёрнуто или выгружено из недавних (§5). Запускаем его, пока
+  /// мы на переднем плане (иначе Android 12+ заблокировал бы старт из фона).
+  ///
+  /// iOS: постоянный фоновый сокет невозможен (нужен APNs) — слушаем хотя бы
+  /// пока приложение открыто, в главном изоляте через [PbPushService].
+  void _updatePartnerPush(bool isPaired) {
+    final myUid = PocketBaseService().userId ?? '';
+    final partnerUid = _pairData.partnerUid;
+    if (isPaired && myUid.isNotEmpty && partnerUid.isNotEmpty) {
+      // Доставка уведомлений партнёра по SSE — БЕЗ FCM.
+      // (1) ГЛАВНЫЙ изолят: подписку держим всегда, пока приложение открыто —
+      // здесь та же рабочая PB-сессия и SSE, что питают живые счётчики, поэтому
+      // foreground-доставка надёжна и не зависит от запуска сервиса.
+      PbPushService().start(
+        groupId: _pairData.pairId,
+        myUid: myUid,
+        partnerUid: partnerUid,
+        partnerName: _pairData.partnerDisplayName,
+      );
+      // (2) Android: вдобавок foreground-сервис — чтобы доставка пережила
+      // сворачивание/выгрузку приложения. Уведомления дедуплицируются по
+      // детерминированному id, поэтому двойного баннера не будет.
+      if (Platform.isAndroid) {
+        unawaited(PushBackgroundService().start(
+          groupId: _pairData.pairId,
+          myUid: myUid,
+          partnerUid: partnerUid,
+          partnerName: _pairData.partnerDisplayName,
+        ));
+        // (3) Android: живучий фолбэк — периодический WorkManager-рефреш
+        // виджетов на случай, когда OEM-киллер (Xiaomi/Samsung) убил
+        // foreground-сервис и realtime-сокет мёртв.
+        unawaited(WidgetBackgroundRefreshService.instance.ensureScheduled());
+      }
+    } else {
+      PbPushService().stop();
+      unawaited(PushBackgroundService().stop());
+      unawaited(WidgetBackgroundRefreshService.instance.cancel());
+    }
+  }
+
+  /// Раскладка главной или Плюс поменялись. Открытая вкладка, которую только
+  /// что спрятали, уступает место главной.
+  void _onLayoutChanged() {
+    if (!mounted) return;
+    setState(() {
+      if (!_navTabShown(_selectedNavIndex)) _selectedNavIndex = 0;
+    });
+  }
+
+  /// Видна ли вкладка нижней панели с этим номером.
+  bool _navTabShown(int index) {
+    final layout = HomeLayoutService.instance.current;
+    return switch (index) {
+      1 => layout.showsTab(HomeTab.widgets),
+      4 => layout.showsTab(HomeTab.watch),
+      _ => true,
+    };
+  }
+
+  /// Код для партнёра, который забыл пароль. Пары нет — спрашивать некого.
+  void _checkPartnerReset() {
+    if (!mounted || !_pairData.isPaired) return;
+    unawaited(maybeShowPartnerReset(context));
+  }
+
+  void _onUserChanged() {
+    if (mounted) setState(() {});
+    // Значок «Старожил» пришёл с сервера — один раз сказать, за что он.
+    if (mounted && (ModalRoute.of(context)?.isCurrent ?? true)) {
+      unawaited(maybeShowOldTimer(context, widget.userData));
+    }
+    // Тема пары меняется через userData → синкаем виджеты рабочего стола,
+    // иначе лепестковый таймер остаётся на старой/дефолтной теме.
+    _scheduleSyncHomeWidgets();
+  }
+
+  /// Обновление MoodService: применять изменения настроения из pairData
+  /// и синхронизировать виджет настроения при изменении состояния.
+  void _onMoodServiceChanged() {
+    if (!mounted) return;
+    // Sync the Android home-screen mood widget and rebuild the in-app UI.
+    // Do NOT call _pairData.setMood() / clearMood() here: that would write to
+    // Firestore and call PairData.notifyListeners(), triggering _handlePairChanged
+    // which restarts Firestore listeners and creates a feedback loop (blinking).
+    // memberMoods stays in sync via the group-document Firestore listener.
+    // Дебаунс: setMoodForToday триггерит цепочку (calendar delete → add → pair
+    // update → widget update), каждый из которых notify-ит MoodService. Без
+    // дебаунса syncMood копирует PNG-ассеты 5+ раз подряд.
+    _syncMoodWidgetDebounce?.cancel();
+    _syncMoodWidgetDebounce = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted) return;
+      _syncMoodWidget();
+      // Lock-screen mood-уведомление держим в синхроне с настроением (раньше
+      // обновлялось только с экрана виджетов → показывало «не задано»).
+      unawaited(_refreshLockScreenMoodNotification());
+    });
+    if (mounted) setState(() {});
+
+    // Проверяем стрик настроения — дебаунс 2с, т.к. _onMoodServiceChanged
+    // срабатывает 3-5 раз подряд за одно действие (cascade: delete→add→pair→widget)
+    if (_pairData.isPaired) {
+      _moodStreakRewardDebounce?.cancel();
+      _moodStreakRewardDebounce = Timer(const Duration(seconds: 2), () {
+        if (!mounted) return;
+        if (_moodService.bothPartnersStreakDays >= 7)
+          _tryClaimMoodStreakReward();
+      });
+    }
+  }
+
+  String get _statusBadgeText {
+    if (!_pairData.isPaired) return LocaleService.current.solo;
+    return _pairData.relationshipLabel;
+  }
+
+  String get _statusBadgeEmoji {
+    if (!_pairData.isPaired) return '';
+    return _pairData.relationshipEmoji;
+  }
+
+  // =============================================
+  // BUILD
+  // =============================================
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          // -- Background --
+          Positioned.fill(
+            child: RepaintBoundary(
+              child: _t.bgImageUrl != null
+                  ? StorageImage(
+                      imageUrl: _t.bgImageUrl!,
+                      fit: BoxFit.cover,
+                      width: double.infinity,
+                      height: double.infinity,
+                      placeholder: (_, __) => DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: _t.bgGradient,
+                          ),
+                        ),
+                      ),
+                      errorWidget: (_, __, ___) => DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: _t.bgGradient,
+                          ),
+                        ),
+                      ),
+                    )
+                  : DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: _t.bgGradient,
+                        ),
+                      ),
+                    ),
+            ),
+          ),
+          // -- Узор темы («Хэллоуин»): контуры предметов по всему фону, под
+          // всеми вкладками, как обои в чате. У темы без узора слот пустой.
+          Positioned.fill(child: ThemePatternLayer(theme: _t)),
+          // -- Сезонный фон под содержимым (только главная вкладка) --
+          // Слот стоит всегда: появлялся бы он только в сезон — Flutter
+          // пересобрал бы соседей. Сам фон, даты и картинки приходят каталогом.
+          Positioned.fill(
+            child: ListenableBuilder(
+              listenable: CatalogService.instance,
+              builder: (context, _) {
+                final b = _selectedNavIndex == 0 ? CatalogService.instance.activeBackdrop() : null;
+                if (b == null) return const SizedBox.shrink();
+                return SeasonBackdropLayer(
+                  key: _backdropKey,
+                  backdrop: b,
+                  brightness: _t.brightness,
+                  accent: _t.fillColor,
+                );
+              },
+            ),
+          ),
+          // -- Main content --
+          SafeArea(
+            bottom: false,
+            child: ListenableBuilder(
+              listenable: CatalogService.instance,
+              builder: (context, child) => BackdropTapCatcher(
+                onEmptyTap: _selectedNavIndex == 0 &&
+                        CatalogService.instance.activeBackdrop()?.handUrl != null
+                    ? _pressBackdrop
+                    : null,
+                child: child!,
+              ),
+              child: Column(
+              children: [
+                HomeHeader(
+                  missKey: _missKey,
+                  // Сезонный призрак за стеклом приходит по «Скучаю».
+                  onMissYou: () {
+                    _backdropKey.currentState?.summon();
+                    CloudEvents.instance.fire(CloudEvent.missSend);
+                  },
+                  theme: _t,
+                  isPaired: _pairData.isPaired,
+                  myAvatarUrl: widget.userData.avatarUrl,
+                  myDisplayName: widget.userData.displayName,
+                  partners: _pairData.partners,
+                  // Читаем из MoodService — единый источник правды для сегодня.
+                  // Раньше шапка читала из pairData.myMood (group memberMoods),
+                  // календарь — из moodService entries, и они расходились.
+                  myMood: _memberMoodFromEntry(_moodService.myMoodToday, MoodGenders.mine),
+                  moodOf: (uid) =>
+                      _memberMoodFromEntry(_moodService.partnerMoodToday(uid), _partnerGender),
+                  statusBadgeText: _statusBadgeText,
+                  statusBadgeEmoji: _statusBadgeEmoji,
+                  onRelationshipTap: _showRelationshipTypeDialog,
+                  pairId: _pairData.pairId,
+                ),
+                _buildPartnerAilmentBanner(),
+                // «Не потеряйте аккаунт»: тем, кто входит только паролем.
+                if (_selectedNavIndex == 0)
+                  LoginNudge(scheme: ProfileTheme.schemeFor(_t)),
+                // Вкладка меняется проявлением; шапка и нижняя панель стоят.
+                Expanded(
+                  child: TabFade(
+                    index: _selectedNavIndex,
+                    child: _buildBody(),
+                  ),
+                ),
+              ],
+            ),
+            ),
+          ),
+          // -- Active mascot floating overlay --
+          if (_pairData.isPaired)
+            ActiveMascotWidget(
+              mascotService: _mascotService,
+              theme: _t,
+              onOpenGallery: _openMascotGallery,
+              sleepOf: widget.userData.sleepOf,
+              // Облачко живёт настроением партнёра (или своим, если так
+              // выбрали в меню). Партнёр сегодня ещё не отметился — своим:
+              // иначе облачко не отзывалось на смену настроения вовсе.
+              moodOf: (mine) {
+                final myMood = _moodService.myMoodToday?.moodId;
+                if (mine) return myMood;
+                final partnerUid = _pairData.partnerUid;
+                final partnerMood = partnerUid.isEmpty ? null : _moodService.partnerMoodToday(partnerUid)?.moodId;
+                return partnerMood ?? myMood;
+              },
+            ),
+          // -- Theme preview banner (показывается только на главной вкладке) --
+          if (widget.userData.isPreviewingTheme && _selectedNavIndex == 0)
+            _buildThemePreviewBanner(),
+          // -- Bottom Nav (hidden when timer card is expanded) --
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: HomeBottomNav(
+              selectedIndex: _selectedNavIndex,
+              theme: _t,
+              isPaired: _pairData.isPaired,
+              showWidgets: _navTabShown(1),
+              showWatch: _navTabShown(4),
+              order: HomeLayoutService.instance.current.navOrder,
+              onTap: (i) {
+                setState(() => _selectedNavIndex = i);
+                // Возврат на главную — освежаем режим боковой кнопки (мог
+                // смениться в Настройках → Профиль).
+                if (i == 0) unawaited(_loadSideActionPref());
+              },
+              onCreatePin: _pairData.isPaired ? _onSideAction : null,
+              sideIsArrow: _sideActionIsArrow,
+              onSideLongPress: _pairData.isPaired ? _toggleSideAction : null,
+              sideButtonKey: _sideBtnKey,
+              // Значок чата поверх круглой кнопки: до переписки было два шага —
+              // вкладка «Связь», а уже оттуда кнопка чата.
+              onChat: _pairData.isPaired ? _openChat : null,
+              chatSourceKey: _chatSourceKey,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBody() {
+    switch (_selectedNavIndex) {
+      case 0:
+        return _buildHomeTab();
+      case 1:
+        return _buildWidgetsTab();
+      case 2:
+        return ConnectPartnerScreen(
+          pairData: _pairData,
+          theme: _t,
+          userData: widget.userData,
+          timerService: _timerService,
+        );
+      case 3:
+        return _buildProfileTab();
+      case 4:
+        return WatchHomeScreen(pairData: _pairData, theme: _t);
+      default:
+        return _buildHomeTab();
+    }
+  }
+
+  Future<void> _loadSideActionPref() async {
+    final isArrow = await UiPrefs.sideActionIsArrow();
+    if (!mounted) return;
+    setState(() => _sideActionIsArrow = isArrow);
+  }
+
+  /// Локальные флаги слота подсказки плюс разовый показ экрана приглашения.
+  Future<void> _loadPromptState() async {
+    final dismissed = await UiPrefs.onboardingDismissed();
+    final pinned = await UiPrefs.widgetPinned();
+    final nudgeAt = await UiPrefs.quietNudgeAt();
+    if (!mounted) return;
+    setState(() {
+      _onboardingDismissed = dismissed;
+      _widgetPinned = pinned;
+      _quietNudgeAt = nudgeAt;
+    });
+    unawaited(_checkWidgetOnScreen());
+    await _maybeShowInviteScreen();
+    // Флаг `users.plus` серверный, и до ответа сервера человек считается
+    // некупившим. Обе витрины ниже спрашивают его, поэтому сперва поднимаем
+    // последний известный ответ (а без копии ходим на сервер).
+    await PlusService.instance.ensureLoaded();
+    await _maybePitchPlus();
+    await _maybeRemindPlus();
+  }
+
+  /// Плашка Togetherly+ — раз в семь часов тем, кто не купил.
+  ///
+  /// Раньше тут стоял только одноразовый рассказ после обновления, и заказчик
+  /// попросил напоминать регулярно («раз в 6–8 часов, попапом, а не экраном»).
+  /// Поэтому нижний лист, а не экран: человек открывал приложение ради своей
+  /// пары, и полноэкранная витрина на входе читается как «сначала заплати».
+  ///
+  /// Правило показа живёт в [shouldShowPlusPromo] под тестами: купившему не
+  /// показываем никогда, на iPhone Плюса не существует вовсе, а в первые сутки
+  /// после установки молчим.
+  Future<void> _maybeRemindPlus() async {
+    if (!mounted) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final show = shouldShowPlusPromo(
+      gate: PlusService.instance.gate,
+      plusKnown: PlusService.instance.known,
+      nowMs: now,
+      lastShownMs: await UiPrefs.plusPromoAt(),
+      installedMs: await UiPrefs.firstRunAt(now),
+    );
+    if (!show || !mounted) return;
+    await UiPrefs.setPlusPromoShown(now);
+    if (!mounted) return;
+    await showPlusPromoSheet(context);
+  }
+
+  /// Рассказ про Togetherly+ — один раз после обновления.
+  ///
+  /// Не показываем: тем, у кого Плюс уже куплен; там, где его не существует
+  /// (iOS — витрины нет вовсе, экран с ценой попал бы под 3.1.1); и новичку в
+  /// первый запуск — ему сначала нужно позвать партнёра.
+  ///
+  /// Периодических напоминаний нет намеренно: приложение открывают по
+  /// несколько раз в день, и показ «раз в N заходов» превращается в долбёжку.
+  /// Дальше Плюс продаёт себя по месту — там, где человек упирается в замок.
+  Future<void> _maybePitchPlus() async {
+    if (!mounted) return;
+    if (!PlusService.instance.known) return;
+    if (!PlusService.instance.visible || PlusService.instance.active) return;
+    if (await UiPrefs.isFirstLaunchEver()) return;
+
+    String version;
+    try {
+      final info = await PackageInfo.fromPlatform();
+      version = '${info.version}+${info.buildNumber}';
+    } catch (_) {
+      return;
+    }
+    if (await UiPrefs.plusPitchShownFor(version)) return;
+    await UiPrefs.markPlusPitchShown(version);
+    // Экран засчитывается за напоминание: без отметки нижний лист выскакивал
+    // сразу, как только человек закрывал экран, — две витрины подряд на одном
+    // заходе («при каждом заходе окно, чтоб сделали покупку», отзыв 10.09.2026).
+    await UiPrefs.setPlusPromoShown(DateTime.now().millisecondsSinceEpoch);
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            PlusScreen(scheme: ProfileTheme.themeFor(_t).colorScheme),
+        settings: const RouteSettings(name: '/plus_pitch'),
+      ),
+    );
+  }
+
+  /// Экран «позовите свою половинку» — один раз после регистрации и только пока
+  /// пары нет. Дальше приглашение живёт первым шагом списка на главной.
+  Future<void> _maybeShowInviteScreen() async {
+    if (await UiPrefs.inviteScreenShown()) return;
+    await UiPrefs.markInviteScreenShown();
+    if (!mounted || _pairData.isPaired) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => InvitePartnerScreen(pairData: _pairData, theme: _t),
+        settings: const RouteSettings(name: '/invite_partner'),
+      ),
+    );
+  }
+
+  /// Последний визит партнёра: по нему решаем, пора ли подсказать «Скучаю».
+  void _watchPartnerPresence() {
+    _partnerPresenceSub?.cancel();
+    _partnerPresenceSub = null;
+    final uid = _pairData.partnerUid;
+    if (uid.isEmpty) {
+      if (_partnerSeenAtMs != null) setState(() => _partnerSeenAtMs = null);
+      return;
+    }
+    _partnerPresenceSub =
+        PbRealtimeService().watchPresence(uid).listen((rec) {
+      final seen = (rec?.data['seen_at'] as num?)?.toInt();
+      if (!mounted || seen == _partnerSeenAtMs) return;
+      setState(() => _partnerSeenAtMs = seen);
+    }, onError: (Object e) => debugPrint('partner presence failed: $e'));
+  }
+
+  /// Тап по боковой кнопке навбара. Стрелка → открывает Ленту (без авто-создания),
+  /// плюс + сразу открывает создание пина.
+  /// Прямой вход в переписку со значка на круглой кнопке.
+  ///
+  /// Раньше до чата добирались через вкладку «Связь», а уже там жала кнопка —
+  /// два шага ради самого частого действия пары.
+  void _openChat() {
+    // Чат вырастает из своей круглой кнопки и складывается обратно в неё.
+    Navigator.push(
+      context,
+      unfoldFrom<void>(
+        _chatSourceKey.currentState,
+        (_) => ChatScreen(
+          pairData: _pairData,
+          theme: _t,
+          userData: widget.userData,
+          myDisplayName: widget.userData.displayName,
+          timerStart: _timerService.systemTimer?.startDate,
+        ),
+        settings: const RouteSettings(name: '/chat'),
+      ),
+    );
+  }
+
+  void _onSideAction() {
+    if (_sideActionIsArrow) {
+      _openMemoryLane();
+    } else {
+      _openCreatePin();
+    }
+  }
+
+  /// Удержание боковой кнопки — переключить режим стрелка ↔ плюс и запомнить.
+  Future<void> _toggleSideAction() async {
+    final next = !_sideActionIsArrow;
+    setState(() => _sideActionIsArrow = next);
+    HapticFeedback.selectionClick();
+    await UiPrefs.setSideActionIsArrow(next);
+    // Если подсказку ещё не закрывали — удержание её закрывает (юзер всё понял).
+    unawaited(HintQueue.instance.markSeen('side_action'));
+    if (!mounted) return;
+    final s = LocaleService.current;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(milliseconds: 1600),
+        content: Text(next ? s.sideActionOpenFeed : s.sideActionCreatePin),
+      ),
+    );
+  }
+
+  /// Открыть Ленту воспоминаний (общий навбар внутри; вкладки возвращают
+  /// на главную через onNavTab). Без авто-создания пина.
+  void _openMemoryLane({
+    bool openCreateOnStart = false,
+    MemoryType? openCreateType,
+    String? openCreateTaskId,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MemoryLaneScreen(
+          pairData: _pairData,
+          theme: _t,
+          userData: widget.userData,
+          openCreateOnStart: openCreateOnStart,
+          openCreateType: openCreateType,
+          openCreateTaskId: openCreateTaskId,
+          onNavTab: (i) {
+            Navigator.of(context).pop();
+            setState(() => _selectedNavIndex = i);
+          },
+        ),
+        settings: const RouteSettings(name: '/memory_lane'),
+      ),
+    );
+  }
+
+  /// Открыть Memory Lane сразу на создании нового пина (режим «плюс»).
+  void _openCreatePin() => _openMemoryLane(openCreateOnStart: true);
+
+  // ── Одноразовая подсказка про удержание боковой кнопки ──────────────────────
+
+  /// Показывает подсказку один раз: пара есть, мы на главной, кнопка отрисована
+  /// и юзер ещё её не видел. Идемпотентно — безопасно дёргать много раз.
+  /// Ставит в очередь одноразовые подсказки о новых функциях.
+  ///
+  /// Разом их показывать нельзя: три пузыря на экране — это завал, а не
+  /// объяснение. [HintQueue] показывает по одной, следующая начинается после
+  /// того, как закрыли предыдущую. Порядок здесь и есть порядок показа: сперва
+  /// боковая кнопка (она старше всех), потом запись ролика, потом экран
+  /// «Скучаю».
+  Future<void> _queueHints() async {
+    if (!mounted || !_pairData.isPaired || _selectedNavIndex != 0) return;
+    final s = LocaleService.current;
+    // Главная должна быть верхним экраном: поверх неё не открыт экран Плюса,
+    // лист или диалог. Окна считает HintCalm, сам экран — isCurrent.
+    bool onHome() =>
+        mounted &&
+        _pairData.isPaired &&
+        _selectedNavIndex == 0 &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
+    HintCalm.instance.homeShown();
+
+    // Чаще всего в поддержку спрашивают, как поменять дату отношений и как
+    // завести таймер, поэтому Ту начинает с них.
+    HintQueue.instance.enqueue(
+      context: context,
+      key: 'timer_date',
+      targetKey: _timerEditKey,
+      text: s.timerDateHint,
+      gotIt: s.gotIt,
+      icon: Icons.edit_rounded,
+      theme: _t,
+      side: HintSide.below,
+      ready: onHome,
+    );
+    HintQueue.instance.enqueue(
+      context: context,
+      key: 'timer_add',
+      targetKey: _timerAddKey,
+      text: s.timerAddHint,
+      gotIt: s.gotIt,
+      icon: Icons.add_rounded,
+      theme: _t,
+      side: HintSide.below,
+      ready: onHome,
+    );
+    HintQueue.instance.enqueue(
+      context: context,
+      key: 'side_action',
+      targetKey: _sideBtnKey,
+      text: s.sideActionHint,
+      gotIt: s.gotIt,
+      icon: Icons.touch_app_rounded,
+      theme: _t,
+      ready: onHome,
+    );
+    HintQueue.instance.enqueue(
+      context: context,
+      key: 'snap_hold',
+      targetKey: _postBtnKey,
+      text: s.snapHoldHint,
+      gotIt: s.gotIt,
+      icon: Icons.videocam_rounded,
+      theme: _t,
+      ready: onHome,
+    );
+    HintQueue.instance.enqueue(
+      context: context,
+      key: 'miss_screen',
+      targetKey: _missKey,
+      text: s.missScreenHint,
+      gotIt: s.gotIt,
+      icon: Icons.favorite_rounded,
+      theme: _t,
+      side: HintSide.below,
+      ready: onHome,
+    );
+    HintQueue.instance.enqueue(
+      context: context,
+      key: 'mood_calendar',
+      targetKey: _calendarBtnKey,
+      text: s.calendarHint,
+      gotIt: s.gotIt,
+      icon: Icons.calendar_month_rounded,
+      theme: _t,
+      ready: onHome,
+    );
+    // Про гардероб говорит сам Ту, поэтому подсказка только при Ту на главной.
+    HintQueue.instance.enqueue(
+      context: context,
+      key: 'mascot_tu',
+      targetKey: _mascotKey,
+      text: s.mascotHint,
+      gotIt: s.gotIt,
+      icon: Icons.checkroom_rounded,
+      theme: _t,
+      ready: () => onHome() && _mascotService.activeMascot?.id == kCloudMascotId,
+    );
+  }
+
+
+
+
+
+
+  // =============================================
+  // HOME TAB
+  // =============================================
+  Widget _buildHomeTab() {
+    // ── Проверяем праздники сегодня ──
+    final conn = _pairData.manager.activeConnection;
+    final anniversaryDate = conn?.anniversaryDate;
+    final myBirthDate = widget.userData.birthDate;
+    final isAnniversaryToday =
+        anniversaryDate != null &&
+        CelebrationNotificationService.isToday(anniversaryDate);
+    final isBirthdayToday =
+        myBirthDate != null &&
+        CelebrationNotificationService.isToday(myBirthDate);
+
+    // Список, а не SingleChildScrollView: блоки ниже ряда действий лежат в
+    // SliverReorderableList, и при перетаскивании блока к краю экрана
+    // прокручивается вся главная, а не невидимый внутренний список.
+    return CustomScrollView(
+      physics: const BouncingScrollPhysics(),
+      slivers: [
+        SliverToBoxAdapter(
+          child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Баннер праздника (если сегодня годовщина или ДР) ──
+          if (isAnniversaryToday)
+            CelebrationBanner(
+              message: LocaleService.current.celebrationBannerAnniversary,
+              emoji: '🎉',
+              color: const Color(0xFFE91E8C),
+            ),
+          if (isBirthdayToday && !isAnniversaryToday)
+            CelebrationBanner(
+              message: LocaleService.current.celebrationBannerBirthday,
+              emoji: '🎂',
+              color: const Color(0xFFFF6B35),
+            ),
+          // Баннер-приглашение убран вместе с сеансами на Firebase RTDB:
+          // комната у пары одна, звать в неё больше не нужно — вкладка
+          // «Смотрим» открывает её обоим.
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Column(
+              children: [
+                const SizedBox(height: 16),
+                AnimatedSlideIn(
+                  delay: const Duration(milliseconds: 0),
+                  child: MiniMoodCalendar(
+                    moodService: _moodService,
+                    theme: _t,
+                    onDayTap: _pairData.isPaired
+                        ? _showMoodPickerForDate
+                        : null,
+                    onTodayButtonVisibilityChanged: (v) =>
+                        setState(() => _showTodayButton = v),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                // Shift dial UP closer to calendar (disabled when Today button is visible)
+                AnimatedContainer(
+                  duration: Motion.nudge,
+                  curve: Motion.standard,
+                  transform: Matrix4.translationValues(
+                    0,
+                    _showTodayButton ? 0 : -20,
+                    0,
+                  ),
+                  child: AnimatedSlideIn(
+                    delay: const Duration(milliseconds: 80),
+                    child: ExpandableTimerCard(
+                      theme: _t,
+                      timerService: _timerService,
+                      myAvatarUrl: widget.userData.avatarUrl,
+                      partnerAvatarUrl: _pairData.partnerAvatarUrl,
+                      isPaired: _pairData.isPaired,
+                      onPetalTap: _pairData.isPaired
+                          ? (label) => _openMemoryLaneForPetal(label)
+                          : null,
+                      editKey: _timerEditKey,
+                      addKey: _timerAddKey,
+                    ),
+                  ),
+                ),
+                // Restore buttons offset to -15 for tighter layout
+                AnimatedContainer(
+                  duration: Motion.nudge,
+                  curve: Motion.standard,
+                  transform: Matrix4.translationValues(
+                    0,
+                    _showTodayButton ? 0 : -15,
+                    0,
+                  ),
+                  // Ряд быстрых действий — только в паре. Все четыре пишут в
+                  // коллекции с group_id, и без партнёра не работают ни одна:
+                  // показывать их выключенными значит держать на главной
+                  // половину неработающего экрана.
+                  child: AnimatedSlideIn(
+                    delay: const Duration(milliseconds: 120),
+                    child: _pairData.isPaired
+                        ? HomeActionButtons(
+                            postButtonKey: _postBtnKey,
+                            calendarButtonKey: _calendarBtnKey,
+                            theme: _t,
+                            isPaired: true,
+                            // Единый источник правды — календарь (myMoodToday),
+                            // как у шапки. Раньше кнопка читала pairData.myMood
+                            // (group memberMoods) и расходилась с мини-календарём.
+                            myMoodImagePath:
+                                _moodService.myMoodToday?.imagePath ?? '',
+                            onDraw: _openDraw,
+                            onMood: _showMoodPicker,
+                            onCalendar: _openMoodCalendar,
+                            onPost: _postPhoto,
+                            onPostHold: _postSnap,
+                            onWallet: _openWallet,
+                            // С Плюсом лишние кнопки ряда можно спрятать в
+                            // настройках, раздел «Главный экран».
+                            hidden: HomeLayoutService.instance.current
+                                .hiddenActions,
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+          ),
+        ),
+        ..._buildHomeBlocks(),
+        SliverToBoxAdapter(
+          child: SizedBox(
+            height: 40 + MediaQuery.of(context).padding.bottom + 100,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Блоки главной ниже ряда действий — в порядке раскладки
+  /// ([HomeLayoutService]). Без Togetherly+ раскладка всегда по умолчанию:
+  /// сундук, маскоты, карта, задания, желания, лента.
+  ///
+  /// Долгое нажатие на блок открывает его меню: выше, ниже, скрыть. Вложенные
+  /// жесты (долгое нажатие на воспоминание в ленте) выигрывают у внешнего,
+  /// поэтому меню блока открывается с пустого места блока.
+  List<Widget> _buildHomeBlocks() {
+    final paired = _pairData.isPaired;
+    final layout = HomeLayoutService.instance.current;
+    const side = EdgeInsets.symmetric(horizontal: 24);
+    // Слот подсказки один на оба состояния: без пары тут стоит
+    // список первых действий (раньше — карточка «подключите
+    // партнёра»), с парой — либо строка прогресса, либо напоминание
+    // о затихшем партнёре. Пусто у тех, кто всё прошёл. Стоит под сундуком,
+    // а если сундук спрятан — первым.
+    final prompt = _homePrompt();
+    final giftWaits = paired &&
+        _giftsEnabled &&
+        shownIncomingGifts(_incomingGifts).isNotEmpty;
+    Widget promptBlock() => Padding(
+          padding: side.copyWith(top: 8),
+          child: AnimatedSlideIn(
+            delay: const Duration(milliseconds: 200),
+            child: prompt!,
+          ),
+        );
+
+    Widget? block(HomeBlock b) {
+      switch (b) {
+        case HomeBlock.chest:
+          // Сундук сразу под таймером (макет «Сундук недели»), стоит
+          // постоянно. Только в паре: подарок из сундука ложится на
+          // полку пары, а без группы серверу некуда его положить.
+          // Отступ сверху у блока свой: выключенный с сервера
+          // (`app_config.chest_enabled`) он не оставляет пустой полосы.
+          if (!paired) return null;
+          return Padding(
+            padding: side,
+            child: AnimatedSlideIn(
+              delay: const Duration(milliseconds: 140),
+              child: ChestHomeCard(
+                theme: _t,
+                groupId: _pairData.pairId,
+                partnerName: _pairData.partnerDisplayName,
+                onCoins: widget.userData.applyServerCoins,
+                userData: widget.userData,
+              ),
+            ),
+          );
+        case HomeBlock.mascot:
+          if (!paired) return null;
+          return Padding(
+            padding: side,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const SizedBox(height: 8),
+                AnimatedSlideIn(
+                  delay: const Duration(milliseconds: 160),
+                  child: _buildMascotRow(),
+                ),
+                // Реклама сразу под маскотом — единственное место на
+                // главной, где она никому не мешает: до сгиба ничего не
+                // трогает, а в зону видимости попадает при первом же
+                // движении пальца. Выше по экрану её ставить нельзя, там
+                // таймер и настроения, ради которых приложение открывают.
+                // Раскладку меняют только с Плюсом, а с ним рекламы нет,
+                // так что у тех, кто её видит, место прежнее.
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: AdBanner(
+                    key: const ValueKey('home_ad'),
+                    framed: true,
+                    label: LocaleService.current.adLabel,
+                    slot: 'home',
+                  ),
+                ),
+              ],
+            ),
+          );
+        case HomeBlock.map:
+          // Карта «Где мы»: live-геопозиция обоих партнёров.
+          if (!paired) return null;
+          return Padding(
+            padding: side,
+            child: AnimatedSlideIn(
+              delay: const Duration(milliseconds: 240),
+              child: LiveMapCard(
+                pairId: _pairData.pairId,
+                partnerUid: _pairData.partnerUid,
+                partnerName: _pairData.partnerDisplayName,
+                partnerAvatarUrl: _pairData.partnerAvatarUrl,
+                theme: _t,
+              ),
+            ),
+          );
+        case HomeBlock.tasks:
+          if (!paired) return null;
+          return Padding(
+            padding: side,
+            child: AnimatedSlideIn(
+              delay: const Duration(milliseconds: 260),
+              child: DailyTasksCard(
+                groupId: _pairData.pairId,
+                partnerName: _pairData.partnerDisplayName,
+                // Задание знает свой тип пина, поэтому лист выбора
+                // пропускаем и открываем сразу нужную форму.
+                onOpenTask: (task) => _openMemoryLane(
+                  openCreateType: task.type,
+                  openCreateTaskId: task.id,
+                ),
+              ),
+            ),
+          );
+        case HomeBlock.wishes:
+          // «Хочу с тобой»: общий список желаний пары — раздел, а не
+          // событие дня, и наверх лезть ему незачем.
+          if (!paired || !_wishesEnabled) return null;
+          return Padding(
+            padding: side,
+            child: AnimatedSlideIn(
+              delay: const Duration(milliseconds: 280),
+              child: WishesCard(
+                theme: _t,
+                groupId: _pairData.pairId,
+                myUid: PocketBaseService().userId ?? '',
+                myName: widget.userData.displayName,
+                partnerUid: _pairData.partnerUid,
+                partnerName: _pairData.partnerDisplayName,
+                myAvatarUrl: widget.userData.avatarUrl,
+                partnerAvatarUrl: _pairData.partnerAvatarUrl,
+              ),
+            ),
+          );
+        case HomeBlock.lane:
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: 40),
+              AnimatedSlideIn(
+                delay: const Duration(milliseconds: 240),
+                // В паре — встроенная НАСТОЯЩАЯ Лента (те же карточки
+                // _memoryTile, первые 3). Без пары — лёгкая заглушка
+                // «подключись».
+                child: paired
+                    ? MemoryLaneScreen(
+                        pairData: _pairData,
+                        theme: _t,
+                        userData: widget.userData,
+                        embedded: true,
+                        previewLimit: 3,
+                        onNavTab: (i) => setState(() => _selectedNavIndex = i),
+                      )
+                    : MemoryLanePreview(
+                        isPaired: false,
+                        memories: const [],
+                        pairData: _pairData,
+                        theme: _t,
+                        userData: widget.userData,
+                      ),
+              ),
+            ],
+          );
+      }
+    }
+
+    // Рассвет от «Солнца» и пришедший подарок — события сегодняшнего дня, а
+    // не разделы: не прячутся и стоят под сундуком, а без сундука — первыми.
+    // Над лентой, в самом низу главной, пришедший подарок не замечали (TOG-10).
+    // Достижения и магазин подарков уехали в профиль, в блок «Наша пара».
+    List<Widget> events() => [
+          if (_sunriseOn)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: AnimatedSlideIn(
+                delay: const Duration(milliseconds: 40),
+                child: _sunriseBanner(),
+              ),
+            ),
+          if (giftWaits)
+            Padding(
+              padding: EdgeInsets.only(top: _sunriseOn ? 0 : 12),
+              child: AnimatedSlideIn(
+                delay: const Duration(milliseconds: 160),
+                child: _incomingGiftEntry(),
+              ),
+            ),
+        ];
+    // Блоки, которые сейчас на экране, и их виджеты. События дня и подсказка
+    // едут вместе с сундуком: перетаскивают блок, а не то, что к нему
+    // прицеплено.
+    final shown = <HomeBlock>[];
+    final items = <Widget>[];
+    for (final b in layout.visibleBlocks) {
+      final w = block(b);
+      if (w == null) continue;
+      shown.add(b);
+      items.add(Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          w,
+          if (b == HomeBlock.chest) ...events(),
+          if (b == HomeBlock.chest && prompt != null) promptBlock(),
+        ],
+      ));
+    }
+    final plus = PlusService.instance.active;
+    final svc = HomeLayoutService.instance;
+
+    return [
+      if (!shown.contains(HomeBlock.chest))
+        SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [...events(), if (prompt != null) promptBlock()],
+          ),
+        ),
+      // Долгое нажатие на блок поднимает его, дальше он едет за пальцем, а
+      // главная прокручивается сама у края. Только с Плюсом; без него долгое
+      // нажатие рассказывает, что так можно. Вложенные жесты (долгое нажатие
+      // на воспоминание в ленте) выигрывают, поэтому блок берут за пустое
+      // место. Кнопок «Выше/Ниже» нет — владелец 02.10.2026: «нормальное
+      // перетаскивание, не кнопками».
+      SliverReorderableList(
+        itemCount: items.length,
+        onReorderStart: (_) => HapticFeedback.mediumImpact(),
+        onReorder: (from, to) =>
+            svc.update(svc.saved.dragged(shown, from, to)),
+        proxyDecorator: (child, _, anim) => AnimatedBuilder(
+          animation: anim,
+          builder: (context, child) => Transform.scale(
+            scale: 1 + 0.03 * Curves.easeOut.transform(anim.value),
+            child: child,
+          ),
+          child: Material(color: Colors.transparent, child: child),
+        ),
+        itemBuilder: (context, i) {
+          final b = shown[i];
+          return plus
+              ? ReorderableDelayedDragStartListener(
+                  key: ValueKey(b),
+                  index: i,
+                  child: items[i],
+                )
+              : GestureDetector(
+                  key: ValueKey(b),
+                  behavior: HitTestBehavior.translucent,
+                  onLongPress: homeLayoutAvailable
+                      ? () => showHomeLayoutPlusPitch(context)
+                      : null,
+                  child: items[i],
+                );
+        },
+      ),
+    ];
+  }
+
+  Widget _buildMascotRow() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: mascotHiddenNotifier,
+      builder: (context, isHidden, _) {
+        return ListenableBuilder(
+          listenable: _mascotService,
+          builder: (context, _) {
+            return _MascotButton(
+              key: _mascotKey,
+              mascot: _mascotService.activeMascot,
+              service: _mascotService,
+              theme: _t,
+              streak: _mascotService.state.activeStreak,
+              restoreOffer: _mascotService.restoreOffer,
+              onRestore: _openStreakRestore,
+              isHidden: isHidden,
+              onTap: _openMascotGallery,
+              sleepOf: widget.userData.sleepOf,
+              onShowOverlay: showMascotOverlay,
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // =============================================
+  // WIDGETS TAB
+  // =============================================
+  Widget _buildWidgetsTab() {
+    // Флаг открытия настроек парного виджета одноразовый — гасим сразу,
+    // чтобы при обычном переходе на вкладку карточка не раскрывалась снова.
+    final openPair = _openPairEditorOnWidgetsTab;
+    _openPairEditorOnWidgetsTab = false;
+    return WidgetScreen(
+      userData: widget.userData,
+      pairData: _pairData,
+      widgetService: _widgetService,
+      moodService: _moodService,
+      timerService: _timerService,
+      mascotService: _mascotService,
+      theme: _t,
+      openPairEditorOnStart: openPair,
+    );
+  }
+
+  // =============================================
+  // PROFILE TAB
+  // =============================================
+  Widget _buildProfileTab() {
+    return ProfileScreen(
+      userData: widget.userData,
+      pairData: _pairData,
+      timerService: _timerService,
+      widgetService: _widgetService,
+      giftsEnabled: _giftsEnabled,
+      onSwitchToHome: () => setState(() => _selectedNavIndex = 0),
+      onSwitchTab: (i) {
+        setState(() => _selectedNavIndex = i);
+        if (i == 0) unawaited(_loadSideActionPref());
+      },
+    );
+  }
+
+  // =============================================
+  // THEME PREVIEW BANNER
+  // =============================================
+  Widget _buildThemePreviewBanner() {
+    final previewId = widget.userData.previewThemeId!;
+    final t = AppThemes.byIndex(previewId);
+    final canAfford = widget.userData.coins >= t.price;
+    final bottomInset = MediaQuery.of(context).padding.bottom;
+    // В паре над панелью стоит кнопка чата: плашка встаёт над ней.
+    final above = _pairData.isPaired
+        ? kHomeChatButtonTop + 8
+        : kHomeBottomNavHeight;
+
+    return Positioned(
+      bottom: above + bottomInset,
+      left: 16,
+      right: 16,
+      child: Material(
+        color: Colors.transparent,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
+          decoration: BoxDecoration(
+            color: _t.cardSurface,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: t.primary.withOpacity(0.15), width: 1),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: t.heroGradient,
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ThemePreviewCountdown(
+                      label: LocaleService.current.previewLabel,
+                      endsAt: widget.userData.previewEndsAt,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: _t.textMuted,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    Text(
+                      paletteDisplayName(previewId),
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: _t.textPrimary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              // Кнопка "Купить"
+              GestureDetector(
+                onTap: canAfford ? () => _buyPreviewTheme(previewId, t) : null,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    gradient: canAfford
+                        ? LinearGradient(
+                            colors: t.heroGradient,
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          )
+                        : null,
+                    color: canAfford ? null : _t.surfaceMuted,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CoinImage(side: 16),
+                      const SizedBox(width: 4),
+                      Text(
+                        '${t.price}',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          color: canAfford
+                              ? Colors.white
+                              : _t.textMuted,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              // Кнопка "Закрыть"
+              GestureDetector(
+                onTap: () {
+                  widget.userData.setPreviewTheme(null);
+                  setState(() {});
+                },
+                child: Container(
+                  width: 32,
+                  height: 32,
+                  decoration: BoxDecoration(
+                    color: _t.surfaceMuted,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    Icons.close_rounded,
+                    size: 18,
+                    color: _t.textMuted,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _buyPreviewTheme(int themeId, AppTheme t) async {
+    final ok = await widget.userData.purchaseTheme(themeId);
+    if (!ok) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(
+          SnackBar(content: Text(LocaleService.current.notEnoughCoins)),
+        );
+      }
+      return;
+    }
+    await widget.userData.setThemeId(themeId);
+    widget.userData.setPreviewTheme(null);
+    if (mounted) setState(() {});
+  }
+
+  // =============================================
+  // RELATIONSHIP TYPE DIALOG
+  // =============================================
+  void _showRelationshipTypeDialog() {
+    showRelationshipTypeDialog(
+      context: context,
+      pairData: _pairData,
+      primary: primary,
+      onStateChanged: () => setState(() {}),
+    );
+  }
+
+  // =============================================
+  // MOOD PICKER
+  // =============================================
+
+  void _openDraw() {
+    final s = LocaleService.current;
+    final t = _t;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: t.cardSurface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: t.divider,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                s.drawingMode,
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.3,
+                  color: t.textPrimary,
+                ),
+              ),
+              const SizedBox(height: 18),
+              DrawModeOption(
+                icon: Icons.add_circle_outline_rounded,
+                color: t.primary,
+                title: s.newCanvas,
+                subtitle: s.startWithBlankCanvas,
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _openNewCanvas();
+                },
+              ),
+              const SizedBox(height: 10),
+              DrawModeOption(
+                icon: Icons.collections_rounded,
+                color: const Color(0xFF8B5CF6),
+                title: s.myDrawings,
+                subtitle: s.openSavedDrawing,
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _openDrawGallery();
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openMemoryLaneForPetal(String petalLabel) {
+    if (!_pairData.isPaired) return;
+    final mode = petalLabel == LocaleService.current.daysShortLabel
+        ? MemoryFilterMode.day
+        : MemoryFilterMode.month;
+    // Обычный маршрут: лента вырастает из нажатого лепестка, как и все
+    // экраны (своего сдвига снизу здесь больше нет).
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => MemoryLaneScreen(
+          pairData: _pairData,
+          theme: _t,
+          filterMode: mode,
+          userData: widget.userData,
+        ),
+      ),
+    );
+  }
+
+  /// «Новый холст» с главной: сперва спрашиваем вид.
+  ///
+  /// Раньше отсюда молча заводился пустой лист, а выбрать раскраску можно было
+  /// только в галерее рисунков, через кнопку создания там. Люди её не находили
+  /// и писали, что раскраски в приложении нет — при том что она на месте и
+  /// бесплатна. Теперь путь один на всё приложение: [CanvasCreateFlow].
+  Future<void> _openNewCanvas() async {
+    await CanvasCreateFlow.start(
+      context,
+      userData: widget.userData,
+      pairData: _pairData,
+      theme: _t,
+      storage: _storage,
+    );
+  }
+
+  void _openDrawGallery() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DrawGalleryScreen(
+          userData: widget.userData,
+          pairData: _pairData,
+          theme: _t,
+        ),
+        settings: const RouteSettings(name: '/draw_gallery'),
+      ),
+    );
+  }
+
+  /// Кнопка Togetherly Wallet: пока приложение не вышло — стена ожидания,
+  /// после выхода — сам Wallet (или его страница в магазине). Флаг выхода
+  /// приходит с сервера, см. `WalletTeaser`.
+  Future<void> _openWallet() async {
+    if (WalletTeaser.released) {
+      if (await WalletTeaser.open()) return;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(trKey('walletOpenFailed'))),
+      );
+      return;
+    }
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => WalletWaitScreen(theme: _t),
+        settings: const RouteSettings(name: '/wallet_wait'),
+      ),
+    );
+  }
+
+  void _openMoodCalendar() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MoodCalendarScreen(
+          pairData: _pairData,
+          moodService: _moodService,
+          widgetService: _widgetService,
+          theme: _t,
+          userData: widget.userData,
+        ),
+        settings: const RouteSettings(name: '/mood_calendar'),
+      ),
+    );
+  }
+
+  /// Открыть выбор настроения для конкретной даты.
+  /// Ключи, купленные парой, кладём в общий снимок каталога: выбор настроения
+  /// открывается и из календаря, и из листа дня, и с экрана виджетов, где
+  /// состояния группы нет вовсе.
+  void _publishPairOwned() =>
+      CatalogService.instance.updatePairOwned(_mascotService.state.ownedFeatures);
+
+  void _showMoodPickerForDate(DateTime date) {
+    _publishPairOwned();
+    showMoodPickerForDate(
+      context: context,
+      date: date,
+      pairData: _pairData,
+      moodService: _moodService,
+      widgetService: _widgetService,
+      primary: primary,
+      navActiveIcon: _t.navActiveIcon, // добавлено
+      user: widget.userData,
+      pairOwned: _mascotService.state.ownedFeatures,
+    );
+  }
+
+  /// Баннер под шапкой: показывается, когда партнёру нездоровится
+  /// (он выбрал «болячку» в пикере «Самочувствие»).
+  Widget _buildPartnerAilmentBanner() {
+    if (!_pairData.isPaired) return const SizedBox.shrink();
+    for (final p in _pairData.partners) {
+      final a = _pairData.ailmentOf(p.uid);
+      if (a.isNotEmpty) {
+        final name = p.name.isNotEmpty ? p.name : LocaleService.current.partner;
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(24, 0, 24, 6),
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: _t.primary.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: _t.primary.withValues(alpha: 0.18)),
+            ),
+            child: Row(
+              children: [
+                AilmentIcon(id: a.id, emoji: a.emoji, size: 28),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    LocaleService.current.partnerAilmentBanner(name, a.label),
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: _t.primary,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
+    }
+    return const SizedBox.shrink();
+  }
+
+  void _showMoodPicker() {
+    _publishPairOwned();
+    showMoodPicker(
+      context: context,
+      pairData: _pairData,
+      moodService: _moodService,
+      widgetService: _widgetService,
+      primary: primary,
+      navActiveIcon: _t.navActiveIcon, // добавлено
+      user: widget.userData,
+      pairOwned: _mascotService.state.ownedFeatures,
+    );
+  }
+
+  /// Локальное включение раздела для проверки на своём устройстве:
+  /// `flutter build apk --dart-define=GIFTS_FORCE=true`. Так подарки можно
+  /// погонять вживую, не открывая их всем парам сразу.
+  static const bool _giftsForced = bool.fromEnvironment('GIFTS_FORCE');
+
+  /// Подписка на подарки пары. Раньше входящие грузились только при запуске
+  /// экрана, поэтому подарок доезжал пушем, а в приложении появлялся лишь
+  /// после перезапуска — отсюда и ощущение, что «получение не работает».
+  Future<void> _listenGifts() async {
+    // Метод переустанавливаемый: сперва снимаем прежнюю подписку, чтобы при
+    // смене пары не копить дубли и не держать канал ушедшей группы.
+    final old = _giftsUnsub;
+    _giftsUnsub = null;
+    if (old != null) unawaited(old());
+
+    if (!_pairData.isPaired) return;
+    final channel = 'pair:${_pairData.pairId}';
+    final unsub = await CentrifugoService.instance.subscribeDelta(
+      channel,
+      'gifts',
+      (_) => unawaited(_onGiftEvent()),
+    );
+    // Пока ждали подписку, экран мог уйти — не держим висячий канал.
+    if (!mounted) {
+      unawaited(unsub());
+      return;
+    }
+    _giftsUnsub = unsub;
+  }
+
+  void _onCatalogForGifts() {
+    if (mounted && _incomingGifts.isNotEmpty) setState(() {});
+  }
+
+  /// Пришёл новый подарок — сразу показываем его, с анимацией открытия.
+  Future<void> _onGiftEvent() async {
+    final before = shownIncomingGifts(_incomingGifts).length;
+    await _loadIncomingGifts();
+    final shown = shownIncomingGifts(_incomingGifts);
+    if (!mounted || shown.length <= before) return;
+    // Подарок показываем на любой вкладке — это событие, его ждут.
+    await _openIncomingGift(shown.first);
+  }
+
+  Future<void> _loadIncomingGifts() async {
+    if (!_pairData.isPaired) return;
+    final list = await PbDataService().fetchIncomingGifts(
+      groupId: _pairData.pairId,
+      uid: PocketBaseService().userId ?? '',
+    );
+    if (mounted) setState(() => _incomingGifts = list);
+  }
+
+  /// Открывает подарок: свечу задувают, коробку открывают, зайчика ловят.
+  Future<void> _openIncomingGift(Map<String, dynamic> raw) async {
+    final frameKey =
+        FrameGiftService.frameKeyOf((raw['gift_key'] ?? '').toString());
+    if (frameKey != null) {
+      await _openIncomingFrame((raw['id'] ?? '').toString(), frameKey);
+      return;
+    }
+    final gift = GiftCatalog.byKey((raw['gift_key'] ?? '').toString());
+    if (gift == null) return;
+    final accepted = await GiftReceiveSheet.show(
+      context,
+      theme: _t,
+      giftId: (raw['id'] ?? '').toString(),
+      gift: gift,
+      senderName: _pairData.partnerDisplayName,
+      note: (raw['note'] ?? '').toString(),
+      photo: (raw['photo'] ?? '').toString(),
+      sound: SoundClip.fromGiftRecord(raw),
+    );
+    if (accepted == true) {
+      await _loadIncomingGifts();
+      _openAfterAccept(gift);
+    } else if (accepted == false) {
+      await _loadIncomingGifts(); // отказ тоже убирает подарок из списка
+    }
+  }
+
+  /// Партнёр отдал свою рамку. Она уже лежит в покупках (сервер переложил её
+  /// при отправке), лист только показывает её на своей аватарке и предлагает
+  /// надеть. Любой ответ закрывает подарок откликом.
+  Future<void> _openIncomingFrame(String giftId, String frameKey) async {
+    final ud = widget.userData;
+    unawaited(ud.refreshCoinsFromServer());
+    final cs = ProfileTheme.themeFor(_t).colorScheme;
+    final frame = AvatarFrame.byKey(frameKey);
+    final frameName = frame?.name ?? frameKey;
+    final sender = _pairData.partnerDisplayName.trim();
+    const side = 168.0;
+    final wear = await showAppSheet<bool>(
+      context,
+      background: cs.surfaceContainerHigh,
+      builder: (ctx) => Theme(
+        data: ProfileTheme.data(cs),
+        child: SheetScaffold(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Center(
+                  child: SizedBox.square(
+                    dimension: side,
+                    child: Center(
+                      child: AvatarWidget(
+                        uid: ud.uid.isNotEmpty
+                            ? ud.uid
+                            : (PocketBaseService().userId ?? ''),
+                        liveUrl: ud.avatarUrl,
+                        name: ud.displayName,
+                        size: side / AvatarFrame.scale,
+                        primary: cs.primary,
+                        frame: frameKey,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  trKey('frameReceivedTitle').replaceAll('{frame}', frameName),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontFamily: ProfileTheme.displayFont,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: cs.onSurface,
+                  ),
+                ),
+                if (sender.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    trKey('frameReceivedFrom').replaceAll('{name}', sender),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontFamily: 'Onest',
+                      fontSize: 14.5,
+                      height: 1.4,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 18),
+                FilledButton(
+                  onPressed: () => Navigator.of(ctx).pop(true),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(52),
+                    shape: const StadiumBorder(),
+                  ),
+                  child: Text(trKey('shopWear')),
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(false),
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                  ),
+                  child: Text(trKey('frameReceivedLater')),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    if (!mounted) return;
+    // Закрыл лист смахиванием — подарок остаётся на главной, как обычный.
+    if (wear == null) return;
+    await GiftsService.instance.react(giftId);
+    if (wear) {
+      await ud.refreshCoinsFromServer();
+      await ud.setFrame(frameKey);
+    }
+    await _loadIncomingGifts();
+  }
+
+  /// Принятое приглашение ведёт туда, куда звало: в чат, на карту, к таймеру.
+  void _openAfterAccept(Gift gift) {
+    switch (gift.opens) {
+      case GiftOpens.addPhoto:
+        // Кадр: сразу форма добавления — просили фото прямо сейчас.
+        _openMemoryLane(openCreateOnStart: true);
+      case GiftOpens.chat:
+      case GiftOpens.map:
+      case GiftOpens.watchTogether:
+      case GiftOpens.callTimer:
+      case GiftOpens.calendar:
+      case GiftOpens.none:
+        break; // остальное открывается со своих кнопок на главном
+    }
+  }
+
+  Future<void> _loadGiftsFlag() async {
+    if (_giftsForced) {
+      if (mounted && !_giftsEnabled) setState(() => _giftsEnabled = true);
+      return;
+    }
+    final on = await PbDataService().fetchGiftsEnabled();
+    if (mounted && on != _giftsEnabled) setState(() => _giftsEnabled = on);
+  }
+
+  Future<void> _loadWishesFlag() async {
+    final on = await PbDataService().fetchWishesEnabled();
+    if (mounted && on != _wishesEnabled) setState(() => _wishesEnabled = on);
+  }
+
+  /// Рассвет от подарка «Солнце»: тёплая полоса поверх главного экрана.
+  Widget _sunriseBanner() {
+    final sun = GiftCatalog.byKey('sun');
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 0, 24, 10),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(20),
+          gradient: const LinearGradient(
+            colors: [Color(0xFFFDE9C8), Color(0xFFFBD9E2)],
+          ),
+        ),
+        child: Row(
+          children: [
+            if (sun != null) GiftImage(sun.key, side: 40),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                LocaleService.current.giftSunriseGreeting(
+                    _pairData.partnerDisplayName),
+                style: const TextStyle(
+                  fontSize: 14.5,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFF5C4433),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Подарок ждёт действия — карточка заметная, с самим значком.
+  Widget _incomingGiftEntry() {
+    final shown = shownIncomingGifts(_incomingGifts);
+    if (shown.isEmpty) return const SizedBox.shrink();
+    final raw = shown.first;
+    final giftKey = (raw['gift_key'] ?? '').toString();
+    final frameKey = FrameGiftService.frameKeyOf(giftKey);
+    final gift = GiftCatalog.byKey(giftKey);
+    final s = LocaleService.current;
+    final cs = ProfileTheme.themeFor(_t).colorScheme;
+    final ud = widget.userData;
+    final Widget art = frameKey != null
+        ? SizedBox.square(
+            dimension: 46,
+            child: Center(
+              child: AvatarWidget(
+                uid: ud.uid.isNotEmpty
+                    ? ud.uid
+                    : (PocketBaseService().userId ?? ''),
+                liveUrl: ud.avatarUrl,
+                name: ud.displayName,
+                size: 46 / AvatarFrame.scale,
+                primary: cs.primary,
+                frame: frameKey,
+              ),
+            ),
+          )
+        : GiftImage(gift!.key, side: 46);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+      child: GestureDetector(
+        onTap: () => _openIncomingGift(raw),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            color: cs.primaryContainer,
+            borderRadius: BorderRadius.circular(24),
+          ),
+          child: Row(
+            children: [
+              art,
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                        frameKey != null
+                            ? trKey('frameIncomingTitle')
+                            : s.giftIncomingTitle,
+                        style: TextStyle(
+                            fontFamily: ProfileTheme.displayFont,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w800,
+                            color: cs.onPrimaryContainer)),
+                    const SizedBox(height: 2),
+                    Text(s.giftIncomingCount(shown.length),
+                        style: TextStyle(
+                            fontSize: 12.5,
+                            color:
+                                cs.onPrimaryContainer.withValues(alpha: 0.75))),
+                  ],
+                ),
+              ),
+              Icon(Icons.chevron_right_rounded,
+                  color: cs.onPrimaryContainer, size: 22),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // =============================================
+  // POST PHOTO (camera > upload > Memory Lane)
+  // =============================================
+  /// Снап: удержание кнопки фото пишет ролик и отправляет его живым фото в
+  /// парный виджет — партнёр увидит его на своём рабочем столе.
+  ///
+  /// Ролик не хранится: сервер режет его на раскадровку 6×3 и удаляет исходник
+  /// (`tools/widget_anim.py`), поэтому место занимает одна картинка на сотню
+  /// килобайт, сколько бы ни весила съёмка.
+  Future<void> _postSnap() async {
+    // Жест нашли сами — подсказка про него больше не нужна.
+    unawaited(HintQueue.instance.markSeen('snap_hold'));
+    if (!_pairData.isPaired || _pairData.pairId.isEmpty) return;
+
+    final path = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => SnapCaptureScreen(theme: _t)),
+    );
+    if (path == null || !mounted) return;
+
+    final s = LocaleService.current;
+    final messenger = ScaffoldMessenger.of(context);
+    void say(String text) => messenger.showSnackBar(
+          SnackBar(content: Text(text), behavior: SnackBarBehavior.floating),
+        );
+
+    // Тот же лист, что у фото: куда отправить. Третьего тумблера тут нет —
+    // виджет «Фото партнёра» показывает снимок, видео ему отдать нечем.
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final result = await _showCaptionDialog(
+      initToMemories: _widgetService.autoSendPhotoToMemory,
+      initToPairWidget: prefs.getBool('widget_sendPhotoToPairWidget') ?? true,
+      initToPartnerWidget: false,
+      partnerName: _pairData.partnerName,
+      showPartnerWidget: false,
+      heading: s.snapNew,
+    );
+    if (!mounted || result == null) return;
+    if (!result.toMemories && !result.toPairWidget) return;
+    await _widgetService.setAutoSendPhotoToMemory(result.toMemories);
+    await prefs.setBool('widget_sendPhotoToPairWidget', result.toPairWidget);
+
+    say(s.snapSending);
+    try {
+      // В ленту ролик уходит обычным воспоминанием: файл живёт в хранилище и
+      // остаётся с парой навсегда.
+      if (result.toMemories) {
+        final ext = path.split('.').last;
+        final dest = 'memories/${_pairData.pairId}/'
+            '${DateTime.now().millisecondsSinceEpoch}.$ext';
+        final url = await _fb.uploadFile(path, dest);
+        if (url != null) {
+          final me = PbAuthService().currentProfile();
+          await MemoryRepository().add(
+            groupId: _pairData.pairId,
+            authorName: (me?['displayName'] as String?) ?? '',
+            authorAvatar: (me?['avatarUrl'] as String?) ?? '',
+            type: MemoryType.video,
+            videoUrl: url,
+            title: result.title,
+            caption: result.caption,
+          );
+        }
+      }
+
+      // В виджет — живым фото. Тут наоборот: сервер режет ролик на кадры и
+      // удаляет исходник, поэтому загрузка своя, а не переиспользованная.
+      if (result.toPairWidget) {
+        await WidgetAnimService.instance.clear();
+        final ref = await PbMediaService().uploadFile(
+          path,
+          uid: PocketBaseService().userId ?? '',
+          groupId: _pairData.pairId,
+          kind: 'widget_anim',
+        );
+        // Ссылка приходит как pb://media/<id>/<file> — нужен только id записи.
+        final parts = (ref ?? '').split('/');
+        final mediaId = parts.length > 3 ? parts[3] : '';
+        if (mediaId.isEmpty) throw Exception('upload failed');
+
+        final ready = await WidgetAnimService.instance.fetch(mediaId);
+        if (ready == null) throw Exception('prepare failed');
+
+        await HomeWidget.saveWidgetData<String>(
+          WidgetAnimService.keyPath,
+          ready.path,
+        );
+        await HomeWidget.saveWidgetData<String>(
+          WidgetAnimService.keyManifest,
+          ready.manifest,
+        );
+        await HomeWidget.updateWidget(name: 'LoveWidgetProvider');
+      }
+      if (mounted) say(result.toPairWidget ? s.snapSent : s.snapSavedToFeed);
+    } catch (e) {
+      debugPrint('_postSnap failed: $e');
+      if (mounted) say(s.snapFailed);
+    }
+  }
+
+  Future<void> _postPhoto() async {
+    if (!_pairData.isPaired || _pairData.pairId.isEmpty) return;
+
+    final picker = ImagePicker();
+    // Отказ в доступе к камере раньше улетал в Crashlytics как Fatal. safePick
+    // глотает сбой пикера; onError показывает подсказку про настройки.
+    final XFile? photo = await safePick(
+      () => picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+        maxWidth: 1920,
+        maxHeight: 1920,
+      ),
+      onError: (_) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(LocaleService.current.cameraPermissionDenied),
+              behavior: SnackBarBehavior.floating,
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 4),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+          );
+        }
+      },
+    );
+    if (photo == null || !mounted) return;
+
+    final croppedPath = await cropPhoto(photo.path, accentColor: _t.primary);
+    if (!mounted) return;
+    // Снимок лежит здесь, а не в строке: в листе подписи его можно отразить.
+    final shot = ValueNotifier<String>(croppedPath ?? photo.path);
+
+    // Геолокация запускается параллельно с диалогом — не блокирует UI.
+    // Пока пользователь вводит название/описание, координаты уже грузятся.
+    final locationFuture = _resolvePhotoLocation(shot.value);
+
+    // Диалог: название/описание + три тумблера «куда отправить».
+    // Дефолты тумблеров запоминаются (общие ключи с виджет-экраном).
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final result = await _showCaptionDialog(
+      initToMemories: _widgetService.autoSendPhotoToMemory,
+      initToPairWidget: prefs.getBool('widget_sendPhotoToPairWidget') ?? true,
+      initToPartnerWidget:
+          prefs.getBool('widget_sendPhotoToPartnerWidget') ?? true,
+      partnerName: _pairData.partnerName,
+      photo: shot,
+    );
+    if (!mounted) return;
+    final effectivePath = shot.value;
+    // null = отмена; ничего не выбрано — выходим.
+    if (result == null) return;
+    if (!result.toMemories &&
+        !result.toPairWidget &&
+        !result.toPartnerWidget) {
+      return;
+    }
+    // Запоминаем выбор на следующий раз.
+    await _widgetService.setAutoSendPhotoToMemory(result.toMemories);
+    await prefs.setBool('widget_sendPhotoToPairWidget', result.toPairWidget);
+    await prefs.setBool(
+      'widget_sendPhotoToPartnerWidget',
+      result.toPartnerWidget,
+    );
+
+    // Лимит проверяем только если фото идёт в ленту воспоминаний.
+    final messenger = ScaffoldMessenger.of(context);
+    if (result.toMemories) {
+      try {
+        await RateLimiterService().checkMemory();
+      } on RateLimitException catch (e) {
+        if (mounted) {
+          messenger.showSnackBar(
+            SnackBar(
+              content: Text(e.message),
+              behavior: SnackBarBehavior.floating,
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 4),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+          );
+        }
+        return;
+      }
+    }
+
+    // К этому моменту пользователь уже потратил время на ввод названия —
+    // геолокация скорее всего уже готова; ждём максимум 3 сек.
+    final location = await locationFuture.timeout(
+      const Duration(seconds: 3),
+      onTimeout: () => (lat: null, lng: null, name: null),
+    );
+
+    // Show loading
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => PopScope(
+        canPop: false,
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.all(32),
+            decoration: BoxDecoration(
+              color: _t.cardSurface,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                M3Loading(color: primaryLight),
+                const SizedBox(height: 16),
+                Text(
+                  LocaleService.current.posting,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: _t.textSecondary,
+                    decoration: TextDecoration.none,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    try {
+      // Заливка в PocketBase
+      final ext = effectivePath.split('.').last;
+      final destination =
+          'memories/${_pairData.pairId}/${DateTime.now().millisecondsSinceEpoch}.$ext';
+      final downloadUrl = await _fb.uploadFile(effectivePath, destination);
+
+      if (downloadUrl == null) {
+        if (mounted) Navigator.of(context).pop(); // dismiss loading
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(LocaleService.current.failedUploadPhoto)),
+          );
+        }
+        return;
+      }
+
+      // 1. Лента воспоминаний.
+      Memory? createdMemory;
+      if (result.toMemories) {
+        final me = PbAuthService().currentProfile();
+        createdMemory = await MemoryRepository().add(
+          groupId: _pairData.pairId,
+          authorName: (me?['displayName'] as String?) ?? '',
+          authorAvatar: (me?['avatarUrl'] as String?) ?? '',
+          type: MemoryType.photo,
+          imageUrl: downloadUrl,
+          title: result.title,
+          caption: result.caption,
+          locationName: location.name,
+          latitude: location.lat,
+          longitude: location.lng,
+        );
+      }
+      // add() возвращает null при тихом дропе (нет сессии/пустой groupId). Раньше
+      // мы всё равно показывали «Добавлено в ленту воспоминаний!» и начисляли
+      // награду — фото уходило в виджеты, но НЕ в воспоминания, а пользователь
+      // был уверен в обратном. Теперь отличаем реальный успех от дропа.
+      final memoryFailed = result.toMemories && createdMemory == null;
+      if (memoryFailed) {
+        unawaited(Sentry.captureMessage(
+          'Instant photo: memory add returned null (не добавилось в ленту)',
+          withScope: (s) {
+            s.level = SentryLevel.error;
+            s.setExtra('isLoggedIn', PocketBaseService().isLoggedIn);
+            s.setExtra('userIdNull', PocketBaseService().userId == null);
+            s.setExtra('pairIdEmpty', _pairData.pairId.isEmpty);
+          },
+        ));
+      }
+
+      // 2. Парный виджет (моя половина).
+      if (result.toPairWidget) {
+        try {
+          await _widgetService.updatePhotoUrl(downloadUrl);
+        } catch (e) {
+          debugPrint('Failed to set pair widget photo: $e');
+        }
+      }
+
+      // 3. Виджет «Фото партнёра».
+      if (result.toPartnerWidget && _pairData.pairId.isNotEmpty) {
+        try {
+          await _widgetService.updatePhotoForPartnerUrl(downloadUrl);
+          await prefs.setString(
+            'photo_day_path_${_pairData.pairId}',
+            photo.path,
+          );
+          final hws = HomeWidgetService.instance;
+          await hws.refreshPhotoOfDay(_pairData.pairId);
+        } catch (e) {
+          debugPrint('Failed to set widget photo day: $e');
+        }
+      }
+
+      if (mounted) Navigator.of(context).pop(); // dismiss loading
+      if (mounted) {
+        final String msg;
+        if (memoryFailed) {
+          msg = LocaleService.current.memoryNotSaved;
+        } else if (result.toMemories) {
+          msg = LocaleService.current.postedToMemoryLane;
+        } else {
+          msg = LocaleService.current.photoSent;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(msg),
+            backgroundColor: memoryFailed ? Colors.orange : primary,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        );
+      }
+      // Награда (1 🪙 в день) — только если фото РЕАЛЬНО добавлено в ленту.
+      if (result.toMemories && !memoryFailed) _tryClaimMemoryReward();
+    } catch (e) {
+      if (mounted) Navigator.of(context).pop(); // dismiss loading
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Error: $e')));
+      }
+    }
+  }
+
+  Future<({double? lat, double? lng, String? name})> _resolvePhotoLocation(
+    String photoPath,
+  ) async {
+    double? lat;
+    double? lng;
+    String? name;
+
+    try {
+      final bytes = await File(photoPath).readAsBytes();
+      final exifData = await readExifFromBytes(bytes);
+      final latTag = exifData['GPS GPSLatitude'];
+      final lngTag = exifData['GPS GPSLongitude'];
+      final latRef = exifData['GPS GPSLatitudeRef'];
+      final lngRef = exifData['GPS GPSLongitudeRef'];
+      if (latTag != null && lngTag != null) {
+        lat = _exifGpsToDouble(latTag.values, latRef?.printable ?? 'N');
+        lng = _exifGpsToDouble(lngTag.values, lngRef?.printable ?? 'E');
+      }
+    } catch (e) {
+      debugPrint('EXIF extraction failed: $e');
+    }
+
+    if (lat == null || lng == null) {
+      try {
+        final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+        if (serviceEnabled) {
+          LocationPermission perm = await Geolocator.checkPermission();
+          if (perm == LocationPermission.denied) {
+            perm = await Geolocator.requestPermission();
+          }
+          if (perm == LocationPermission.always ||
+              perm == LocationPermission.whileInUse) {
+            final pos = await Geolocator.getCurrentPosition(
+              locationSettings: const LocationSettings(
+                accuracy: LocationAccuracy.low,
+                timeLimit: Duration(seconds: 10),
+              ),
+            );
+            lat = pos.latitude;
+            lng = pos.longitude;
+          }
+        }
+      } catch (e) {
+        debugPrint('Geolocator fallback failed: $e');
+      }
+    }
+
+    if (lat != null && lng != null) {
+      try {
+        final placemarks = await placemarkFromCoordinates(lat, lng);
+        if (placemarks.isNotEmpty) {
+          final p = placemarks.first;
+          final parts = <String>[
+            if (p.locality != null && p.locality!.isNotEmpty) p.locality!,
+            if (p.country != null && p.country!.isNotEmpty) p.country!,
+          ];
+          if (parts.isNotEmpty) name = parts.join(', ');
+        }
+      } catch (e) {
+        debugPrint('Reverse geocode failed: $e');
+      }
+    }
+
+    return (lat: lat, lng: lng, name: name);
+  }
+
+  /// Превью снимка в листе подписи и кнопка «Отразить» под ним.
+  Widget _captionPhoto(ValueNotifier<String> photo) {
+    return ValueListenableBuilder<String>(
+      valueListenable: photo,
+      builder: (context, path, _) => Column(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: Image.file(
+              File(path),
+              key: ValueKey(path),
+              height: 180,
+              fit: BoxFit.cover,
+              cacheHeight: 540,
+            ),
+          ),
+          const SizedBox(height: 8),
+          FilledButton.tonalIcon(
+            onPressed: () async {
+              final flipped = await flipPhotoFile(path);
+              if (flipped != null) photo.value = flipped;
+            },
+            icon: const Icon(Icons.flip_rounded),
+            label: Text(LocaleService.current.flipPhoto),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<
+    ({
+      String? title,
+      String? caption,
+      bool toMemories,
+      bool toPairWidget,
+      bool toPartnerWidget,
+    })?
+  >
+  _showCaptionDialog({
+    required bool initToMemories,
+    required bool initToPairWidget,
+    required bool initToPartnerWidget,
+    required String partnerName,
+    /// Ролику этот тумблер не нужен: виджет «Фото партнёра» показывает
+    /// снимок, видео ему отдать нечем.
+    bool showPartnerWidget = true,
+    String? heading,
+    /// Снимок с камеры. iPhone отдаёт селфи не таким, каким его видели в
+    /// кадре, а настройка «Зеркальное селфи» на чужие приложения не влияет:
+    /// кнопка «Отразить» под превью переворачивает кадр (обращение 187).
+    ValueNotifier<String>? photo,
+  }) async {
+    final titleController = TextEditingController();
+    final controller = TextEditingController();
+    return showAppSheet<
+      ({
+        String? title,
+        String? caption,
+        bool toMemories,
+        bool toPairWidget,
+        bool toPartnerWidget,
+      })
+    >(
+      context,
+      builder: (ctx) {
+        bool toMemories = initToMemories;
+        bool toPairWidget = initToPairWidget;
+        bool toPartnerWidget = initToPartnerWidget;
+        return StatefulBuilder(
+          builder: (ctx, setDlgState) {
+            final partner = partnerName.isNotEmpty
+                ? partnerName
+                : LocaleService.current.partnerFallback;
+            final nothingSelected = !toMemories &&
+                !toPairWidget &&
+                !(showPartnerWidget && toPartnerWidget);
+            return SheetScaffold(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        SvgPicture.asset(
+                          'assets/icons/ic_photo.svg',
+                          width: 22,
+                          height: 22,
+                          colorFilter: ColorFilter.mode(
+                            _t.textPrimary,
+                            BlendMode.srcIn,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          heading ?? LocaleService.current.newPhoto,
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w800,
+                            color: _t.textPrimary,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    if (photo != null) ...[
+                      _captionPhoto(photo),
+                      const SizedBox(height: 16),
+                    ],
+                    // Заголовок
+                    TextField(
+                      controller: titleController,
+                      textCapitalization: TextCapitalization.sentences,
+                      maxLength: 60,
+                      decoration: InputDecoration(
+                        hintText: LocaleService.current.titleHint,
+                        hintStyle: TextStyle(color: _t.textMuted),
+                        filled: true,
+                        fillColor: _t.surfaceMuted,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: BorderSide(color: primary, width: 1.5),
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 14,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    // Описание
+                    TextField(
+                      controller: controller,
+                      autofocus: false,
+                      maxLines: 3,
+                      maxLength: 200,
+                      textCapitalization: TextCapitalization.sentences,
+                      decoration: InputDecoration(
+                        hintText: LocaleService.current.descriptionOptionalHint,
+                        hintStyle: TextStyle(color: _t.textMuted),
+                        filled: true,
+                        fillColor: _t.surfaceMuted,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: BorderSide(color: primary, width: 1.5),
+                        ),
+                        contentPadding: const EdgeInsets.all(16),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    // Куда отправить фото — три независимых тумблера.
+                    _captionDestRow(
+                      title: LocaleService.current.captionDestMemories,
+                      subtitle: LocaleService.current.captionDestMemoriesSub,
+                      value: toMemories,
+                      onChanged: (v) => setDlgState(() => toMemories = v),
+                    ),
+                    _captionDestRow(
+                      title: LocaleService.current.captionDestPairWidget,
+                      subtitle:
+                          LocaleService.current.captionDestPairWidgetSub(partner),
+                      value: toPairWidget,
+                      onChanged: (v) => setDlgState(() => toPairWidget = v),
+                    ),
+                    if (showPartnerWidget)
+                      _captionDestRow(
+                        title: LocaleService.current.captionDestPartnerWidget,
+                        subtitle: LocaleService.current
+                            .captionDestPartnerWidgetSub(partner),
+                        value: toPartnerWidget,
+                        onChanged: (v) =>
+                            setDlgState(() => toPartnerWidget = v),
+                      ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextButton(
+                            onPressed: () => Navigator.pop(ctx),
+                            child: Text(
+                              LocaleService.current.skip,
+                              style: TextStyle(
+                                color: _t.textMuted,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: ElevatedButton(
+                            onPressed: nothingSelected
+                                ? null
+                                : () {
+                                    final titleText = titleController.text
+                                        .trim();
+                                    final text = controller.text.trim();
+                                    Navigator.pop(ctx, (
+                                      title: titleText.isEmpty
+                                          ? null
+                                          : titleText,
+                                      caption: text.isEmpty ? null : text,
+                                      toMemories: toMemories,
+                                      toPairWidget: toPairWidget,
+                                      toPartnerWidget: toPartnerWidget,
+                                    ));
+                                  },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: primary,
+                              foregroundColor: Colors.white,
+                              disabledBackgroundColor: _t.surfaceMuted,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                            child: Text(
+                              LocaleService.current.post,
+                              style: TextStyle(fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// Строка-тумблер «куда отправить фото» в диалоге публикации.
+  Widget _captionDestRow({
+    required String title,
+    required String subtitle,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: _t.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  subtitle,
+                  style: TextStyle(fontSize: 11, color: _t.textMuted),
+                ),
+              ],
+            ),
+          ),
+          Switch.adaptive(
+            value: value,
+            activeColor: primary,
+            onChanged: onChanged,
+          ),
+        ],
+      ),
+    );
+  }
+
+
+  // =============================================
+  // СЛОТ ПОДСКАЗКИ НА ГЛАВНОЙ
+  // =============================================
+
+  /// Что показать в слоте подсказки: приглашение партнёра, напоминание о
+  /// затихшем партнёре, список первых действий пары или ничего.
+  ///
+  /// Одиночке показываем только приглашение: настроение без группы не
+  /// сохраняется, половина каталога виджетов закрыта, чат и лента ждут второго —
+  /// учить нечему, пока пары нет. Список появляется у собравшейся пары.
+  ///
+  /// У напоминания о затихшем партнёре приоритет: оно про сейчас, а список
+  /// подождёт.
+  // ── «Умение любить» ───────────────────────────────────────────────────────
+
+  bool _lovePartnerDone = false;
+  bool _loveMineDone = false;
+  bool _loveDismissed = true;
+
+  /// Узнаём, есть ли повод звать в тест. Тихо: раз за открытие главной, без
+  /// подписок — карточка появляется один раз и живёт до первого касания.
+  Future<void> _loadLoveTestState() async {
+    if (!_pairData.isPaired || _pairData.pairId.isEmpty) return;
+    final dismissed = await UiPrefs.loveTestPromptDismissed();
+    final pair = await LoveTestService.instance.load(
+      _pairData.pairId,
+      widget.userData.uid,
+    );
+    if (!mounted) return;
+    setState(() {
+      _loveDismissed = dismissed;
+      _lovePartnerDone = pair.partnerReady;
+      _loveMineDone = pair.mine != null;
+    });
+  }
+
+  void _openLoveTest() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        settings: const RouteSettings(name: '/love_test'),
+        builder: (_) => LoveTestScreen(
+          theme: _t,
+          groupId: _pairData.pairId,
+          myUid: widget.userData.uid,
+          partnerName: _pairData.partnerDisplayName,
+          myGender: widget.userData.gender?.name ?? '',
+          partnerGender: _partnerGender,
+        ),
+      ),
+    ).then((_) {
+      // Открыли — карточка своё дело сделала, второй раз не зовём.
+      unawaited(UiPrefs.dismissLoveTestPrompt());
+      if (mounted) setState(() => _loveDismissed = true);
+    });
+  }
+
+  void _dismissLoveTest() {
+    unawaited(UiPrefs.dismissLoveTestPrompt());
+    setState(() => _loveDismissed = true);
+  }
+
+  Widget? _homePrompt() {
+    final cs = ProfileTheme.themeFor(_t).colorScheme;
+
+    if (!_pairData.isPaired) {
+      return InvitePromptCard(
+        scheme: cs,
+        onInvite: () => Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => InvitePartnerScreen(pairData: _pairData, theme: _t),
+            settings: const RouteSettings(name: '/invite_partner'),
+          ),
+        ),
+      );
+    }
+
+    // Пара с пустым местом: вместо «партнёр молчит» и списка первых шагов —
+    // сколько осталось до возвращения и заявка, если кто-то ввёл код. Всё
+    // остальное в этой паре и так работает, подсказки ей не нужны.
+    if (_pairData.waitingMode) {
+      return WaitingHomeCard(
+        scheme: cs,
+        name: _pairData.placeholderName,
+        daysLeft: _pairData.daysUntilReturn,
+        claimName: _pairData.hasClaimRequest ? _pairData.claimName : null,
+        onApprove: () => _pairData.answerClaim(approve: true),
+        onDecline: () => _pairData.answerClaim(approve: false),
+      );
+    }
+
+    if (_quietDays != null) {
+      return QuietPartnerCard(
+        scheme: cs,
+        partnerUid: _pairData.partnerUid,
+        partnerName: _pairData.partnerDisplayName,
+        partnerAvatarUrl: _pairData.partnerAvatarUrl,
+        quietDays: _quietDays!,
+        busy: _quietSending,
+        onSend: _sendQuietNudge,
+      );
+    }
+
+    if (showLovePrompt(
+      partnerDone: _lovePartnerDone,
+      mineDone: _loveMineDone,
+      dismissed: _loveDismissed,
+    )) {
+      return LoveTestCard(
+        scheme: cs,
+        partnerName: _pairData.partnerDisplayName,
+        onOpen: _openLoveTest,
+        onDismiss: _dismissLoveTest,
+      );
+    }
+
+    final done = _onboardingDone();
+    if (!OnboardingProgress.visible(
+      done: done,
+      daysSinceSignup: _daysSinceSignup(),
+      dismissed: _onboardingDismissed,
+      hasPartner: _pairData.isPaired,
+    )) {
+      return null;
+    }
+    return OnboardingCard(
+      scheme: cs,
+      done: done,
+      onStep: _openOnboardingStep,
+      onHide: () async {
+        setState(() => _onboardingDismissed = true);
+        await UiPrefs.dismissOnboarding();
+      },
+    );
+  }
+
+  /// Пройденные шаги считаем по данным, а не по нажатиям: кто поставил аватар
+  /// при регистрации, видит шаг закрытым сразу.
+  Set<OnboardingStep> _onboardingDone() => OnboardingProgress.doneSteps(
+        hasPhoto: widget.userData.avatarUrl.isNotEmpty,
+        moodToday: _moodService.myMoodToday != null,
+        widgetPinned: _widgetPinned,
+      );
+
+  /// Виджет мог встать на экран мимо каталога: на iPhone его ставят только с
+  /// рабочего стола, на Android ещё и из меню лончера. Спрашиваем систему,
+  /// пока карточка первых действий вообще может быть на экране.
+  Future<void> _checkWidgetOnScreen() async {
+    if (_widgetPinned || _onboardingDismissed) return;
+    if (_daysSinceSignup() >= OnboardingProgress.lifetimeDays) return;
+    if (!await HomeWidgetService.instance.anyWidgetOnScreen()) return;
+    await UiPrefs.markWidgetPinned();
+    // Опыт за виджет разовый, как у кнопки в каталоге: повтор ничего не даст.
+    unawaited(LevelService.instance.award(XpAction.setWidget));
+    if (!mounted) return;
+    setState(() => _widgetPinned = true);
+  }
+
+  /// Сколько дней человек с нами. Дата регистрации — системное поле `created`
+  /// профиля; если его нет (офлайн-старт), считаем новичком.
+  int _daysSinceSignup() {
+    final raw = PocketBaseService().currentUser?.get<String>('created') ?? '';
+    final created = DateTime.tryParse(raw);
+    if (created == null) return 0;
+    return DateTime.now().difference(created).inDays;
+  }
+
+  /// Тап по шагу ведёт ровно туда, где его выполняют.
+  void _openOnboardingStep(OnboardingStep step) {
+    switch (step) {
+      case OnboardingStep.photo:
+        setState(() => _selectedNavIndex = 3);
+      case OnboardingStep.mood:
+        _showMoodPicker();
+      case OnboardingStep.widget:
+        setState(() => _selectedNavIndex = 1);
+    }
+  }
+
+  /// «Скучаю» с карточки затихшего партнёра.
+  /// Открывает холст по номеру с виджета. Не нашли — открываем галерею
+  /// рисунков: она хотя бы там, куда человек шёл.
+  Future<void> _openCanvasFromWidget(String canvasId) async {
+    try {
+      final canvases = await CanvasStorageService.instance
+          .getCanvases(widget.userData.uid, groupId: _pairData.pairId);
+      if (!mounted) return;
+      final meta = canvases.where((c) => c.id == canvasId).firstOrNull;
+      if (meta == null) {
+        _openDrawGallery();
+        return;
+      }
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => DrawScreen(
+            userData: widget.userData,
+            pairData: _pairData,
+            theme: _t,
+            canvasId: meta.id,
+            canvasName: meta.name,
+            pixelW: meta.pixelW,
+            pixelH: meta.pixelH,
+            sheetRatio: meta.effectiveRatio,
+          ),
+          settings: const RouteSettings(name: '/draw'),
+        ),
+      );
+    } catch (e) {
+      debugPrint('canvas from widget failed: $e');
+    }
+  }
+
+  Future<void> _sendQuietNudge() async {
+    if (_quietSending) return;
+    setState(() => _quietSending = true);
+    try {
+      await MissYouRepository().sendMissYou(_pairData.pairId);
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await UiPrefs.markQuietNudgeSent(now);
+      if (!mounted) return;
+      setState(() {
+        _quietNudgeAt = now;
+        _quietSending = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text(LocaleService.current.quietPartnerSent),
+        ),
+      );
+    } catch (e) {
+      debugPrint('quiet nudge failed: $e');
+      if (mounted) setState(() => _quietSending = false);
+    }
+  }
+
+  // =============================================
+  // HELPER METHODS: Location, EXIF, Time
+  // =============================================
+
+  // ── Ежедневный бонус ────────────────────────────────────────────────────────
+
+  /// Вызывается один раз при старте (через 4с). Надёжнее чем триггер в
+  /// _handlePairChanged, который может прерваться из-за generation-check.
+  Future<void> _tryClaimStartupRewards() async {
+    if (!mounted) return;
+    await _tryClaimDailyBonus();
+    // Разовая награда за партнёра: сервер сам проверит флаг partnerInviteRewardGranted
+    if (_pairData.isPaired) await _tryClaimPartnerInviteReward();
+  }
+
+  Future<void> _tryClaimDailyBonus() async {
+    if (!mounted) return;
+    final awarded = await widget.userData.claimDailyBonus();
+    if (!awarded || !mounted) return;
+    CoinRewardToast.show(
+      context,
+      amount: 1,
+      label: LocaleService.current.dailyBonusTitle,
+    );
+  }
+
+  Future<void> _tryClaimMemoryReward() async {
+    if (!mounted) return;
+    final amount = await widget.userData.claimMemoryReward();
+    if (amount <= 0 || !mounted) return;
+    CoinRewardToast.show(
+      context,
+      amount: amount,
+      label: LocaleService.current.memoryRewardTitle,
+    );
+  }
+
+  Future<void> _tryClaimPartnerInviteReward() async {
+    if (!mounted) return;
+    // Награда теперь за УНИКАЛЬНУЮ пару людей (не одноразово на аккаунт), поэтому
+    // и локальный кеш — на конкретного партнёра, а не глобальный флаг.
+    final partnerUid = _pairData.partnerUid;
+    if (partnerUid.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final cacheKey = 'partnerInviteRewarded_local_$partnerUid';
+    if (prefs.getBool(cacheKey) == true) return;
+
+    final amount = await widget.userData.claimPartnerInviteReward(partnerUid);
+    if (amount > 0) {
+      await prefs.setBool(cacheKey, true);
+    }
+    if (amount <= 0 || !mounted) return;
+    CoinRewardToast.show(
+      context,
+      amount: amount,
+      label: LocaleService.current.partnerInviteRewardTitle,
+    );
+  }
+
+  Future<void> _tryClaimMoodStreakReward() async {
+    if (!mounted || _pairData.pairId.isEmpty) return;
+    final amount = await widget.userData.claimMoodStreakReward(
+      _pairData.pairId,
+    );
+    if (amount <= 0 || !mounted) return;
+    CoinRewardToast.show(
+      context,
+      amount: amount,
+      label: LocaleService.current.moodStreakRewardTitle,
+    );
+  }
+
+  // ── In-app update ──────────────────────────────────────────────────────────
+
+  Future<void> _checkForUpdate() async {
+    if (!mounted) return;
+    // Три разные установки — три разных разговора об обновлении. Развилка
+    // живёт в UpdateService, чтобы её можно было проверить тестом.
+    final path = decideUpdatePath(
+      sideloaded: await UpdateService.isSideloaded(),
+      signedByUs: await UpdateService.signedByUs(),
+      splitsMissing: await UpdateService.hasMissingSplits(),
+      playServices: await UpdateService.hasPlayServices(),
+    );
+    if (!mounted) return;
+
+    switch (path) {
+      // Sideload-сборки (установленные из публичного GitHub-репо, а не из Play
+      // Store) не получают обновления через Google Play — проверяем version.json
+      // в релизах вручную и отдаём установку системному установщику.
+      case UpdatePath.sideload:
+        final upd = await UpdateService.checkForUpdate();
+        if (!mounted || upd == null) return;
+        _showGithubUpdateSheet(upd);
+
+      // Установка из Play без докачиваемых частей. Позвать отсюда Play Core —
+      // значит отдать человеку его окно «Something went wrong», английское и
+      // закрывающее приложение. Объясняем сами и ведём в магазин.
+      case UpdatePath.brokenInstall:
+        await _showBrokenInstallSheetIfDue();
+
+      // Телефон без сервисов Google: Honor и Huawei последних лет, прошивки
+      // без GMS, выключенный Play. Обновлять оттуда нечего, а Play Core на
+      // любой вопрос отвечает своим окном — молчим.
+      case UpdatePath.none:
+        break;
+
+      case UpdatePath.playStore:
+        try {
+          final info = await InAppUpdate.checkForUpdate();
+          if (!mounted) return;
+          if (info.updateAvailability == UpdateAvailability.updateAvailable) {
+            _showUpdateSheet(info);
+          }
+        } catch (e) {
+          debugPrint('HomeScreen._checkForUpdate failed: $e');
+        }
+    }
+  }
+
+  /// Ключ последнего показа объяснения про неполную установку.
+  static const String _brokenInstallShownAtKey = 'broken_install_shown_at';
+
+  /// Показывает объяснение не чаще раза в сутки: чинится оно переустановкой,
+  /// а до неё человек продолжает пользоваться приложением, и упираться в один
+  /// и тот же лист при каждом запуске незачем.
+  Future<void> _showBrokenInstallSheetIfDue() async {
+    final prefs = await SharedPreferences.getInstance();
+    final last = prefs.getInt(_brokenInstallShownAtKey) ?? 0;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - last < const Duration(days: 1).inMilliseconds) return;
+    if (!mounted) return;
+    await prefs.setInt(_brokenInstallShownAtKey, now);
+    _showBrokenInstallSheet();
+  }
+
+  void _showBrokenInstallSheet() {
+    final s = LocaleService.current;
+    final p = primary;
+    showModalSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => Container(
+        decoration: BoxDecoration(
+          color: _t.cardSurface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        padding: EdgeInsets.fromLTRB(
+          24,
+          20,
+          24,
+          MediaQuery.of(ctx).viewPadding.bottom + 24,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              s.brokenInstallTitle,
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              s.brokenInstallBody,
+              style: TextStyle(fontSize: 14, height: 1.45, color: _t.textSecondary),
+            ),
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: p,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                onPressed: () async {
+                  Navigator.of(ctx).pop();
+                  // Сначала нативный market://, затем https-фолбэк — тот же
+                  // порядок, что на экране принудительного обновления.
+                  const market = 'market://details?id=com.togetherly.love';
+                  const web =
+                      'https://play.google.com/store/apps/details?id=com.togetherly.love';
+                  try {
+                    if (!await safeLaunchUrl(
+                      Uri.parse(market),
+                      mode: LaunchMode.externalApplication,
+                    )) {
+                      await safeLaunchUrl(
+                        Uri.parse(web),
+                        mode: LaunchMode.externalApplication,
+                      );
+                    }
+                  } catch (e) {
+                    debugPrint('HomeScreen._showBrokenInstallSheet failed: $e');
+                  }
+                },
+                child: Text(s.brokenInstallAction),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Лист обновления для sideload-сборок: ведёт на скачивание APK из публичного
+  /// GitHub-репо (браузер докачивает файл и вызывает системный установщик).
+  void _showGithubUpdateSheet(GithubUpdate upd) {
+    final p = primary;
+    // Без isScrollControlled Flutter режет лист по 9/16 высоты экрана, и с
+    // длинными заметками к версии кнопка «Обновить» уезжала под системную
+    // панель — нажать её было нельзя (обращение 236, 05.10.2026).
+    showModalSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => Container(
+        decoration: BoxDecoration(
+          color: _t.cardSurface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        padding: EdgeInsets.fromLTRB(
+          24,
+          12,
+          24,
+          MediaQuery.of(ctx).viewPadding.bottom + 24,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: _t.divider,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Container(
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    color: p.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Icon(Icons.system_update_rounded, color: p, size: 28),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        LocaleService.current.updateAvailableTitle,
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800,
+                          color: _t.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        upd.versionName.isNotEmpty
+                            ? '${LocaleService.current.updateAvailableSubtitle} · ${upd.versionName}'
+                            : LocaleService.current.updateAvailableSubtitle,
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: _t.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            if (upd.notes.isNotEmpty) ...[
+              const SizedBox(height: 20),
+              // Что нового именно в той версии, на которую зовём: раньше здесь
+              // не было ничего, и человек не понимал, ради чего обновляться.
+              Container(
+                width: double.infinity,
+                // Заметки прокручиваются внутри, а кнопки всегда на экране:
+                // на низком телефоне 260 точек заметок съели бы и их.
+                constraints: BoxConstraints(maxHeight: (MediaQuery.sizeOf(ctx).height * 0.32).clamp(120.0, 260.0)),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: _t.surfaceMuted,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: SingleChildScrollView(
+                  child: Text(
+                    upd.notes,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: _t.textSecondary,
+                      fontWeight: FontWeight.w500,
+                      height: 1.6,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+            const SizedBox(height: 24),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton.icon(
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  final uri = Uri.parse(upd.apkUrl);
+                  try {
+                    await safeLaunchUrl(uri, mode: LaunchMode.externalApplication);
+                  } catch (e) {
+                    debugPrint('GitHub update launch failed: $e');
+                  }
+                },
+                icon: const Icon(Icons.download_rounded),
+                label: Text(LocaleService.current.updateButton),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: p,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  elevation: 0,
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              height: 44,
+              child: TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: Text(
+                  LocaleService.current.updateLaterButton,
+                  style: TextStyle(
+                    color: _t.textSecondary,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showUpdateSheet(AppUpdateInfo info) {
+    showModalSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => _UpdateBottomSheet(info: info, primaryColor: primary),
+    );
+  }
+
+  // ── User location ───────────────────────────────────────────────────────────
+
+  /// Fetch user location for distance calculation on photo cards.
+  /// На входе в приложение разрешение НЕ запрашиваем — только используем уже
+  /// выданное. Иначе пользователю, который отказал, диалог геолокации всплывал
+  /// бы на каждом запуске. Сам запрос остаётся в контекстных экранах (добавление
+  /// воспоминания с локацией, выбор точки на карте), где он уместен.
+  Future<void> _fetchUserLocation() async {
+    // Не трогаем GPS, если «Показывать мою геопозицию» выключено. Раньше
+    // расстояние до мест на карточках воспоминаний читало GPS при КАЖДОМ
+    // открытии главного экрана независимо от тумблера → iOS зажигал индикатор
+    // геолокации, хотя трансляция выключена (жалоба тестера). Теперь уважаем
+    // тумблер: нет трансляции — нет обращения к GPS.
+    if (!LiveLocationService.instance.sharingEnabled.value) return;
+    try {
+      final perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.always ||
+          perm == LocationPermission.whileInUse) {
+        final pos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.low,
+            timeLimit: Duration(seconds: 10),
+          ),
+        );
+        if (mounted) {
+          setState(() {
+            _userLat = pos.latitude;
+            _userLng = pos.longitude;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('Failed to get user location: $e');
+    }
+  }
+
+  /// Convert EXIF GPS rational values to double degrees.
+  /// Based on the official exif package example (gps_coords.dart).
+  double _exifGpsToDouble(IfdValues values, String ref) {
+    if (values is! IfdRatios) return 0.0;
+
+    double sum = 0.0;
+    double unit = 1.0;
+    for (final v in values.ratios) {
+      sum += v.toDouble() * unit;
+      unit /= 60.0;
+    }
+
+    if (ref == 'S' || ref == 'W') sum = -sum;
+    return sum;
+  }
+}
+
+// ── Mascot preview in the home row ────────────────────────────────────────────
+
+class _MascotPreviewWidget extends StatelessWidget {
+  final Mascot mascot;
+  final MascotService service;
+
+  /// Цвет морф-индикатора, пока картинка качается. Схему карточки знает только
+  /// кнопка, поэтому цвет приходит снаружи, а не из Theme.of.
+  final Color? color;
+
+  /// Когда этот персонаж уходит на ночную сцену.
+  final SleepWindow sleep;
+
+  const _MascotPreviewWidget({
+    required this.mascot,
+    required this.service,
+    this.color,
+    this.sleep = SleepWindow.standard,
+  });
+
+  Widget _waiting(BuildContext context) => Center(
+        child: M3Loading(
+          size: 32,
+          color: (color ?? Theme.of(context).colorScheme.onSecondaryContainer)
+              .withValues(alpha: 0.55),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    // Ту без картинки и ссылки каталога: рисунок приходит анимациями
+    // `cloud_*`, и без этой ветки на месте Ту стоял системный смайлик.
+    if (mascot.id == kCloudMascotId) {
+      return LayoutBuilder(
+        builder: (_, c) {
+          final side = c.biggest.shortestSide;
+          return CloudMascotView(
+            size: side.isFinite ? side : 48,
+            night: sleep.contains(DateTime.now()),
+          );
+        },
+      );
+    }
+    final asset = service.resolvedAssetForMood(mascot);
+    if (asset != null) {
+      return buildMascotAssetImage(asset, fit: BoxFit.contain);
+    }
+    // Пиксельный маскот: его catalogUrl ведёт на атлас кадров, и обычная
+    // картинка показывала бы всю простыню разом. Проверка идёт ПЕРЕД веткой
+    // catalogUrl — иначе на главной вместо персонажа лежит лента кадров.
+    final animated = CatalogService.instance.animById(mascot.id);
+    if (animated != null) {
+      return LayoutBuilder(
+        builder: (_, c) {
+          final side = c.biggest.shortestSide;
+          return PixelMascotView(
+            anim: animated,
+            state: MascotAnimState.live,
+            level: MascotAnim.levelForStreak(service.activeStreak),
+            sleep: sleep,
+            size: side.isFinite ? side : 64,
+          );
+        },
+      );
+    }
+    // Каталожные (уровневые) маскоты рендерятся по публичному catalogUrl.
+    // Без этой ветки они падали в Icon(face) → «нет превью» в карточке серии.
+    if (mascot.catalogUrl != null) {
+      return CachedNetworkImage(
+      cacheManager: OfflineImageCacheManager.instance,
+        imageUrl: mascot.catalogUrl!,
+        fit: BoxFit.contain,
+        placeholder: (context, _) => _waiting(context),
+        errorWidget: (_, _, _) => const Icon(Icons.face),
+      );
+    }
+    if (mascot.imageUrl != null) {
+      return StorageImage(
+        imageUrl: mascot.imageUrl!,
+        fit: BoxFit.contain,
+        placeholder: (context, _) => _waiting(context),
+        errorWidget: (_, _, _) => const Icon(Icons.face),
+      );
+    }
+    return const Icon(Icons.face);
+  }
+}
+
+// ── Animated mascot button ────────────────────────────────────────────────────
+
+class _MascotButton extends StatefulWidget {
+  final Mascot? mascot;
+  final MascotService service;
+  final AppTheme theme;
+  final int streak;
+  final bool isHidden;
+  final VoidCallback onTap;
+  final Future<void> Function()? onShowOverlay;
+
+  /// Серию можно вернуть за ролик — справа кнопка «Вернуть серию».
+  final StreakRestoreOffer? restoreOffer;
+  final Future<void> Function()? onRestore;
+
+  /// Окно ночной сцены персонажа: у каждого своё, задаётся в настройках.
+  final SleepWindow Function(String mascotId) sleepOf;
+
+  const _MascotButton({
+    super.key,
+    required this.mascot,
+    required this.service,
+    required this.theme,
+    required this.streak,
+    required this.isHidden,
+    required this.onTap,
+    required this.sleepOf,
+    this.onShowOverlay,
+    this.restoreOffer,
+    this.onRestore,
+  });
+
+  @override
+  State<_MascotButton> createState() => _MascotButtonState();
+}
+
+class _MascotButtonState extends State<_MascotButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulseCtrl;
+  bool _pressed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _pulseCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mascot = widget.mascot;
+    final streak = widget.streak;
+    final t = widget.theme;
+    final cs = ProfileTheme.themeFor(t).colorScheme;
+    final hasStreak = streak > 0;
+    // Маскот ещё едет: либо сервис только подписался на группу, либо id выбран,
+    // а сам объект в галерею пока не приехал. Смайлик в это время врал —
+    // выглядел как «маскота нет, выберите».
+    final isLoading = mascot == null &&
+        (widget.service.isLoading || widget.service.hasActiveMascot);
+
+    return GestureDetector(
+      onTap: widget.onTap,
+      onTapDown: (_) => setState(() => _pressed = true),
+      onTapUp: (_) => setState(() => _pressed = false),
+      onTapCancel: () => setState(() => _pressed = false),
+      child: AnimatedScale(
+        scale: _pressed ? 0.97 : 1.0,
+        duration: const Duration(milliseconds: 80),
+        curve: Curves.easeOut,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 250),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          decoration: BoxDecoration(
+            color: cs.secondaryContainer,
+            borderRadius: BorderRadius.circular(24),
+          ),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 48,
+                height: 48,
+                // Пока маскота нет — морфинг-фигура M3, и в загрузке, и в
+                // пустом состоянии. Смайлик отсюда убран: он рисовался
+                // системной иконкой, ничего не значил и оставался на экране,
+                // будто маскот такой и есть.
+                child: mascot != null
+                    ? _MascotPreviewWidget(
+                        mascot: mascot,
+                        service: widget.service,
+                        color: cs.onSecondaryContainer,
+                        sleep: widget.sleepOf(mascot.id),
+                      )
+                    : Center(
+                        child: M3Loading(
+                          size: 36,
+                          color:
+                              cs.onSecondaryContainer.withValues(alpha: 0.55),
+                        ),
+                      ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      mascot != null
+                          ? mascot.localizedName
+                          : LocaleService.current.groupMascot,
+                      style: TextStyle(
+                        fontFamily: ProfileTheme.displayFont,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 14,
+                        color: cs.onSecondaryContainer,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    if (hasStreak)
+                      _StreakBadge(
+                        streak: streak,
+                        theme: t,
+                        pulseCtrl: _pulseCtrl,
+                      )
+                    else
+                      Text(
+                        mascot != null
+                            ? LocaleService.current.tapForGallery
+                            : isLoading
+                                ? LocaleService.current.loading
+                                : LocaleService.current.selectMascot,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color:
+                              cs.onSecondaryContainer.withValues(alpha: 0.7),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              if (mascot != null && widget.restoreOffer != null)
+                GestureDetector(
+                  onTap: () => widget.onRestore?.call(),
+                  behavior: HitTestBehavior.opaque,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 4, right: 2),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 7,
+                      ),
+                      decoration: BoxDecoration(
+                        color: cs.primary,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.local_fire_department_rounded,
+                            size: 15,
+                            color: cs.onPrimary,
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                            LocaleService.current.streakRestoreAction,
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: cs.onPrimary,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              else if (mascot != null)
+                GestureDetector(
+                  onTap: widget.isHidden
+                      ? () => widget.onShowOverlay?.call()
+                      : null,
+                  behavior: HitTestBehavior.opaque,
+                  child: widget.isHidden
+                      ? Padding(
+                          padding: const EdgeInsets.only(left: 4, right: 2),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 7,
+                            ),
+                            decoration: BoxDecoration(
+                              color: cs.primary,
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.visibility_rounded,
+                                  size: 15,
+                                  color: cs.onPrimary,
+                                ),
+                                const SizedBox(width: 5),
+                                Text(
+                                  LocaleService.current.showLabel,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    color: cs.onPrimary,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      : Icon(
+                          Icons.chevron_right_rounded,
+                          size: 20,
+                          color: cs.onSecondaryContainer.withValues(alpha: 0.55),
+                        ),
+                )
+              else
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 20,
+                  color: cs.onSecondaryContainer.withValues(alpha: 0.55),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Animated streak badge ─────────────────────────────────────────────────────
+
+class _StreakBadge extends StatelessWidget {
+  final int streak;
+  final AppTheme theme;
+  final AnimationController pulseCtrl;
+
+  const _StreakBadge({
+    required this.streak,
+    required this.theme,
+    required this.pulseCtrl,
+  });
+
+  Color _color() {
+    if (streak >= 30) return const Color(0xFFFF9500);
+    if (streak >= 7) return const Color(0xFFFF6B35);
+    return theme.primary;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _color();
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AnimatedBuilder(
+            animation: pulseCtrl,
+            builder: (_, _) {
+              final scale = Tween<double>(begin: 1.0, end: 1.4)
+                  .animate(
+                    CurvedAnimation(parent: pulseCtrl, curve: Curves.easeInOut),
+                  )
+                  .value;
+              return Transform.scale(
+                scale: scale,
+                child: Icon(Icons.local_fire_department_rounded,
+                    size: 14, color: color),
+              );
+            },
+          ),
+          const SizedBox(width: 5),
+          TweenAnimationBuilder<int>(
+            tween: IntTween(begin: 0, end: streak),
+            duration: const Duration(milliseconds: 900),
+            curve: Curves.easeOutCubic,
+            builder: (_, val, _) => Text(
+              LocaleService.current.streakLabel(val),
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: color,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Update bottom sheet widget
+// ─────────────────────────────────────────────────────────────
+
+class _UpdateBottomSheet extends StatefulWidget {
+  final AppUpdateInfo info;
+  final Color primaryColor;
+
+  const _UpdateBottomSheet({required this.info, required this.primaryColor});
+
+  @override
+  State<_UpdateBottomSheet> createState() => _UpdateBottomSheetState();
+}
+
+class _UpdateBottomSheetState extends State<_UpdateBottomSheet> {
+  bool _isUpdating = false;
+  bool _isDownloaded = false;
+
+  Future<void> _startUpdate() async {
+    if (_isUpdating) return;
+    setState(() => _isUpdating = true);
+
+    try {
+      await InAppUpdate.startFlexibleUpdate();
+      if (!mounted) return;
+      setState(() {
+        _isUpdating = false;
+        _isDownloaded = true;
+      });
+    } catch (e) {
+      debugPrint('In-app update start failed: $e');
+      if (!mounted) return;
+      setState(() {
+        _isUpdating = false;
+        _isDownloaded = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(LocaleService.current.failedUpdateStatus(e.toString())),
+        ),
+      );
+    }
+  }
+
+  Future<void> _applyUpdate() async {
+    if (!mounted) return;
+    Navigator.of(context).maybePop();
+    try {
+      await InAppUpdate.completeFlexibleUpdate();
+    } catch (e) {
+      debugPrint('In-app update completion failed: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(LocaleService.current.failedUpdateStatus(e.toString())),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = widget.primaryColor;
+    final t = context.appTheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: t.cardSurface,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      // Отступ снизу учитывает системную навигационную панель (жесты/кнопки),
+      // иначе кнопка «перезапустить» налезает на неё и плохо нажимается.
+      padding: EdgeInsets.fromLTRB(
+          24, 16, 24, 24 + MediaQuery.of(context).viewPadding.bottom),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Handle bar
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: t.divider,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // Icon + title row
+          Row(
+            children: [
+              Container(
+                width: 52,
+                height: 52,
+                decoration: BoxDecoration(
+                  color: p.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Icon(Icons.system_update_rounded, color: p, size: 28),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      LocaleService.current.updateAvailableTitle,
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        color: t.textPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      LocaleService.current.updateAvailableSubtitle,
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: t.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 20),
+
+          // What's new block. Гибкий: на маленьком экране заметки сжимаются и
+          // листаются, а кнопка обновления остаётся на виду (TOG-39).
+          Flexible(
+            child: Container(
+              width: double.infinity,
+              constraints: const BoxConstraints(maxHeight: 300),
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: t.surfaceMuted,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: t.divider),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.star_rounded, color: p, size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: Text(
+                        // Заметки НОВОЙ версии: они приезжают с version.json.
+                        // Текст из установленной сборки остаётся запасным — на
+                        // релизах, выпущенных до 13 августа 2026, поля ещё нет.
+                        UpdateService.cachedNotes ??
+                            LocaleService.current.updateWhatsNew,
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: t.textSecondary,
+                          fontWeight: FontWeight.w500,
+                          height: 1.6,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 20),
+
+          if (_isDownloaded) ...[
+            // Ready to install — restart button
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton.icon(
+                onPressed: _applyUpdate,
+                icon: const Icon(Icons.restart_alt_rounded),
+                label: Text(LocaleService.current.updateRestartButton),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: p,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  elevation: 0,
+                ),
+              ),
+            ),
+          ] else ...[
+            // Update + Later buttons
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton(
+                onPressed: _isUpdating ? null : _startUpdate,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: p,
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: p.withOpacity(0.5),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  elevation: 0,
+                ),
+                child: _isUpdating
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          color: Colors.white,
+                          strokeWidth: 2,
+                        ),
+                      )
+                    : Text(
+                        LocaleService.current.updateButton,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              height: 44,
+              child: TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: Text(
+                  LocaleService.current.updateLaterButton,
+                  style: TextStyle(
+                    color: t.textSecondary,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}

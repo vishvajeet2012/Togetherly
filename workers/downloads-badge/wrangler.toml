@@ -1,0 +1,6 @@
+name = "togetherly-badge"
+main = "src/index.js"
+compatibility_date = "2026-07-19"
+
+# MOD_SECRET задаётся как СЕКРЕТ (не var), чтобы не лежал в репозитории:
+#   npx wrangler secret put MOD_SECRET

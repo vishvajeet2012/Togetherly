@@ -1,0 +1,1051 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+import 'package:flutter/cupertino.dart' show CupertinoPageTransitionsBuilder;
+import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_displaymode/flutter_displaymode.dart';
+import 'package:flutter/services.dart';
+import 'package:sentry_flutter/sentry_flutter.dart';
+import 'config/sentry_config.dart';
+import 'services/crash_noise.dart';
+import 'services/network/server_route.dart';
+import 'services/stale_pointer_sweeper.dart';
+import 'utils/safe_pick.dart';
+import 'package:home_widget/home_widget.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
+import 'package:yandex_mobileads/mobile_ads.dart' as yandex;
+import 'package:image_picker_android/image_picker_android.dart';
+import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'models/user_data.dart';
+import 'theme/app_theme.dart';
+import 'theme/app_palettes.dart';
+import 'theme/profile_theme.dart';
+import 'theme/theme_scope.dart';
+import 'services/analytics_service.dart';
+import 'services/hint_calm.dart';
+import 'services/mascot_guide_service.dart';
+import 'services/deep_link_service.dart';
+import 'services/shared_link_service.dart';
+import 'services/pb_push_service.dart';
+import 'services/apns_service.dart';
+import 'services/fcm_service.dart';
+import 'services/push_background_service.dart';
+import 'services/catalog_service.dart';
+import 'services/launch_splash_service.dart';
+import 'services/live_location_service.dart';
+import 'models/symbol_catalog.dart';
+import 'services/locale_service.dart';
+import 'services/app_icon_service.dart';
+import 'services/mascot_inactivity_notification_service.dart';
+import 'services/mood_pack_service.dart';
+import 'services/tu_wear_service.dart';
+import 'services/pocketbase_service.dart';
+import 'models/ios_widget_gaps.dart';
+import 'services/pb_auth_service.dart';
+import 'services/pb_data_service.dart';
+import 'services/home_widget_service.dart';
+import 'services/miss_you_repository.dart';
+import 'services/widget_background_refresh_service.dart';
+import 'services/app_time_service.dart';
+import 'services/offline/local_store.dart';
+import 'services/offline/connectivity_service.dart';
+import 'services/offline/outbox_service.dart';
+import 'services/offline/media_cache.dart';
+import 'services/coin_store.dart';
+import 'services/pb_coins_service.dart';
+import 'screens/welcome_screen.dart';
+import 'widgets/common/guide_mascot.dart' show warmCatalogArt;
+import 'screens/home_screen.dart';
+import 'screens/login_screen.dart';
+import 'screens/force_update_screen.dart';
+import 'widgets/common/m3_loading.dart';
+import 'widgets/unfold/unfold_route.dart';
+import 'widgets/unfold/unfold_touch.dart';
+import 'widgets/launch_splash/launch_splash_overlay.dart';
+import 'widgets/offline_sync_banner.dart';
+import 'services/pair_jar_service.dart';
+import 'widgets/chest/jar_toast.dart';
+
+// ATT/трекинг убран НАМЕРЕННО: приложение НЕ отслеживает пользователей
+// (в App Store Connect: App Privacy → Tracking = None). Без ATT-авторизации
+// iOS отдаёт обнулённый IDFA, и AdMob/Yandex показывают неперсональную рекламу.
+// Так снят реджект 2.1: ATT-попап всё равно не мог показаться на устройстве
+// ревьюера с выключенным системным тумблером «Allow Apps to Request to Track».
+
+/// Запрашивает согласие GDPR (UMP), затем инициализирует рекламу Яндекса.
+///
+/// AdMob убран 28.09.2026, но окно согласия Google (UMP) осталось: без него
+/// рекламу в ЕЭЗ показывать нельзя. UMP пишет стандартную строку согласия
+/// IAB TCF, её читает и SDK Яндекса. Инициализация — только ПОСЛЕ согласия,
+/// иначе на устройствах из ЕЭЗ SDK стартует без него.
+Future<void> _initConsentAndAds() async {
+  final params = ConsentRequestParameters(
+    consentDebugSettings: kDebugMode
+        ? ConsentDebugSettings(
+            debugGeography: DebugGeography.debugGeographyEea,
+            testIdentifiers: <String>[],
+          )
+        : null,
+  );
+
+  final completer = Completer<void>();
+
+  ConsentInformation.instance.requestConsentInfoUpdate(
+    params,
+    () async {
+      try {
+        await ConsentForm.loadAndShowConsentFormIfRequired((error) {
+          if (error != null) debugPrint('UMP form error: $error');
+        });
+      } finally {
+        completer.complete();
+      }
+    },
+    (FormError error) {
+      debugPrint('UMP update error: $error');
+      completer.complete();
+    },
+  );
+
+  // Таймаут 5 с — не блокируем запуск если UMP завис
+  await completer.future.timeout(const Duration(seconds: 5), onTimeout: () {});
+
+  // Реклама одна — Яндекс.
+  try {
+    await yandex.YandexAds.initialize();
+  } catch (e) {
+    debugPrint('Yandex Ads init failed: $e');
+  }
+}
+
+// FCM-фоновый хендлер удалён: пуши на PocketBase (PbPushService).
+
+/// Точка входа безголового движка, который поднимает `AppDelegate` по тихому
+/// пушу (iOS).
+///
+/// У виджетов на iOS нет фонового обновления: пока приложение закрыто, фото и
+/// статус партнёра на рабочем столе застывают до следующего запуска — на
+/// Android то же место закрывает WorkManager. Сервер шлёт `content-available`,
+/// когда партнёр поменял данные виджетов, iOS даёт нам несколько секунд, и мы
+/// перекладываем свежие записи `widget_data` в контейнер App Group.
+///
+/// Имя функции прибито в Swift (`run(withEntrypoint: "widgetPushRefresh")`), а
+/// `vm:entry-point` не даёт выбросить её при сборке.
+@pragma('vm:entry-point')
+Future<void> widgetPushRefresh() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await ServerRoute.install();
+  const channel = MethodChannel('love_app/widget_bg_refresh');
+  var changed = false;
+  try {
+    await HomeWidget.setAppGroupId('group.com.togetherly.love');
+    // Сессия PocketBase лежит на диске: записи виджетов защищены, без токена
+    // их не прочитать.
+    await PocketBaseService().init();
+    final myUid = PocketBaseService().userId ?? '';
+    final groupId =
+        await HomeWidget.getWidgetData<String>('love_widget_group_id') ?? '';
+    final partnerUid =
+        await HomeWidget.getWidgetData<String>('love_widget_partner_uid') ?? '';
+    if (myUid.isNotEmpty && groupId.isNotEmpty) {
+      await HomeWidgetService.instance.backgroundRefreshAll(
+        groupId: groupId,
+        myUid: myUid,
+        partnerUid: partnerUid,
+        refreshPhotos: true,
+      );
+      changed = true;
+    }
+  } catch (e) {
+    debugPrint('widgetPushRefresh failed: $e');
+  }
+  // Отвечаем всегда: без этого iOS считает пробуждение неудачным и в
+  // следующий раз даёт меньше времени (а то и не будит вовсе).
+  try {
+    await channel.invokeMethod('done', changed);
+  } catch (_) {
+    // Движок уже погашен таймаутом — ничего страшного.
+  }
+}
+
+/// Вызывается нативным виджетом (LoveWidgetProvider.onUpdate) через
+/// HomeWidgetBackgroundReceiver, когда процесс Flutter мёртв.
+/// Тянет свежие данные из Firestore и обновляет SharedPreferences виджета,
+/// чтобы парный виджет показывал актуальный статус/настроение без открытия приложения.
+@pragma('vm:entry-point')
+Future<void> _homeWidgetBackgroundCallback(Uri? uri) async {
+  if (!Platform.isAndroid || uri == null) return;
+
+  final host = uri.host.trim().toLowerCase();
+  if (host.isEmpty) return;
+  await ServerRoute.install();
+
+  // Тап по виджету «Скучаю»: отправляем реакцию партнёру, не открывая
+  // приложение. Виджет уже показал «Отправлено» — здесь только запись на
+  // сервер и обновление счётчиков.
+  if (host == 'miss') {
+    try {
+      await PocketBaseService().init();
+      final uid = PocketBaseService().userId ?? '';
+      if (uid.isEmpty) return;
+      final groupId =
+          uri.queryParameters['group']?.trim() ??
+          await HomeWidget.getWidgetData<String>('miss_latest_group') ??
+          '';
+      if (groupId.isEmpty || groupId == 'solo') return;
+      await MissYouRepository().sendMissYou(groupId);
+      // local=1 — виджет уже посчитал отправку сам, чтобы кнопка отзывалась
+      // мгновенно. Прибавлять второй раз нельзя.
+      final countedLocally = uri.queryParameters['local'] == '1';
+      await HomeWidgetService.instance.markMissSentFromWidget(
+        groupId,
+        alreadyCounted: countedLocally,
+      );
+      // Долг закрыт — снимаем отметку, чтобы приложение не отправило повторно.
+      await HomeWidget.saveWidgetData<String>(
+        'miss_${groupId}_pending_send',
+        '0',
+      );
+    } catch (e) {
+      debugPrint('miss from widget failed: $e');
+    }
+    return;
+  }
+
+  // Тихий пуш «у партнёра поменялись данные виджетов». Периодический
+  // WorkManager подобрал бы это сам, но через четверть часа, а пуш даёт
+  // обновить рабочий стол сразу (`FcmService.kt`).
+  if (host == 'refresh') {
+    try {
+      await PocketBaseService().init();
+      final myUid = PocketBaseService().userId ?? '';
+      final groupId =
+          await HomeWidget.getWidgetData<String>('love_widget_group_id') ?? '';
+      final partnerUid =
+          await HomeWidget.getWidgetData<String>('love_widget_partner_uid') ??
+              '';
+      if (myUid.isEmpty || groupId.isEmpty) return;
+      await HomeWidgetService.instance.backgroundRefreshAll(
+        groupId: groupId,
+        myUid: myUid,
+        partnerUid: partnerUid,
+        refreshPhotos: true,
+      );
+    } catch (e) {
+      debugPrint('refresh from push failed: $e');
+    }
+    return;
+  }
+
+  // Заметка, написанная прямо на рабочем столе. Листик уже показал новый
+  // текст — здесь только отправка партнёру.
+  if (host == 'note') {
+    try {
+      await PocketBaseService().init();
+      if ((PocketBaseService().userId ?? '').isEmpty) return;
+      final groupId =
+          uri.queryParameters['group']?.trim() ??
+          await HomeWidget.getWidgetData<String>('note_latest_group') ??
+          '';
+      if (groupId.isEmpty || groupId == 'solo') return;
+      await HomeWidgetService.instance.saveNoteFromWidget(
+        groupId: groupId,
+        text: uri.queryParameters['text'] ?? '',
+      );
+    } catch (e) {
+      debugPrint('note from widget failed: $e');
+    }
+    return;
+  }
+
+  // Тап по кнопке настроения на виджете: отмечаем день, не открывая
+  // приложение. Виджет уже подсветил выбор — здесь только запись.
+  if (host == 'mood') {
+    try {
+      final moodId = uri.queryParameters['id']?.trim() ?? '';
+      if (moodId.isEmpty) return;
+      await PocketBaseService().init();
+      if ((PocketBaseService().userId ?? '').isEmpty) return;
+      final groupId =
+          uri.queryParameters['group']?.trim() ??
+          await HomeWidget.getWidgetData<String>('tgmood_latest_group') ??
+          '';
+      if (groupId.isEmpty || groupId == 'solo') return;
+      await HomeWidgetService.instance.applyMoodFromWidget(
+        groupId: groupId,
+        moodId: moodId,
+      );
+    } catch (e) {
+      debugPrint('mood from widget failed: $e');
+    }
+    return;
+  }
+
+  // Ниже прежде лежал второй разбор `refresh` — недостижимый: ветка выше
+  // возвращает управление сама. Он обновлял парный виджет в обход обхода по
+  // связям и путал при чтении: казалось, что путей два.
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Запасной путь к серверу для тех, кому режут основной (Украина,
+  // 22.10.2026). Ставится до первого запроса: клиенты, созданные раньше,
+  // пошли бы мимо него.
+  await ServerRoute.install();
+  // Потерянное системным жестом касание запирало все нажатия до перезапуска
+  // (обращение 231, Realme): досылаем ему отмену.
+  StalePointerSweeper.install();
+  // Запоминает, по какой кнопке нажали: из неё вырастет следующий экран.
+  UnfoldTouch.install();
+
+  // Android отдаёт приложению 60 Гц, даже когда экран умеет 120: анимации и
+  // перемотка видео на глаз становятся ступенчатыми. Просим максимум.
+  if (Platform.isAndroid) {
+    unawaited(FlutterDisplayMode.setHighRefreshRate());
+  }
+
+  // iOS: home_widget работает поверх общего App Group контейнера. Любой вызов
+  // saveWidgetData/updateWidget/clearWidget ДО setAppGroupId падает с
+  // PlatformException(-7, «AppGroupId not set. Call setAppGroupId first»).
+  // Группа должна совпадать с App Group из Runner.entitlements и
+  // TogetherlyWidget.entitlements (= group.com.togetherly.love), иначе виджет и
+  // приложение пишут в разные контейнеры. На Android метод — no-op, поэтому
+  // выставляем безусловно и максимально рано, до первой синхронизации виджетов.
+  await HomeWidget.setAppGroupId('group.com.togetherly.love');
+
+  // Принудительно используем системный Android Photo Picker (ACTION_PICK_IMAGES)
+  // вместо legacy ACTION_GET_CONTENT, который на MIUI открывает файловый
+  // проводник (DocumentsUI) вместо галереи.
+  final imagePickerImpl = ImagePickerPlatform.instance;
+  if (imagePickerImpl is ImagePickerAndroid) {
+    imagePickerImpl.useAndroidPhotoPicker = true;
+  }
+
+  // PocketBase — поднимаем клиент и восстанавливаем сессию из SharedPreferences
+  // (миграция Firebase→PB). Сессия переживает перезапуск процесса. signInSilently
+  // лишь освежает токен, если он валиден. Firebase пока инициализируется рядом:
+  // остальные слои (данные/realtime/медиа/пуш) ещё на нём — его инициализацию,
+  // Crashlytics, Messaging и Supabase убираем ПОСЛЕДНИМ шагом cutover'а, когда
+  // все слои переведены (см. pocketbase/CUTOVER.md §1, §7).
+  await PocketBaseService().init();
+  // Офлайн-фундамент: локальный кэш (sembast) + детектор связи. Открываем ДО
+  // первых watch*, чтобы экраны читали из кэша мгновенно и работали офлайн.
+  // fail-open: при ошибке открытия кэша приложение работает как раньше (онлайн).
+  await LocalStore.instance.init();
+  unawaited(ConnectivityService.instance.init());
+  // signInSilently освежает токен СЕТЕВЫМ запросом (authRefresh) — НЕ блокируем
+  // им холодный старт: токен уже восстановлен из SharedPreferences (init выше),
+  // запросы пойдут с ним сразу, а refresh идёт в фоне. Раньше старт висел на
+  // authRefresh, ожидая медленный/перегруженный сервер (на слабой связи — до
+  // таймаута), и UI не показывался даже при наличии локального кэша. userId ниже
+  // берётся из persisted-сессии, поэтому в готовности signInSilently не нуждается.
+  unawaited(PbAuthService().signInSilently().then((_) {
+    // Не уложился в таймаут — сессия остаётся живой, но без записи профиля:
+    // имя и аватар пусты, срок пары считается не от той даты. Пробуем ещё раз,
+    // уже отдельным запросом (правило пауз — в session_restore.dart).
+    unawaited(PbAuthService().ensureProfileLoaded());
+  }));
+  // Привязываем кэш к владельцу: если на устройстве сменился аккаунт — кэш
+  // полностью чистится (защита от утечки данных между пользователями).
+  await LocalStore.instance.ensureOwner(PocketBaseService().userId);
+  // Виджеты рабочего стола держат свои данные отдельно, в общем хранилище
+  // устройства, — их тоже надо привязать к владельцу. Иначе после смены
+  // аккаунта на столе остаётся пара из прошлой жизни: «на аккаунте где Настя
+  // не присылала ни одного фото, стоит фотка Вики» (14.08.2026).
+  unawaited(HomeWidgetService.instance.ensureOwner(PocketBaseService().userId));
+  // И дальше следим за сессией: выход и вход в другой аккаунт случаются без
+  // перезапуска, а одна проверка на старте их не видит (жалоба 18.08.2026).
+  HomeWidgetService.instance.watchOwner();
+  // Очередь офлайн-записи: дослать на сервер изменения, сделанные офлайн в
+  // прошлой сессии (если уже есть сеть), и реагировать на её появление.
+  unawaited(OutboxService.instance.init());
+  // Отложенные медиа (созданные офлайн) — дослать в PB при появлении сети.
+  unawaited(MediaCache.instance.init());
+
+  // Крашрепортинг — self-hosted Bugsink (Sentry-совместимый, наш VPS), замена
+  // Firebase Crashlytics. Перехватываем:
+  //  • FlutterError.onError — синхронные ошибки фреймворка (build/layout/paint);
+  //  • PlatformDispatcher.onError — необработанные асинхронные ошибки (Future/
+  //    Stream), которые иначе молча гасились.
+  // В debug DSN пустой → SDK no-op (не шлём тестовые краши на прод-бэкенд).
+  await SentryFlutter.init((options) {
+    options.dsn = kDebugMode ? '' : SentryConfig.dsn;
+    options.environment = kDebugMode ? 'debug' : 'production';
+    options.tracesSampleRate = 0.0; // только краши, без performance-трейсинга
+    options.attachStacktrace = true;
+    // Не шлём транспортный сетевой шум (обрывы сокета, недоступность сервера,
+    // плохая сеть пользователя — особенно при блокировках в РФ). Это не баги
+    // приложения, а они тонной забивали панель и топили реальные краши.
+    options.beforeSend = (event, hint) {
+      final t = event.throwable;
+      if (t != null && (isCrashNoise(t))) {
+        return null; // выбросить событие
+      }
+      final stack = [
+        for (final e in event.exceptions ?? const <SentryException>[])
+          for (final f in e.stackTrace?.frames ?? const <SentryStackFrame>[])
+            '${f.absPath ?? ''} ${f.fileName ?? ''}',
+      ].join(' ');
+      if (t != null && isAudioPlayerAfterClose(t, stack)) return null;
+      return event;
+    };
+  });
+  Sentry.configureScope(
+    (scope) => scope.setUser(SentryUser(id: PocketBaseService().userId ?? '')),
+  );
+  // Отказ выбора фото — не краш, поэтому он и не попадал в трекер: жалоба
+  // «при добавлении фото выскакивает окно Google Play» (realme C67, Android 14,
+  // 01.09.2026) разбиралась вслепую, потому что за месяц по галерее не нашлось
+  // ни одной записи. Уходит предупреждением с кодом отказа — по нему видно и
+  // модель телефона, и версию системы.
+  onPickFailure((code, error) {
+    unawaited(
+      Sentry.captureMessage(
+        'picker failed: $code',
+        level: SentryLevel.warning,
+        withScope: (scope) {
+          scope.setTag('picker_code', code);
+          scope.setContexts('picker', {'error': error.toString()});
+        },
+      ),
+    );
+  });
+
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.presentError(details);
+    unawaited(
+      Sentry.captureException(details.exception, stackTrace: details.stack),
+    );
+  };
+  WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+    // Возвращаем true → приложение НЕ падает, выполнение продолжается. Часть
+    // ошибок здесь — из фоновых операций (presence, фоновая загрузка медиа) и
+    // крашами не являются: помечаем их level=warning, остальное — fatal, чтобы
+    // не завышать счётчик падений.
+    final fatal = !isBenignBackgroundError(error);
+    unawaited(
+      Sentry.captureException(
+        error,
+        stackTrace: stack,
+        withScope: (scope) =>
+            scope.level = fatal ? SentryLevel.fatal : SentryLevel.warning,
+      ),
+    );
+    return true;
+  };
+
+  // Supabase убран (миграция на PocketBase). Прежний слой Supabase был
+  // переходным экспериментом дуал-райта; его инициализация удалена. Все вызовы
+  // SupabaseService защищены `isReady` и становятся no-op без init, так что
+  // FirebaseService продолжает работать на Firebase до полного перехода на PB.
+  // Force-update порог теперь читается из PocketBase (`app_config.min_build`).
+
+  // Google UMP + AdMob перенесены за первый кадр (`_LoveAppState`): форма
+  // согласия — модальное окно, а до runApp сцены ещё нет. iOS такому окну
+  // показаться не даёт, Future не завершается, и старт замирает на белом
+  // экране — жалобы «просто белый экран» после выхода в App Store были про
+  // это. Сторож: test/startup_no_modal_before_runapp_test.dart.
+
+  // При первом запуске после установки — принудительно выходим из сессии
+  // и очищаем SharedPreferences. На iOS Firebase Auth хранит токен в Keychain,
+  // который переживает удаление приложения — поэтому signOut() вызывается
+  // безусловно, без проверки isLoggedIn.
+  final prefs = await SharedPreferences.getInstance();
+  const kInstallKey = 'app_installed_v1';
+  if (!prefs.containsKey(kInstallKey)) {
+    try {
+      PocketBaseService().signOut();
+    } catch (_) {}
+    await prefs.clear();
+    await prefs.setBool(kInstallKey, true);
+  }
+
+  // Debug → Release переход: при апгрейде SharedPreferences НЕ очищаются,
+  // поэтому kInstallKey уже есть и выхода из аккаунта не происходит.
+  // Если предыдущая сессия была debug, а текущая release — делаем signOut,
+  // чтобы стейт debug-тестирования не засорял production-окружение.
+  const kLastBuildMode = 'last_build_mode_v1';
+  final lastBuildMode = prefs.getString(kLastBuildMode) ?? '';
+  const currentBuildMode = kDebugMode ? 'debug' : 'release';
+  if (lastBuildMode == 'debug' && currentBuildMode == 'release') {
+    try {
+      if (PocketBaseService().isLoggedIn) {
+        PocketBaseService().signOut();
+      }
+    } catch (_) {}
+  }
+  await prefs.setString(kLastBuildMode, currentBuildMode);
+
+  // На Samsung One UI / aggressive battery saver путь
+  // HomeWidgetBackgroundReceiver -> JobIntentService нестабилен
+  // (особенно в home_widget 0.7.x). Для наших Android-виджетов достаточно
+  // launch intent + явных updateWidget(), поэтому не регистрируем
+  // background interactivity callback и не провоцируем enqueueWork crash.
+  if (!Platform.isAndroid) {
+    // На iOS ниже 17 интерактивности у виджетов нет вовсе, и плагин отвечает
+    // отказом («Interactivity is only available on iOS 17.0»). Отказ приходит
+    // ФЬЮЧЕРОМ, поэтому синхронный try его не ловил: 3649 событий в Bugsink за
+    // трое суток на 1.29.6. Ниже семнадцатой не зовём вовсе, а отказ гасим там,
+    // где он и рождается.
+    if (supportsWidgetInteractivity(Platform.operatingSystemVersion)) {
+      unawaited(
+        HomeWidget.registerInteractivityCallback(_homeWidgetBackgroundCallback)
+            .catchError((Object e) {
+          debugPrint('Старт: интерактивность виджетов недоступна — $e');
+          return null;
+        }),
+      );
+    }
+  } else {
+    // Android: живучий фолбэк обновления виджетов через WorkManager. Foreground-
+    // сервис (PushBackgroundService) даёт мгновенность, но его душат OEM-киллеры
+    // (Xiaomi/MIUI, Samsung) даже с whitelist батареи. Периодическая задача
+    // переживает убийство процесса и Doze → виджет не застревает навсегда.
+    // Инициализируем диспетчер здесь; само расписание ставит home_screen при
+    // активной паре (там известен контекст). Не блокируем старт.
+    unawaited(WidgetBackgroundRefreshService.instance.init());
+    // Пуш про виджеты при открытом приложении обновляет их здесь, без фоновой задачи.
+    WidgetBackgroundRefreshService.instance.listenInApp();
+    // Часы в приложении для званий: считаются, пока приложение на экране.
+    unawaited(AppTimeService.instance.start());
+  }
+
+  // Аналитика отключена (firebase_analytics убран при уходе с Firebase) —
+  // AnalyticsService теперь no-op shell. Привязку userId оставляем как заглушку
+  // на случай будущей серверной аналитики на PocketBase.
+  unawaited(AnalyticsService.instance.setUserId(PocketBaseService().userId));
+
+  // Deep links — инициализация
+  DeepLinkService().init();
+
+  // «Поделиться → Togetherly»: ссылка на товар из магазина уезжает в «Хочу
+  // с тобой». Ловим до первого кадра — на холодном старте она приходит
+  // раньше, чем смонтируется главная.
+  unawaited(SharedLinkService.instance.init());
+
+  // Локальное напоминание о простое поднимается за первым кадром: на iOS его
+  // init просит разрешение на уведомления, а системное окно до runApp показать
+  // некому — старт вставал белым намертво. См. `_initDeferredStartup`.
+
+  // Locale — инициализация (определяет язык по региону или сохранённым настройкам)
+  await LocaleService.instance.init();
+
+  // Каталог значков Material Symbols: по нему рисуются символ таймера и знак
+  // своего типа связи. Грузим заранее и не ждём — иначе на первом кадре вместо
+  // выбранного значка мелькает запасной.
+  unawaited(SymbolCatalog.load());
+
+  // Ярлык на рабочем столе должен быть ровно один. Выбранную иконку мы
+  // включаем явно, и это переживает обновление, а новая основная приехала
+  // включённой из манифеста — у выбиравших цветную ярлыков стало два
+  // («обновил, стало два», 16.08.2026). Чиним молча и только при расхождении.
+  unawaited(AppIconService.instance.repairIfNeeded());
+
+  // Восстанавливаем флаг шеринга геопозиции (карта «Где мы»). Сам трекинг
+  // стартует из home_screen после привязки к группе (resumeIfEnabled).
+  await LiveLocationService.instance.init();
+
+  // Выбранный пак настроений (локальный выбор, как язык) — грузим заранее,
+  // чтобы пикер сразу открывался на нужном наборе без мигания.
+  await MoodPackService.instance.load();
+  // Наряд Ту — тоже локальный выбор: маскот на главной сразу в своих вещах.
+  await TuWearService.instance.load();
+
+  // Удалённый каталог контента (паки настроений из Supabase) — поднимаем кэш с
+  // диска мгновенно, свежий список тянем фоном. Новые паки/эмоции приезжают без
+  // обновления приложения. Офлайн/без credentials — остаются встроенные паки.
+  await CatalogService.instance.init();
+
+  // Своя аналитика: экраны считает NavigatorObserver, события уходят пачками
+  // раз в минуту. До входа ничего не отправляется.
+  unawaited(AnalyticsService.instance.init());
+
+  // Магазин покупок поднимаем на старте, а не при открытии экрана.
+  //
+  // Google доставляет незавершённые покупки в поток сразу после подписки.
+  // Пока подписка жила вместе с экраном Togetherly+, оплата, случившаяся при
+  // свёрнутом или закрытом экране, просто некому было обработать: деньги
+  // списаны, роут начисления не вызван. Здесь слушатель живёт столько же,
+  // сколько приложение, и зависшая покупка доезжает при следующем запуске.
+  if (kCoinsPurchasable) {
+    unawaited(
+      sharedCoinStore.init(
+        onGrantCoins:
+            ({required String productId, required String purchaseToken}) async {
+              final res = await PbCoinsService().iapPurchase(
+                productId: productId,
+                purchaseToken: purchaseToken,
+              );
+              if (res == null || res['ok'] != true) return null;
+              return (res['coins'] as num?)?.toInt() ?? 0;
+            },
+      ),
+    );
+  }
+
+  // Synchronise Flutter's window with MainActivity's setDecorFitsSystemWindows(false).
+  // Without this call Flutter and Android disagree about where gesture exclusion
+  // zones are, causing system swipe gestures (back, home) to be intercepted by
+  // Flutter's own gesture arena and bounce the user back into the app.
+  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.dark,
+      statusBarBrightness: Brightness.light,
+      systemNavigationBarColor: Colors.transparent,
+      systemNavigationBarIconBrightness: Brightness.dark,
+      // false = don't let Android paint a contrast scrim over the nav bar;
+      // that scrim overlaps the gesture zone and can interfere with swipe detection.
+      systemNavigationBarContrastEnforced: false,
+    ),
+  );
+  // Строка «+1 в копилку пары» после любого ролика.
+  PairJarService.instance.onDrop = showJarToast;
+  // Заставка при запуске: только выбранная, по датам и уже лежащая на диске.
+  // Сети здесь нет. Картинки разжимаются здесь, пока видна системная
+  // заставка; при «уменьшить движение» заставки нет вовсе.
+  LaunchSplashOverlay.pending = await LaunchSplashService.instance.prepareLaunch(
+    DateTime.now(),
+    calm: WidgetsBinding.instance.platformDispatcher.accessibilityFeatures.disableAnimations,
+  );
+  runApp(const LoveApp());
+}
+
+class LoveApp extends StatefulWidget {
+  /// Навигатор всего приложения. Нужен там, где экран открывают после
+  /// полноэкранной рекламы: она пересобирает дерево, и локальный контекст к
+  /// этому моменту уже мёртв.
+  static final GlobalKey<NavigatorState> rootNavigatorKey =
+      GlobalKey<NavigatorState>();
+
+  const LoveApp({super.key});
+
+  @override
+  State<LoveApp> createState() => _LoveAppState();
+}
+
+class _LoveAppState extends State<LoveApp> with WidgetsBindingObserver {
+  final UserData _userData = UserData();
+  bool _loading = true;
+  // Установленная сборка ниже минимально поддерживаемой (PocketBase
+  // app_config.min_build) → блокирующий экран обновления. fail-open: при любой
+  // ошибке/без конфига остаётся false и никого не блокирует.
+  bool _forceUpdate = false;
+  AppLifecycleListener? _lifecycleListener;
+
+  // Тема пересобирается при смене темы приложения (акцент берётся из активной
+  // AppTheme). Кэшируем по акценту, чтобы не пересоздавать на каждый
+  // notifyListeners() UserData (монеты, присутствие и т.п.).
+  Object? _lastThemeSig;
+  ThemeData? _lastTheme;
+
+  ThemeData _themeFor(AppTheme appTheme) {
+    // Кэш по подписи, а не по индексу: режим/вариант/AMOLED меняют тему при том
+    // же индексе, иначе меню осталось бы в старом стиле.
+    final sig = Object.hash(
+      appTheme.index,
+      appTheme.brightness,
+      appTheme.primary,
+      appTheme.cardSurface,
+    );
+    if (_lastTheme == null || _lastThemeSig != sig) {
+      _lastThemeSig = sig;
+      _lastTheme = _buildTheme(appTheme);
+    }
+    return _lastTheme!;
+  }
+
+  /// Единый стиль для всех меню (диалоги, bottom-sheet, snackbar, popup-меню).
+  /// Цвета — от акцента активной темы, форма/скругления — из общих токенов.
+  /// Цвет, которым залито растущее окно: поверхность схемы, на ней стоит
+  /// большинство экранов.
+  static Color _screenFill(BuildContext context) =>
+      Theme.of(context).colorScheme.surface;
+
+  static ThemeData _buildTheme(AppTheme appTheme) {
+    final brightness = appTheme.brightness;
+    final isDark = brightness == Brightness.dark;
+
+    // Схема берётся у самой темы, а НЕ собирается заново из её акцента.
+    // Повторный `fromSeed` от `appTheme.primary` — это сид из производного
+    // тона: он терял и сочность, и выбранный вариант, поэтому нижний лист
+    // выходил цветом чужой темы (жалоба 15 августа 2026 — «попап тему не
+    // берёт»). Расходились ВСЕ 25 палитр в обеих яркостях: у закатной
+    // primaryContainer #FFEBE2 против #FFDAD2, у монохрома схема уезжала в
+    // бирюзу. Та же грабля уже чинилась в `ProfileTheme.schemeFor`.
+    final scheme = ProfileTheme.schemeFor(appTheme);
+
+    // Поверхности меню (диалоги/шиты/попапы) и цвета текста — из токенов активной
+    // темы. На светлых темах: cardSurface=#FFFFFF, textPrimary/Secondary ≈ прежним
+    // тёмным — визуально идентично. На тёмной: тёмная поверхность + светлый текст.
+    final menuSurface = appTheme.cardSurface;
+    final titleColor = appTheme.textPrimary;
+    final bodyColor = appTheme.textSecondary;
+    final scaffoldBg = isDark
+        ? appTheme.bgGradient.last
+        : const Color(0xFFF7F3F0);
+
+    // База — M3-тема профиля (шрифты Unbounded/Onest, кнопки-пилюли, тональные
+    // карточки радиусом 22) на всё приложение. Поверх — меню/диалоги/шиты в тех
+    // же токенах. Вёрстку экранов это не трогает: виджеты берут цвета из
+    // context.appTheme, а тут задаётся стиль Material-компонентов и шрифт.
+    return ProfileTheme.data(scheme).copyWith(
+      scaffoldBackgroundColor: scaffoldBg,
+      // Экран растёт из нажатой кнопки и складывается обратно в неё (макет
+      // «Переходы: все экраны», 11.10.2026). Открытый не касанием идёт
+      // прежним переходом платформы — он передан запасным.
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: <TargetPlatform, PageTransitionsBuilder>{
+          TargetPlatform.android: UnfoldPageTransitionsBuilder(
+            fallback: PredictiveBackPageTransitionsBuilder(),
+            fill: _screenFill,
+          ),
+          TargetPlatform.iOS: UnfoldPageTransitionsBuilder(
+            fallback: CupertinoPageTransitionsBuilder(),
+            fill: _screenFill,
+          ),
+        },
+      ),
+      dialogTheme: DialogThemeData(
+        backgroundColor: menuSurface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+        titleTextStyle: TextStyle(
+          fontFamily: ProfileTheme.displayFont,
+          fontSize: 19,
+          fontWeight: FontWeight.w700,
+          color: titleColor,
+        ),
+        contentTextStyle: TextStyle(
+          fontFamily: ProfileTheme.bodyFont,
+          fontSize: 15,
+          height: 1.4,
+          color: bodyColor,
+        ),
+      ),
+      bottomSheetTheme: BottomSheetThemeData(
+        backgroundColor: menuSurface,
+        modalBackgroundColor: menuSurface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        modalElevation: 12,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+        ),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: const Color(0xFF2E2A2C),
+        contentTextStyle: const TextStyle(
+          fontFamily: ProfileTheme.bodyFont,
+          color: Colors.white,
+          fontSize: 14,
+        ),
+        actionTextColor: scheme.inversePrimary,
+        elevation: 0,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      ),
+      popupMenuTheme: PopupMenuThemeData(
+        color: menuSurface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      ),
+    );
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // Наблюдатель ОС-яркости: в режиме «система» тема идёт за темой телефона.
+    WidgetsBinding.instance.addObserver(this);
+    _init();
+    // Шаги старта, открывающие системные окна, ждут первого кадра — раньше
+    // сцены нет и окно показать некому.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_initDeferredStartup());
+    });
+    // Отслеживаем жизненный цикл приложения для обновления статуса присутствия
+    _lifecycleListener = AppLifecycleListener(
+      onResume: () {
+        // Онлайн-презенс ведёт PresenceService (lifecycle-aware).
+        MascotInactivityNotificationService.instance.markAppOpened();
+      },
+      onPause: () {
+        MascotInactivityNotificationService.instance
+            .scheduleReminderAfterOneDay();
+      },
+      onDetach: () {
+        MascotInactivityNotificationService.instance
+            .scheduleReminderAfterOneDay();
+      },
+      onHide: () {
+        MascotInactivityNotificationService.instance
+            .scheduleReminderAfterOneDay();
+      },
+    );
+  }
+
+  @override
+  void didChangePlatformBrightness() {
+    // Сменилась тема ОС — в режиме «система» пересобираем свою.
+    if (mounted && _userData.themeMode == AppThemeMode.system) {
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _lifecycleListener?.dispose();
+    super.dispose();
+  }
+
+  /// Часть старта, которую нельзя делать до первого кадра: согласие на рекламу
+  /// (UMP) и разрешение на уведомления открывают системные окна. Пока сцена не
+  /// живая, iOS такое окно не показывает, а Future остаётся незавершённым — и
+  /// приложение стоит на белом launch-экране, сколько бы его ни перезапускали.
+  /// Ошибки здесь глушим: реклама и напоминания не стоят сорванного запуска.
+  Future<void> _initDeferredStartup() async {
+    // Токен FCM спрашиваем ПЕРВЫМ и не после модальных окон: своих окон он не
+    // показывает, а от его вердикта зависит, поднимать ли фоновый сервис. Пока
+    // он стоял за согласием на рекламу, вердикт ждал человека у диалога, и
+    // сервис успевал стартовать со строкой «Togetherly на связи» в шторке.
+    try {
+      await FcmService.instance.start();
+      // Строка могла остаться с прошлого запуска или от `autoRunOnBoot` после
+      // перезагрузки телефона — гасим, не дожидаясь смены пары.
+      if (FcmService.instance.ready) {
+        unawaited(PushBackgroundService().stop());
+      }
+    } catch (e) {
+      debugPrint('Старт: токен FCM не получен — $e');
+    }
+    if (Platform.isAndroid || Platform.isIOS) {
+      try {
+        await _initConsentAndAds();
+      } catch (e) {
+        debugPrint('Старт: согласие и реклама не поднялись — $e');
+      }
+    }
+    try {
+      await MascotInactivityNotificationService.instance.init();
+      await MascotInactivityNotificationService.instance.markAppOpened();
+    } catch (e) {
+      debugPrint('Старт: напоминание о простое не поднялось — $e');
+    }
+    // Токен устройства для пушей Apple: без него закрытое приложение молчит —
+    // сокет, по которому приходят уведомления, iOS убивает вместе с процессом.
+    // Просить его нужно после разрешения на уведомления, поэтому идём следом.
+    try {
+      await ApnsService.instance.start();
+    } catch (e) {
+      debugPrint('Старт: токен пушей не получен — $e');
+    }
+  }
+
+  Future<void> _checkMinBuild() async {
+    try {
+      // fail-open: нет ответа или ошибка — не блокируем.
+      final minBuild = await PbDataService()
+          .fetchMinSupportedBuild()
+          .timeout(const Duration(seconds: 15), onTimeout: () => 0);
+      if (minBuild <= 0) return;
+      final info = await PackageInfo.fromPlatform();
+      final current = int.tryParse(info.buildNumber) ?? 0;
+      if (current < minBuild && mounted) {
+        setState(() => _forceUpdate = true);
+      }
+    } catch (_) {
+      // Любая ошибка чтения конфига — не блокируем пользователя.
+    }
+  }
+
+  Future<void> _init() async {
+    // Последняя страховка от «бесконечной загрузки»: что бы ни повисло внутри —
+    // сеть, чтение профиля, серверный конфиг, — заставка уходит через десять
+    // секунд, и человек попадает в приложение с локальными данными. Жалобы
+    // «бесконечная загрузка» приходили именно про этот экран, а перезапуск от
+    // него не спасал.
+    Timer(const Duration(seconds: 10), () {
+      if (mounted && _loading) {
+        debugPrint('Старт: заставка снята по страховке, инициализация затянулась');
+        setState(() => _loading = false);
+      }
+    });
+    try {
+      // Force-update kill-switch: если сборка ниже min_build из PocketBase
+      // (`app_config`) — покажем блокирующий ForceUpdateScreen. Только Android
+      // (на iOS обновления гонит App Store). Проверка идёт в фоне: заставка
+      // сеть не ждёт, а запрет, если он есть, встанет, как только придёт ответ.
+      if (Platform.isAndroid) unawaited(_checkMinBuild());
+      // Флаг облачка-гида нужен уже приветствию: поднимаем сохранённый и
+      // перечитываем конфиг в фоне. На Android его читает проверка сборки.
+      // Ждём: это чтение настроек, а приветствие без флага выбрало бы старые
+      // сцены. Пока висит заставка, облачко приветствия уже разжимается.
+      await MascotGuideService.instance.restore();
+      if (MascotGuideService.instance.on) {
+        warmCatalogArt(const ['guide_welcome', 'guide_album', 'guide_moods'], side: kWelcomeGuideSide);
+        // Регистрация следом: облачко пола и пароля размером около 120 точек.
+        warmCatalogArt(const ['guide_look_down', 'guide_girl', 'guide_boy', 'guide_nopeek'], side: 120);
+      }
+      if (!Platform.isAndroid) unawaited(PbDataService().fetchMinSupportedBuild());
+
+      // Запоминаем, была ли сессия активна ДО loadFromPrefs: внутри него
+      // серверная синхронизация коинов/тем выполняется только при уже
+      // активной сессии (isLoggedIn). При тихом входе сессия поднимается
+      // ниже — поэтому при wasLoggedIn == false синк надо повторить вручную.
+      final wasLoggedIn = PocketBaseService().isLoggedIn;
+
+      // Загружаем локальный профиль из SharedPreferences.
+      await _userData.loadFromPrefs();
+
+      // Тихий вход в PocketBase уже выполнен в main() до runApp
+      // (PbAuthService().signInSilently). Firebase-сессия на cutover не нужна.
+
+      // Сессию подняли только что (loadFromPrefs синк пропустил, т.к. на тот
+      // момент мы не были залогинены) → подтягиваем авторитетный баланс/темы
+      // с сервера. Без этого весь сеанс показывались бы устаревшие локальные
+      // значения, а серверные начисления (реклама, ежедневный вход, покупки)
+      // молча применялись бы поверх неактуального состояния — отсюда симптомы
+      // «монеты пропадают/возвращаются, награды и покупки не сохраняются».
+      if (!wasLoggedIn &&
+          _userData.isRegistered &&
+          PocketBaseService().isLoggedIn) {
+        // В фоне: локальные данные уже прочитаны, а на медленной связи этот
+        // запрос держал заставку. Свежие значения дорисуются, когда придут.
+        unawaited(_userData.syncFromServer());
+      }
+
+      // Онлайн-презенс ведёт PresenceService (стартует на home-экране).
+
+      // Выдаём иконки-награды спонсорам и помощникам.
+      // grantSpecialBadge только ДОБАВЛЯЕТ иконку в доступные и закрепляет её
+      // лишь если у пользователя ещё нет выбранной иконки — поэтому свободный
+      // выбор иконки пользователем больше не перезатирается при каждом запуске.
+      const sponsorEmails = {
+        'badzoff@gmail.com',
+        'alena.petukhova1@gmail.com',
+        'romanhilp22@gmail.com',
+        'nakotumari@gmail.com',
+        'lrt56k@mail.ru',
+      };
+      const helperEmails = {'ashatilov2008@gmail.com'};
+      // Рыбка — награда для любителей рыбалки. Отдельная категория, поэтому
+      // выдаётся независимо (не через else if): её можно совмещать со Sponsor/Helper.
+      const fishEmails = {
+        'vazzxxcc123@gmail.com',
+        'glp010409@gmail.com',
+        'milkalove12let@gmail.com',
+      };
+      if (sponsorEmails.contains(_userData.email)) {
+        final granted = await _userData.grantSpecialBadge('Sponsor');
+        if (granted) {
+          await PbPushService().showLocal(
+            id: 8801,
+            title: '🎉 Вам вручён значок «Спонсор»!',
+            body:
+                'Спасибо за поддержку — теперь рядом с вашим именем '
+                'красуется особый бейдж 💖',
+          );
+        }
+      } else if (helperEmails.contains(_userData.email)) {
+        final granted = await _userData.grantSpecialBadge('Helper');
+        if (granted) {
+          await PbPushService().showLocal(
+            id: 8802,
+            title: '🎉 Вам вручён значок «Помощник»!',
+            body: 'Спасибо за помощь проекту — особый бейдж теперь ваш 💖',
+          );
+        }
+      }
+      if (fishEmails.contains(_userData.email)) {
+        final granted = await _userData.grantSpecialBadge('Fish');
+        if (granted) {
+          await PbPushService().showLocal(
+            id: 8803,
+            title: '🎣 Вам вручён значок «Рыбка»!',
+            body: 'Особый бейдж для любителей рыбалки теперь ваш 💖',
+          );
+        }
+      }
+    } catch (_) {
+      // Даже при ошибке убираем спиннер
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      // Слушаем язык И профиль: смена темы (в _userData) пересобирает ThemeData,
+      // поэтому единый стиль меню сразу подхватывает новый акцент.
+      listenable: Listenable.merge([LocaleService.instance, _userData]),
+      builder: (context, _) => MaterialApp(
+        title: 'Togetherly',
+        debugShowCheckedModeBanner: false,
+        navigatorKey: LoveApp.rootNavigatorKey,
+        theme: _themeFor(_userData.theme),
+        // Локаль задаём сами, а не отдаём системе: язык интерфейса — выбор
+        // человека в настройках, и системные диалоги обязаны идти за ним.
+        locale: LocaleService.instance.language.locale,
+        supportedLocales: LocaleService.supportedLocales,
+        localizationsDelegates: const [
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+        navigatorObservers: [AnalyticsService.instance.observer, HintCalm.instance.observer],
+        // Глобальная плашка «офлайн / ожидает синхронизации» поверх любого экрана.
+        builder: (context, child) => LaunchSplashOverlay(
+          child: ThemeScope(
+            theme: _userData.theme,
+            child: OfflineSyncBanner(child: child ?? const SizedBox.shrink()),
+          ),
+        ),
+        home: _loading
+            ? const Scaffold(body: M3PageLoading(color: Color(0xFFFF7E8B)))
+            : _buildInitialScreen(),
+      ),
+    );
+  }
+
+  Widget _buildInitialScreen() {
+    // 0. Обязательное обновление — блокирующий экран поверх всего.
+    if (_forceUpdate) {
+      return const ForceUpdateScreen();
+    }
+    // 1. Первый запуск — показываем welcome
+    if (!_userData.hasSeenWelcome) {
+      return WelcomeScreen(userData: _userData);
+    }
+    // 2. Профиль есть локально.
+    if (_userData.isRegistered) {
+      // PB-сессия восстановлена в main()/_init() через signInSilently().
+      // Если она НЕвалидна (токен протух за 5 дней, потерян, или не долетел до
+      // клиента при OAuth-входе) — Home показывать НЕЛЬЗЯ: он будет молча
+      // сломан (groups GET → 404 по viewRule, coins → 401, таймер 00:00, синка
+      // с партнёром нет — всё уходит с пустым auth-токеном). Тихого
+      // восстановления нет (OAuth требует участия пользователя), поэтому мягко
+      // ведём на перелогин. LoginScreen.register(isReturningUser: true) НЕ
+      // стирает локальный профиль/группу/таймеры — после входа возвращает на
+      // Home уже с валидной сессией, и синк сразу оживает.
+      //
+      // Офлайн не страдает: isLoggedIn = локальная проверка exp JWT, поэтому при
+      // живом (непротухшем) токене без сети остаёмся на Home; на перелогин ведём
+      // только когда токен реально мёртв и Home всё равно работать не будет.
+      if (!PocketBaseService().isLoggedIn) {
+        return LoginScreen(userData: _userData);
+      }
+      return HomeScreen(userData: _userData);
+    }
+    // 3. Профиль не заполнен — на экран входа
+    return WelcomeScreen(userData: _userData);
+  }
+}

@@ -1,0 +1,300 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+
+import '../models/pb_media_ref.dart';
+import '../models/upload_failure.dart';
+import '../models/upload_timeout.dart';
+import 'package:pocketbase/pocketbase.dart';
+import 'package:sentry_flutter/sentry_flutter.dart';
+
+import 'pocketbase_service.dart';
+
+/// Медиа-слой PocketBase (миграция Firebase→PB, Этап 6).
+///
+/// Заменяет Firebase Storage. В PB файлы крепятся к записям через file-поле —
+/// один блоб = одна запись коллекции `media`. В текстовые поля сущностей
+/// (photo_url/image_url/music_url/...) кладём ссылку схемы `pb://media/<id>/<file>`,
+/// которая резолвится в `<baseUrl>/api/files/media/<id>/<file>`.
+///
+/// (Схема `pb://` зеркалит прежнюю `sb://` из supabase-слоя — на cutover
+/// резолвер медиа в виджетах распознаёт `pb://` так же, как раньше `sb://`.)
+/// Адрес protected-файла с файловым токеном, либо ничего.
+///
+/// Без токена коллекция `media` отвечает 404 — такая ссылка не откроется
+/// никогда, а телефон повторяет её при каждой перерисовке. Пусто честнее:
+/// экран покажет заглушку и не закэширует отказ.
+String? mediaUrlWithToken({required String base, required String? token}) =>
+    (token == null || token.isEmpty) ? null : '$base?token=$token';
+
+class PbMediaService {
+  PbMediaService._();
+  static final PbMediaService instance = PbMediaService._();
+  factory PbMediaService() => instance;
+
+  PocketBase get _pb => PocketBaseService().pb;
+  static const String _col = 'media';
+  static const String scheme = 'pb://';
+
+  /// Загружает байты как новый media-файл. Возвращает ссылку
+  /// `pb://media/<recordId>/<filename>` или null при ошибке.
+  Future<String?> uploadBytes(
+    List<int> bytes,
+    String filename, {
+    String? uid,
+    String? groupId,
+    String? kind,
+  }) async =>
+      (await uploadBytesWithReason(
+        bytes,
+        filename,
+        uid: uid,
+        groupId: groupId,
+        kind: kind,
+      ))
+          .ref;
+
+  /// То же, что [uploadBytes], но при отказе говорит причину
+  /// ([classifyUploadError]): экрану нужно отличать обрыв сети от истёкшей
+  /// сессии и слишком большого файла.
+  Future<UploadOutcome> uploadBytesWithReason(
+    List<int> bytes,
+    String filename, {
+    String? uid,
+    String? groupId,
+    String? kind,
+  }) async {
+    // Пустой файл сервер примет и положит в бакет нулём байт — такой файл
+    // уже не открыть и не снять с него кадр. Кружки и голосовые идут сюда
+    // мимо MediaService, поэтому проверка стоит здесь.
+    if (bytes.isEmpty) {
+      return const UploadOutcome.failed(UploadFailure.emptyFile);
+    }
+    // Срок ждём по размеру файла, а не одинаковый на всё. Жёсткие шестьдесят
+    // секунд обрывали 155 заливок за тридцать дней, и 93 из них были картинки
+    // холста: заливка ведром кладёт пятно целой картинкой, а мегабайты по
+    // мобильной сети в минуту не укладываются.
+    final limit = uploadTimeoutFor(bytes.length);
+    Object? lastError;
+    // Две попытки: обрыв и молчание сети со второй обычно проходят, а отказ по
+    // сути (протухшая сессия, запрет, слишком большой файл) повторять незачем —
+    // это решает `uploadWorthRetry`.
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        final body = <String, dynamic>{};
+        if (uid != null) body['uid'] = uid;
+        if (groupId != null) body['group_id'] = groupId;
+        if (kind != null) body['kind'] = kind;
+        final rec = await _pb
+            .collection(_col)
+            .create(
+              body: body,
+              files: [
+                http.MultipartFile.fromBytes('file', bytes, filename: filename),
+              ],
+            )
+            .timeout(limit);
+        // PB мог переименовать файл (суффикс против коллизий) → берём фактическое.
+        final stored = (rec.data['file'] ?? filename).toString();
+        return UploadOutcome.ok('$scheme$_col/${rec.id}/$stored');
+      } catch (e) {
+        lastError = e;
+        final code = e is ClientException ? e.statusCode : null;
+        final answer = e is ClientException ? e.response : null;
+        if (attempt == 2 || !uploadWorthRetry(code, response: answer)) break;
+        debugPrint('PbMedia.uploadBytes: попытка $attempt не прошла ($e) — повтор');
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+    }
+    final e = lastError!;
+    debugPrint('PbMedia.uploadBytes failed: $e');
+    // Диагностика «не удалось загрузить фото/видео»: реальную причину (403 ACL,
+    // 401 протухшая сессия, сеть, валидация) глотал только debugPrint и она не
+    // была видна в проде. Кидаем в Bugsink с контекстом — статус-код у
+    // ClientException укажет точную причину сбоя загрузки воспоминания.
+    final statusCode = e is ClientException ? e.statusCode : null;
+    final response = e is ClientException ? e.response.toString() : null;
+    final loggedIn = PocketBaseService().isLoggedIn;
+    final failure = classifyUploadError(e, loggedIn: loggedIn);
+    // Обрыв сети и протухшая сессия — не баги: первое лечит повтор, второе
+    // вход. Их в панель не шлём, чтобы не топить настоящие отказы.
+    if (!uploadErrorWorthReporting(e)) return UploadOutcome.failed(failure);
+    unawaited(Sentry.captureException(e, withScope: (s) {
+      s.level = SentryLevel.warning;
+      s.setExtra('reason', 'PbMedia.uploadBytes failed');
+      s.setExtra('kind', kind ?? '(none)');
+      // Размер и срок: по ним видно, упёрлись мы в потолок или сеть молчала.
+      s.setExtra('bytes', bytes.length.toString());
+      s.setExtra('timeoutSeconds', limit.inSeconds.toString());
+      s.setExtra('hasUid', (uid != null && uid.isNotEmpty).toString());
+      s.setExtra('hasGroupId', (groupId != null && groupId.isNotEmpty).toString());
+      s.setExtra('loggedIn', loggedIn.toString());
+      s.setExtra('filename', filename);
+      s.setExtra('failure', failure.name);
+      if (statusCode != null) s.setExtra('statusCode', statusCode.toString());
+      if (response != null) s.setExtra('pbResponse', response);
+    }));
+    return UploadOutcome.failed(failure);
+  }
+
+  /// Загружает локальный файл по пути. Читает байты, имя — из пути. Возвращает
+  /// `pb://`-ссылку или null. Удобная обёртка над [uploadBytes] для call-site'ов,
+  /// которые раньше звали `FirebaseService.uploadFile(path, dest)`.
+  Future<String?> uploadFile(
+    String localPath, {
+    String? uid,
+    String? groupId,
+    String? kind,
+  }) async {
+    try {
+      final file = File(localPath);
+      if (!await file.exists()) {
+        debugPrint('PbMedia.uploadFile: файла нет: $localPath');
+        return null;
+      }
+      final bytes = await file.readAsBytes();
+      final filename = localPath.split(Platform.pathSeparator).last;
+      return await uploadBytes(bytes, filename, uid: uid, groupId: groupId, kind: kind);
+    } catch (e) {
+      debugPrint('PbMedia.uploadFile($localPath) failed: $e');
+      return null;
+    }
+  }
+
+  /// `true`, если ссылка — наша PB-схема.
+  bool isPbRef(String? url) => url != null && url.startsWith(scheme);
+
+  /// Ссылка в виде `pb://…`, даже если пришла готовым адресом файла.
+  ///
+  /// В записях с давних пор лежат абсолютные `https://togetherly.day/api/files/
+  /// media/…`, а файлы `media` защищённые: без токена сервер отвечает 404, и
+  /// картинка не открывалась вовсе (152 таких запроса за две недели). Приводим
+  /// такие адреса обратно к схеме — дальше работает общий путь с токеном.
+  String normalizeRef(String url) => pbRefFromUrl(url) ?? url;
+
+  /// Нужен ли этой ссылке файловый токен.
+  bool needsFileToken(String? url) =>
+      isPbRef(url) || (url != null && pbRefFromUrl(url) != null);
+
+  /// Готовая к скачиванию/воспроизведению ссылка: `pb://` → authed HTTPS,
+  /// остальное (http/локальные) — как есть. Заменяет прежний
+  /// FirebaseService.resolveMediaUrl. Легаси `gs://`/`sb://` НЕ резолвятся
+  /// (Firebase убран) — вернутся как есть и просто не загрузятся.
+  Future<String> resolvePlayable(String url) async {
+    if (isPbRef(url)) return (await resolveUrlAuthed(url)) ?? url;
+    return url;
+  }
+
+  /// Резолвит `pb://media/<id>/<file>` → HTTPS-URL PB БЕЗ токена. Не-pb ссылки
+  /// возвращает как есть. Файлы media теперь `protected` → этот «голый» URL без
+  /// токена отдаст 403; используется как стабильный cacheKey и для разбора id.
+  /// Для РЕАЛЬНОЙ загрузки/показа бери [resolveUrlAuthed].
+  String? resolveUrl(String? ref) {
+    if (ref == null || ref.isEmpty) return ref;
+    if (!isPbRef(ref)) return ref;
+    final path = ref.substring(scheme.length); // media/<id>/<file>
+    return '${PocketBaseService.baseUrl}/api/files/$path';
+  }
+
+  // ── file-токен для protected-файлов ────────────────────────────────────────
+  // Один короткоживущий токен открывает ВСЕ файлы, доступные текущему юзеру по
+  // viewRule коллекции. Кэшируем и обновляем раньше истечения; стабильный
+  // cacheKey (pb://-ссылка) в StorageImage не даёт смене токена сбрасывать кэш.
+  String? _fileToken;
+  DateTime? _fileTokenAt;
+  Future<String?>? _tokenInflight;
+  static const Duration _tokenTtl = Duration(seconds: 90);
+
+  /// Сколько ждём сам запрос токена. Зависший вызов не бросает исключение — он
+  /// просто не возвращается, а его future лежит в [_tokenInflight] и раздаётся
+  /// всем, кто просит токен следом: одна заминка останавливает подготовку всех
+  /// картинок виджета разом. На эмуляторе 08.09.2026 запрос отвечал то за
+  /// секунду, то не отвечал вовсе — предел по времени снимает этот риск.
+  static const Duration _tokenTimeout = Duration(seconds: 12);
+
+  Future<String?> _ensureFileToken() {
+    final t = _fileToken, at = _fileTokenAt;
+    if (t != null && at != null && DateTime.now().difference(at) < _tokenTtl) {
+      return Future.value(t);
+    }
+    final inflight = _tokenInflight;
+    if (inflight != null) return inflight;
+    final fut = () async {
+      try {
+        final tok = await _pb.files.getToken().timeout(_tokenTimeout);
+        _fileToken = tok;
+        _fileTokenAt = DateTime.now();
+        return tok;
+      } on ClientException catch (e) {
+        // 401 — устал токен сессии, а не пропал доступ. Без этой ветки телефон
+        // до перезапуска отдавал ссылки без файлового токена, и не грузилось
+        // НИ ОДНО фото сразу: 203 отказа в токене за трое суток обернулись
+        // одиннадцатью тысячами заведомо мёртвых запросов к файлам.
+        if (e.statusCode != 401) {
+          debugPrint('PbMedia.getToken failed: $e');
+          return _fileToken;
+        }
+        try {
+          await _pb
+              .collection('users')
+              .authRefresh()
+              .timeout(const Duration(seconds: 8));
+          final tok = await _pb.files.getToken().timeout(_tokenTimeout);
+          _fileToken = tok;
+          _fileTokenAt = DateTime.now();
+          return tok;
+        } catch (e2) {
+          debugPrint('PbMedia.getToken after refresh failed: $e2');
+          return _fileToken; // прошлый токен может быть ещё валиден
+        }
+      } catch (e) {
+        debugPrint('PbMedia.getToken failed: $e');
+        return _fileToken; // прошлый токен может быть ещё валиден
+      } finally {
+        _tokenInflight = null;
+      }
+    }();
+    _tokenInflight = fut;
+    return fut;
+  }
+
+  /// Резолвит `pb://` → HTTPS С `?token=` (доступ к protected-файлу). Не-pb
+  /// ссылки — как есть. ВСЕ in-app загрузки/показ медиа идут через него.
+  Future<String?> resolveUrlAuthed(String? ref) async {
+    if (ref == null || ref.isEmpty) return ref;
+    // Готовый адрес защищённого файла сперва возвращаем к схеме: иначе он
+    // уходит в сеть без токена и получает 404.
+    final normalized = normalizeRef(ref);
+    if (!isPbRef(normalized)) return ref;
+    final base = resolveUrl(normalized);
+    if (base == null) return ref;
+    final tok = await _ensureFileToken();
+    return mediaUrlWithToken(base: base, token: tok);
+  }
+
+  /// Сброс кэша токена (на выходе/смене пользователя).
+  void clearFileToken() {
+    _fileToken = null;
+    _fileTokenAt = null;
+  }
+
+  /// Удаляет media-запись по `pb://`-ссылке (или по recordId).
+  Future<bool> delete(String refOrId) async {
+    try {
+      String id = refOrId;
+      if (isPbRef(refOrId)) {
+        final parts = refOrId.substring(scheme.length).split('/');
+        if (parts.length >= 2) id = parts[1]; // media/<id>/<file>
+      }
+      if (id.isEmpty) return false;
+      await _pb.collection(_col).delete(id);
+      return true;
+    } catch (e) {
+      if (e is ClientException && e.statusCode == 404) return true;
+      debugPrint('PbMedia.delete($refOrId) failed: $e');
+      return false;
+    }
+  }
+}

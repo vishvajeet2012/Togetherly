@@ -1,0 +1,387 @@
+import 'package:flutter/foundation.dart';
+import 'dart:io';
+
+import 'package:http/http.dart' as http;
+import 'package:pocketbase/pocketbase.dart';
+import 'package:video_compress/video_compress.dart';
+
+import '../utils/video_link_thumb.dart';
+import 'pocketbase_service.dart';
+import 'pb_realtime_service.dart';
+
+/// Своё видео пары: либо загруженное во вкладке «Смотрим», либо ролик из
+/// ленты воспоминаний.
+class WatchVideo {
+  final String id;
+  final String title;
+  final String url;
+
+  /// Обложка ролика (кадр из видео). Пусто → плитка покажет play на фоне.
+  final String thumbUrl;
+  final int seconds;
+
+  /// true — файл лежит в защищённом хранилище воспоминаний: приложение его
+  /// откроет, а партнёр в браузере нет, там нет сессии.
+  final bool appOnly;
+
+  /// Ролик залит во вкладке «Смотрим» — такой можно убрать. Видео из ленты
+  /// воспоминаний удаляется в самой ленте, вместе с записью.
+  final bool uploaded;
+
+  const WatchVideo({
+    required this.id,
+    required this.title,
+    required this.url,
+    required this.seconds,
+    this.thumbUrl = '',
+    this.appOnly = false,
+    this.uploaded = false,
+  });
+}
+
+/// Свои видео: пара загружает ролик в приложение и смотрит его вместе.
+///
+/// Файл лежит у нас, поэтому обоим он отдаётся обычной прямой ссылкой — это
+/// самая точная синхронизация из возможных, секунда в секунду. Ссылка работает
+/// без сессии: комнату на сайте открывает анонимный гость.
+class WatchVideosService {
+  WatchVideosService._();
+
+  static const String _col = 'watch_videos';
+
+  /// Потолок для бесплатной версии. Ограничение стоит и в базе.
+  static const int maxBytes = 100 * 1024 * 1024;
+
+  /// Потолок с Togetherly+. Больше базы не просим: сервер отвергнет.
+  static const int maxBytesPlus = 300 * 1024 * 1024;
+
+  /// Сколько живёт ролик совместного просмотра.
+  ///
+  /// Его заливают, чтобы посмотреть вдвоём в этот вечер, а не хранить. Раньше
+  /// такие файлы лежали вечно и молча занимали диск, за который платят каждый
+  /// месяц.
+  static const Duration lifetime = Duration(days: 30);
+
+  /// Действующий потолок с учётом покупки.
+  static int limitFor({required bool plus}) => plus ? maxBytesPlus : maxBytes;
+
+  /// Форматы, которые играют у обоих. Комната пары показывает ролик обычным
+  /// плеером браузера — а он берёт только эти контейнеры (см. `parseSource`
+  /// в `pb_public/watch/room/room.js`). MKV или AVI загрузятся, но у партнёра
+  /// останется пустой кадр, поэтому отсекаем их до загрузки.
+  static const List<String> playableExtensions = [
+    'mp4',
+    'm4v',
+    'mov',
+    'webm',
+    'ogv',
+    'ogg',
+  ];
+
+  /// Площадки, которые страница комнаты открывает своим плеером
+  /// (зеркало `parseSource` в `pb_public/watch/room/room.js`).
+  static const List<String> _roomHosts = [
+    'youtu.be',
+    'youtube.com',
+    'vimeo.com',
+    'vk.com',
+    'vkvideo.ru',
+    'rutube.ru',
+    'disk.yandex.ru',
+    'disk.yandex.com',
+    'yadi.sk',
+    'dropbox.com',
+    'mega.nz',
+    'mega.io',
+    'drive.google.com',
+  ];
+
+  /// Откроет ли ссылку вкладка комнаты. Там анонимный гость: ни нашей сессии,
+  /// ни файлового токена у него нет.
+  ///
+  /// Заведено по жалобе «воспоминание-видео не прогружается»: приложение
+  /// отдавало комнате ссылку на защищённый файл воспоминания, страница честно
+  /// вставляла её в плеер, и оба смотрели на вечный спиннер. Признаком
+  /// «своего» файла был один префикс `pb://`, а у записей после миграции и у
+  /// свежих загрузок ссылка обычная — https на `/api/files/media/...`.
+  static bool playsInRoom(String url) {
+    final raw = url.trim();
+    if (raw.isEmpty) return false;
+    final lower = raw.toLowerCase();
+
+    // Свои схемы и локальные файлы: комнате их не передать.
+    if (lower.startsWith('pb://') ||
+        lower.startsWith('sb://') ||
+        lower.startsWith('gs://') ||
+        lower.startsWith('localfile://') ||
+        lower.startsWith('file://') ||
+        lower.startsWith('content://')) {
+      return false;
+    }
+
+    final uri = Uri.tryParse(raw);
+    if (uri == null || !uri.hasScheme || !uri.hasAuthority) return false;
+    if (uri.scheme != 'http' && uri.scheme != 'https') return false;
+
+    final host = uri.host.toLowerCase().replaceFirst(RegExp(r'^www\.'), '');
+
+    // Хранилища прошлых лет: Firebase на Spark и Supabase у нас выключены, их
+    // ссылки не открываются нигде — играть такое можно только своим плеером,
+    // у которого остаётся кэш.
+    if (host.endsWith('firebasestorage.googleapis.com') ||
+        host.endsWith('supabase.co') ||
+        host.endsWith('supabase.in')) {
+      return false;
+    }
+
+    // Файлы PocketBase: `watch_videos` лежат открыто (`protected: false`),
+    // всё остальное — только с токеном, живущим полторы минуты.
+    if (uri.path.contains('/api/files/')) {
+      return uri.path.contains('/api/files/watch_videos/');
+    }
+
+    for (final known in _roomHosts) {
+      if (host == known || host.endsWith('.$known')) return true;
+    }
+
+    return isPlayable(uri.path);
+  }
+
+  /// Проиграется ли файл с таким именем у обоих.
+  static bool isPlayable(String fileName) {
+    final dot = fileName.lastIndexOf('.');
+    if (dot < 0 || dot == fileName.length - 1) return false;
+    return playableExtensions.contains(
+      fileName.substring(dot + 1).toLowerCase(),
+    );
+  }
+
+  /// Убирает ролики старше [lifetime]. Зовётся при открытии раздела: отдельного
+  /// планировщика ради уборки заводить незачем.
+  static Future<void> purgeExpired(String groupId) async {
+    if (groupId.isEmpty) return;
+    try {
+      final edge = DateTime.now().toUtc().subtract(lifetime);
+      final list = await _pb
+          .collection(_col)
+          .getFullList(filter: _pb.filter('group_id = {:g}', {'g': groupId}));
+      for (final rec in list) {
+        final created = DateTime.tryParse(rec.created)?.toUtc();
+        if (created == null || created.isAfter(edge)) continue;
+        await _pb.collection(_col).delete(rec.id);
+      }
+    } catch (e) {
+      debugPrint('WatchVideos.purgeExpired failed: $e');
+    }
+  }
+
+  static PocketBase get _pb => PocketBaseService.instance.pb;
+
+  static String _fileUrl(RecordModel r) {
+    final file = (r.data['file'] ?? '').toString();
+    if (file.isEmpty) return '';
+    return '${PocketBaseService.baseUrl}/api/files/$_col/${r.id}/$file';
+  }
+
+  static String _thumbUrl(RecordModel r) {
+    final file = (r.data['thumb'] ?? '').toString();
+    if (file.isEmpty) return '';
+    return '${PocketBaseService.baseUrl}/api/files/$_col/${r.id}/$file';
+  }
+
+  static WatchVideo _fromRecord(RecordModel r) => WatchVideo(
+    id: r.id,
+    title: (r.data['title'] ?? '').toString(),
+    url: _fileUrl(r),
+    thumbUrl: _thumbUrl(r),
+    seconds: ((r.data['seconds'] ?? 0) as num).round(),
+    uploaded: true,
+  );
+
+  /// Все ролики пары: сначала загруженные во вкладке «Смотрим», затем видео из
+  /// ленты воспоминаний — иначе люди не понимают, куда делись их записи.
+  static Future<List<WatchVideo>> list(String groupId) async {
+    if (groupId.isEmpty) return const [];
+    final own = await uploaded(groupId);
+    final lane = await fromMemoryLane(groupId);
+    return [...own, ...lane];
+  }
+
+  /// Живой список своих роликов пары.
+  ///
+  /// Коллекция ходит в канале `pair:<groupId>` с 17.08.2026 (запись в
+  /// `rtCollections` сборки PocketBase), поэтому ролик партнёра появляется на
+  /// открытом экране сам. Видео из ленты воспоминаний сюда не входят: они
+  /// подтягиваются отдельным чтением и меняются несопоставимо реже.
+  static Stream<List<WatchVideo>> streamUploaded(String groupId) {
+    if (groupId.isEmpty) return const Stream.empty();
+    return PbRealtimeService()
+        .watchWatchVideos(groupId)
+        .map((list) => list.map(_fromRecord).toList());
+  }
+
+  /// Свои залитые ролики одним чтением: запасной путь, когда живая подписка
+  /// оборвалась (перезапуск PocketBase рвёт сокеты у всех разом).
+  static Future<List<WatchVideo>> uploaded(String groupId) async {
+    try {
+      final res = await _pb
+          .collection(_col)
+          .getList(
+            page: 1,
+            perPage: 30,
+            filter: 'group_id = "$groupId"',
+            sort: '-updated',
+          );
+      return res.items.map(_fromRecord).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Видео-воспоминания. Ссылка на файл в них своя (`pb://media/...`), фильтра
+  /// по вложенному json в PocketBase нет, поэтому отбираем на клиенте.
+  static Future<List<WatchVideo>> fromMemoryLane(String groupId) async {
+    try {
+      final res = await _pb
+          .collection('memories')
+          .getList(
+            page: 1,
+            perPage: 60,
+            filter: 'group_id = "$groupId"',
+            // Дата воспоминания лежит в created_at: автополя created у этой
+            // коллекции нет, и сортировка по нему отдавала 400 на каждый заход
+            // в комнату — видео-воспоминания не показывались ни разу.
+            sort: '-created_at',
+          );
+      final out = <WatchVideo>[];
+      for (final r in res.items) {
+        final raw = r.data['data'];
+        if (raw is! Map) continue;
+        final v = fromMemoryData(r.id, raw);
+        if (v != null) out.add(v);
+      }
+      return out;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Плитка «Наших видео» из данных воспоминания; без ролика — null.
+  ///
+  /// Обложка: своя, а без неё — кадр площадки по ссылке ([videoLinkThumb]).
+  /// У ссылок своя почти никогда не сохраняется, и раньше такие плитки
+  /// стояли серыми. Подпись: название, иначе подпись к воспоминанию.
+  static WatchVideo? fromMemoryData(String id, Map raw) {
+    final url = (raw['videoUrl'] ?? '').toString();
+    if (url.isEmpty) return null;
+    String pick(List<String> keys) {
+      for (final k in keys) {
+        final s = (raw[k] ?? '').toString().trim();
+        if (s.isNotEmpty) return s;
+      }
+      return '';
+    }
+
+    final own = pick(const ['imageUrl', 'thumbnailUrl']);
+    return WatchVideo(
+      id: id,
+      title: pick(const ['title', 'caption', 'text']),
+      url: url,
+      thumbUrl: own.isNotEmpty ? own : videoLinkThumb(url),
+      seconds: 0,
+      // Не «начинается на pb://», а «откроет ли это вкладка комнаты»:
+      // защищённый файл по обычному https туда уезжал и висел спиннером.
+      appOnly: !playsInRoom(url),
+    );
+  }
+
+  /// Загружает ролик. Возвращает запись или null, если файл слишком большой
+  /// либо сервер отказал. [plus] поднимает потолок до [maxBytesPlus] — тот же,
+  /// что стоит в коллекции.
+  static Future<WatchVideo?> upload({
+    required String groupId,
+    required File file,
+    required String title,
+    bool plus = false,
+  }) async {
+    if (groupId.isEmpty) return null;
+    final size = await file.length();
+    if (size > limitFor(plus: plus)) return null;
+
+    try {
+      final bytes = await file.readAsBytes();
+
+      final files = <http.MultipartFile>[
+        http.MultipartFile.fromBytes('file', bytes, filename: title),
+      ];
+
+      // Длительность для подписи на плитке. Не вышло — плитка обойдётся без
+      // неё, загрузку из-за этого не роняем.
+      int seconds = 0;
+      try {
+        final info = await VideoCompress.getMediaInfo(
+          file.path,
+        ).timeout(const Duration(seconds: 20));
+        seconds = ((info.duration ?? 0) / 1000).round();
+      } catch (e) {
+        debugPrint('WatchVideos.upload: длительность не прочиталась: $e');
+      }
+
+      // Обложка для карусели — первый информативный кадр. Таймаут обязателен:
+      // getByteThumbnail на части кодеков виснет. При неудаче грузим без
+      // превью (плитка покажет play на тональном фоне) — загрузку не рушим.
+      try {
+        final thumbBytes = await VideoCompress.getByteThumbnail(
+          file.path,
+          quality: 80,
+          position: -1,
+        ).timeout(const Duration(seconds: 30), onTimeout: () => null);
+        if (thumbBytes != null && thumbBytes.isNotEmpty) {
+          files.add(
+            http.MultipartFile.fromBytes(
+              'thumb',
+              thumbBytes,
+              filename: 'thumb.jpg',
+            ),
+          );
+        }
+      } catch (_) {
+        // Превью не обязательно — продолжаем без него.
+      }
+
+      final rec = await _pb
+          .collection(_col)
+          .create(
+            body: {
+              'group_id': groupId,
+              'title': title,
+              'seconds': seconds,
+              'added_by': PocketBaseService().userId ?? '',
+            },
+            files: files,
+          )
+          // Сто мегабайт по мобильной сети идут долго: минутного таймаута,
+          // как у фотографий, тут не хватает.
+          .timeout(const Duration(minutes: 10));
+      return _fromRecord(rec);
+    } catch (e) {
+      // Отказ сервера виден только здесь: экран покажет общую ошибку, а причину
+      // (потолок размера, правила коллекции) без этой строки не найти.
+      debugPrint('WatchVideos.upload failed: $e');
+      return null;
+    }
+  }
+
+  /// Убирает свой ролик. Отвечает, получилось ли: экран показывает отказ, а не
+  /// делает вид, что ролик исчез.
+  static Future<bool> remove(String id) async {
+    if (id.isEmpty) return false;
+    try {
+      await _pb.collection(_col).delete(id);
+      return true;
+    } catch (e) {
+      debugPrint('WatchVideos.remove failed: $e');
+      return false;
+    }
+  }
+}

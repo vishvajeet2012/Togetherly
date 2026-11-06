@@ -1,0 +1,248 @@
+import 'dart:convert';
+
+import 'gift.dart';
+import 'sound_clip.dart';
+
+/// Сколько раз партнёру дарили один и тот же подарок.
+class GiftTally {
+  const GiftTally(this.gift, this.count);
+
+  final Gift gift;
+  final int count;
+
+  String get key => gift.key;
+}
+
+/// Полка подарков: одинаковые сложены вместе, частые — впереди.
+///
+/// [records] — записи коллекции `gifts` как есть, с полем `gift_key`.
+/// Подарок, которого нет в каталоге (запись от новой версии приложения),
+/// пропускается: показать его всё равно нечем.
+List<GiftTally> tallyGifts(List<Map<String, dynamic>> records) {
+  final counts = <String, int>{};
+  for (final r in records) {
+    final key = (r['gift_key'] ?? '').toString();
+    if (key.isEmpty || GiftCatalog.byKey(key) == null) continue;
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  final out = counts.entries
+      .map((e) => GiftTally(GiftCatalog.byKey(e.key)!, e.value))
+      .toList();
+  out.sort((a, b) {
+    final byCount = b.count.compareTo(a.count);
+    // при равенстве — порядок каталога, чтобы полка не прыгала между заходами
+    return byCount != 0 ? byCount : _catalogIndex(a.key) - _catalogIndex(b.key);
+  });
+  return out;
+}
+
+int _catalogIndex(String key) =>
+    GiftCatalog.all.indexWhere((g) => g.key == key);
+
+/// Полученный подарок со всем, что к нему прилагалось.
+///
+/// Записка, ответ, место и дата встречи живут в самой записи `gifts` и
+/// хранятся вечно, но до 1 августа их показывал только лист получения — один
+/// раз, в момент вручения. Кто закрыл лист не дочитав, письмо терял: в
+/// приложении не было ни одного места, где его можно открыть заново.
+class GiftMemo {
+  const GiftMemo({
+    required this.giftKey,
+    this.sentAt,
+    this.senderUid = '',
+    this.note = '',
+    this.photo = '',
+    this.sound,
+    this.reply = '',
+    this.place = '',
+    this.date,
+    this.state = '',
+  });
+
+  final String giftKey;
+
+  /// Когда подарок отправлен. null у записей с испорченной датой — такие
+  /// встречаются среди мигрированных из Firebase.
+  final DateTime? sentAt;
+
+  final String senderUid;
+
+  /// Что вложил даритель.
+  final String note;
+
+  /// Снимок дарителя, ссылка `pb://media/…`. Пусто, если не прикладывал.
+  final String photo;
+
+  /// Кусок песни или голос дарителя к «Песне». null — без звука.
+  final SoundClip? sound;
+
+  /// Что ответил получатель (желание на звезду, согласие на свидание).
+  final String reply;
+
+  /// Место встречи — у приглашений.
+  final String place;
+
+  /// Дата встречи — у приглашений.
+  final DateTime? date;
+
+  final String state;
+
+  /// Есть ли что перечитать. Подарок без единого слова открывать незачем —
+  /// на полке он и так виден.
+  bool get hasText =>
+      note.isNotEmpty ||
+      photo.isNotEmpty ||
+      sound != null ||
+      reply.isNotEmpty ||
+      place.isNotEmpty ||
+      date != null;
+}
+
+DateTime? _memoDate(Object? raw) {
+  if (raw == null) return null;
+  if (raw is num) {
+    final ms = raw.toInt();
+    if (ms <= 0) return null;
+    return DateTime.fromMillisecondsSinceEpoch(ms);
+  }
+  final s = raw.toString().trim();
+  if (s.isEmpty) return null;
+  final ms = int.tryParse(s);
+  if (ms != null) {
+    return ms <= 0 ? null : DateTime.fromMillisecondsSinceEpoch(ms);
+  }
+  return DateTime.tryParse(s)?.toLocal();
+}
+
+String _memoText(Object? raw) => (raw ?? '').toString().trim();
+
+GiftMemo _memoOf(Map<String, dynamic> r) => GiftMemo(
+      giftKey: (r['gift_key'] ?? '').toString(),
+      sentAt: _memoDate(r['created']),
+      senderUid: _memoText(r['sender_uid']),
+      note: _memoText(r['note']),
+      photo: _memoText(r['photo']),
+      sound: SoundClip.fromGiftRecord(r),
+      reply: _memoText(r['reply']),
+      place: _memoText(r['place']),
+      date: _memoDate(r['date']),
+      state: _memoText(r['state']),
+    );
+
+/// Все полученные подарки одного вида — свежие сверху.
+///
+/// Записи без даты уходят вниз: у мигрированных из Firebase `created` бывает
+/// пустым, и ронять из-за них порядок остальных незачем.
+List<GiftMemo> memosOfKey(List<Map<String, dynamic>> records, String key) {
+  final out = records
+      .where((r) => (r['gift_key'] ?? '').toString() == key)
+      .map(_memoOf)
+      .toList();
+  out.sort((a, b) {
+    final ad = a.sentAt, bd = b.sentAt;
+    if (ad == null && bd == null) return 0;
+    if (ad == null) return 1;
+    if (bd == null) return -1;
+    return bd.compareTo(ad);
+  });
+  return out;
+}
+
+/// Сколько подарков на полке хранят слова — по этому числу профиль решает,
+/// подсказывать ли, что полку можно открыть.
+int countWithText(List<Map<String, dynamic>> records) =>
+    records.map(_memoOf).where((m) => m.hasText).length;
+
+/// «Я скучаю» в разрезе дней недели.
+class WeekStats {
+  const WeekStats(this.byDay);
+
+  /// Семь чисел, начиная с понедельника.
+  final List<int> byDay;
+
+  int get total => byDay.fold(0, (s, v) => s + v);
+
+  bool get isEmpty => total == 0;
+
+  /// День недели с максимумом (1 = понедельник). При равенстве — более ранний.
+  /// null, если истории ещё нет.
+  int? get topDay {
+    if (isEmpty) return null;
+    var best = 0;
+    for (var i = 1; i < byDay.length; i++) {
+      if (byDay[i] > byDay[best]) best = i;
+    }
+    return best + 1;
+  }
+}
+
+/// Разбирает поле `by_weekday` записи `miss_you`: карта «день → количество».
+///
+/// История копится с релиза: у пар, заведённых раньше, поле пустое, и экран
+/// честно показывает, что данных пока нет.
+///
+/// Принимает и строку, и готовую карту. Раньше стояло жёсткое приведение
+/// `as String?` в двух местах, и когда сервер начал отдавать это поле
+/// объектом, оба профиля — свой и партнёра — навсегда зависали на спиннере:
+/// исключение вылетало внутри `setState`, и загрузка не заканчивалась
+/// никогда (разбор 15.08.2026). Поле сервер вернул строкой, но полагаться на
+/// один вид ответа здесь больше нельзя.
+WeekStats parseWeekdays(Object? raw) {
+  final days = List<int>.filled(7, 0);
+  if (raw == null) return WeekStats(days);
+  if (raw is String && raw.trim().isEmpty) return WeekStats(days);
+  try {
+    final decoded = raw is String ? jsonDecode(raw) : raw;
+    if (decoded is Map) {
+      decoded.forEach((k, v) {
+        final day = int.tryParse(k.toString());
+        final count = v is num ? v.toInt() : int.tryParse(v.toString());
+        if (day == null || count == null || day < 1 || day > 7) return;
+        days[day - 1] = count;
+      });
+    }
+  } catch (_) {
+    return WeekStats(List<int>.filled(7, 0));
+  }
+  return WeekStats(days);
+}
+
+/// Кто отправитель подарка с точки зрения того, кто смотрит.
+enum GiftSender {
+  /// Дарил я.
+  me,
+
+  /// Дарил тот, с кем я в паре.
+  counterpart,
+
+  /// Понять нельзя — подписываем обезличенно.
+  unknown,
+
+  /// Выпал из сундука недели: отправитель записи — `chest`.
+  chest,
+}
+
+/// Отправитель подарков из сундука (`chest.pb.js`).
+const String kChestSenderUid = 'chest';
+
+/// Кем подписать подарок на полке.
+///
+/// Жалоба 14 августа 2026: «приложение показывает мой подарок партнёру так,
+/// будто это он мне его отправил». Подпись держалась на сравнении с моим uid, а
+/// он бывает пустым: полумёртвая сессия отдаёт пустую личность, и любой подарок
+/// становился «от партнёра». Полка при этом знает своего владельца — этого
+/// достаточно, чтобы не соврать: на чужой полке отправитель, не совпадающий с
+/// её владельцем, это я.
+GiftSender giftSenderOf({
+  required String senderUid,
+  required String myUid,
+  String shelfOwnerUid = '',
+}) {
+  if (senderUid.isEmpty) return GiftSender.unknown;
+  if (senderUid == kChestSenderUid) return GiftSender.chest;
+  if (myUid.isNotEmpty) {
+    return senderUid == myUid ? GiftSender.me : GiftSender.counterpart;
+  }
+  if (shelfOwnerUid.isEmpty) return GiftSender.unknown;
+  return senderUid == shelfOwnerUid ? GiftSender.unknown : GiftSender.me;
+}

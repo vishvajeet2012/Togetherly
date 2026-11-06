@@ -1,0 +1,804 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../models/chat_drawing.dart';
+import '../models/chat_msg.dart';
+import '../models/shape_note.dart';
+import '../models/voice_note.dart';
+import '../utils/documents_file.dart';
+import 'note_recorder_service.dart';
+import 'voice_recorder_service.dart';
+import 'offline/local_store.dart';
+import 'offline/outbox_service.dart';
+import 'offline/pb_id.dart';
+import 'centrifugo_service.dart';
+import 'media_service.dart';
+import 'pb_data_service.dart';
+import 'pb_realtime_service.dart';
+import 'pocketbase_service.dart';
+
+/// Сервис постоянного текстового чата пары — на PocketBase (миграция §3).
+///
+/// История сообщений и статусы прочтения живут в коллекциях PB `chat_messages`
+/// и `chat_reads` (раньше — RTDB ради нуля Firestore-чтений; на self-hosted PB
+/// чтения бесплатны → вся история live без лимитов/пагинации). «Печатает…» —
+/// эфемерный маркер в `chat_typing` (heartbeat+TTL вместо RTDB onDisconnect).
+/// Пуш партнёру шлёт [PbPushService] по SSE-дельте `chat_messages` (НЕ Firestore-
+/// триггер). Локальные настройки (фон/прокрутка/цвета) — в SharedPreferences.
+class ChatService {
+  ChatService._();
+  static final ChatService instance = ChatService._();
+
+  final PbDataService _data = PbDataService();
+  final PbRealtimeService _rt = PbRealtimeService();
+
+  String get _uid => PocketBaseService().userId ?? '';
+
+  /// Маркер «свежести» typing — печатает, если метка партнёра моложе этого.
+  static const int _typingFreshMs = 8000;
+
+  /// Легаси-членство RTDB для security-rules больше не нужно (PB-правила —
+  /// по группе). No-op, сохранён ради вызова из chat_screen.
+  Future<void> ensureMember(String groupId) async {}
+
+  /// Легаси Supabase-бэкфилл (Supabase откатили). No-op, сохранён ради вызова
+  /// из мёртвого оркестратора firebase_service; уйдёт с §7.
+  Future<int> backfillToSupabase(String groupId) async => 0;
+
+  /// Поток последних сообщений, отсортированных по времени. Ленивый режим:
+  /// начальная выборка лишь новейших [limit] сообщений (а не всей истории —
+  /// для активных пар история в тысячи сообщений вешала первый синк); догрузку
+  /// старых делает экран чата прокруткой вверх (повторная подписка с бо́льшим
+  /// [limit]). Кэш хранит просмотренное; новые сообщения приходят live-дельтой.
+  Stream<List<ChatMsg>> watchMessages(String groupId, {int limit = 100}) {
+    if (groupId.isEmpty) return const Stream.empty();
+    return _rt
+        .watchMessages(groupId, limit: limit)
+        .map((recs) => recs.map(ChatMsg.fromPb).toList());
+  }
+
+  /// Отправить сообщение. [pinId]/[pinTitle] — опционально прикреплённый пин.
+  /// Возвращает true при успехе. false = сообщение НЕ сохранено (экран должен
+  /// вернуть ввод и дать повторить, иначе текст теряется молча).
+  Future<bool> send({
+    required String groupId,
+    required String senderName,
+    required String text,
+    String? pinId,
+    String? pinTitle,
+    String? pinThumb,
+    String? replyToId,
+    String? replyToName,
+    String? replyToText,
+    String? face,
+    int? color,
+    int? textColor,
+    double? faceX,
+    double? faceY,
+    int? deliverAt,
+    int? callMs,
+  }) async {
+    final trimmed = text.trim();
+    if (groupId.isEmpty || _uid.isEmpty || trimmed.isEmpty) return false;
+    final id = newPbId();
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    // 1) оптимистично в кэш (snake_case-колонки, как читает ChatMsg.fromPb)
+    await LocalStore.instance.upsertRaw('chat_messages', id, {
+      'id': id,
+      'group_id': groupId,
+      'user_uid': _uid,
+      'user_name': senderName,
+      'text': trimmed,
+      'ts': ts,
+      'deleted': false,
+      'pin_id': ?pinId,
+      'pin_title': ?pinTitle,
+      'pin_thumb': ?pinThumb,
+      'reply_to_id': ?replyToId,
+      'reply_to_name': ?replyToName,
+      'reply_to_text': ?replyToText,
+      'face': ?face,
+      'color': ?color,
+      'text_color': ?textColor,
+      'face_x': ?faceX,
+      'face_y': ?faceY,
+      'deliver_at': ?deliverAt,
+      'call_ms': ?callMs,
+    });
+    // 2) в очередь (camelCase — как ожидает PbDataService.chatSend)
+    await OutboxService.instance.enqueue('chatUpsert', {
+      'groupId': groupId,
+      'id': id,
+      'msg': {
+        'uid': _uid,
+        'name': senderName,
+        'text': trimmed,
+        'ts': ts,
+        'pinId': pinId,
+        'pinTitle': pinTitle,
+        'pinThumb': pinThumb,
+        'replyToId': replyToId,
+        'replyToName': replyToName,
+        'replyToText': replyToText,
+        'face': face,
+        'color': color,
+        'textColor': textColor,
+        'faceX': faceX,
+        'faceY': faceY,
+        'deliverAt': deliverAt,
+        'callMs': callMs,
+      },
+    });
+    // Пуш партнёру — через PbPushService (SSE на chat_messages при отправке очереди).
+    return true; // оптимистично: сообщение в кэше и очереди
+  }
+
+  /// Отправить рисунок: снимок холста [pngPath] заливается в хранилище, а в
+  /// чат уходит сообщение с пином рисунка (см. `chat_drawing.dart`).
+  ///
+  /// Заливка идёт сразу, а не очередью: без файла на сервере партнёр увидит
+  /// пустую карточку. Не залилось или легло только на телефон
+  /// (`localfile://`) — возвращаем false, и холст скажет «не отправилось».
+  Future<bool> sendDrawing({
+    required String groupId,
+    required String senderName,
+    required String canvasId,
+    required String canvasName,
+    required String pngPath,
+  }) async {
+    if (groupId.isEmpty || _uid.isEmpty) return false;
+    final outcome = await MediaService().uploadFileWithReason(
+      pngPath,
+      'chat_drawings/$groupId/${DateTime.now().millisecondsSinceEpoch}.png',
+    );
+    final ref = outcome.ref;
+    if (ref == null || ref.startsWith('localfile://')) return false;
+    return send(
+      groupId: groupId,
+      senderName: senderName,
+      text: kChatDrawingText,
+      pinId: chatDrawingPinId(canvasId),
+      pinTitle: canvasName,
+      pinThumb: ref,
+    );
+  }
+
+  /// Отправить голосовое. [capture] — то, что вернул [VoiceRecorderService].
+  ///
+  /// Пузырь появляется сразу и играет с диска, а файл уезжает очередью
+  /// (операция `chatVoice`: сперва заливка в `media`, следом само сообщение).
+  /// Файл переносим из временной папки в постоянную: очередь может лежать
+  /// сутками при плохой сети, а временную систему чистит без предупреждения.
+  Future<bool> sendVoice({
+    required String groupId,
+    required String senderName,
+    required VoiceCapture capture,
+    String? replyToId,
+    String? replyToName,
+    String? replyToText,
+  }) async {
+    if (groupId.isEmpty || _uid.isEmpty) return false;
+    if (capture.duration < VoiceRecorderService.minDuration) return false;
+
+    final stored = await _keepFile(capture.path);
+    if (stored == null) return false;
+
+    final id = newPbId();
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    final ms = capture.duration.inMilliseconds;
+
+    await LocalStore.instance.upsertRaw('chat_messages', id, {
+      'id': id,
+      'group_id': groupId,
+      'user_uid': _uid,
+      'user_name': senderName,
+      'text': '',
+      'ts': ts,
+      'deleted': false,
+      'voice_url': stored,
+      'voice_ms': ms,
+      'voice_peaks': capture.peaks,
+      'reply_to_id': ?replyToId,
+      'reply_to_name': ?replyToName,
+      'reply_to_text': ?replyToText,
+    });
+
+    await OutboxService.instance.enqueue('chatVoice', {
+      'groupId': groupId,
+      'id': id,
+      'path': stored,
+      'msg': {
+        'uid': _uid,
+        'name': senderName,
+        'text': '',
+        'ts': ts,
+        'voiceUrl': stored,
+        'voiceMs': ms,
+        'voicePeaks': capture.peaks,
+        'replyToId': replyToId,
+        'replyToName': replyToName,
+        'replyToText': replyToText,
+      },
+    });
+    return true;
+  }
+
+  /// Переносит запись в папку приложения (`files/<dir>`). Возвращает
+  /// новый путь или null, если перенести не вышло.
+  Future<String?> _keepFile(String tempPath, {String dir = 'voice_outbox'}) async {
+    try {
+      final src = File(tempPath);
+      if (!await src.exists()) return null;
+      final base = await getApplicationSupportDirectory();
+      final folder = Directory('${base.path}/$dir');
+      if (!await folder.exists()) await folder.create(recursive: true);
+      final dst = '${folder.path}/${tempPath.split(Platform.pathSeparator).last}';
+      try {
+        final moved = await src.rename(dst);
+        return moved.path;
+      } on FileSystemException {
+        // `rename` не работает ЧЕРЕЗ границу файловых систем: обложка фигурки
+        // рождается во внешнем каталоге (video_compress на /storage/emulated),
+        // а кладём мы её во внутренний — Android отвечает
+        // `Cross-device link, errno = 18`, и сообщение уходило без обложки
+        // (поймано живым прогоном на эмуляторе 11.09.2026). Копируем и
+        // убираем исходник руками.
+        final copied = await src.copy(dst);
+        try {
+          await src.delete();
+        } catch (_) {}
+        return copied.path;
+      }
+    } catch (e) {
+      debugPrint('ChatService._keepFile failed: $e');
+      // Переименование через границу файловых систем падает — копируем.
+      try {
+        final base = await getApplicationSupportDirectory();
+        final folder = Directory('${base.path}/$dir');
+        if (!await folder.exists()) await folder.create(recursive: true);
+        final dst = '${folder.path}/${tempPath.split(Platform.pathSeparator).last}';
+        await File(tempPath).copy(dst);
+        await File(tempPath).delete();
+        return dst;
+      } catch (e2) {
+        debugPrint('ChatService._keepFile copy failed: $e2');
+        return null;
+      }
+    }
+  }
+
+  /// Отправить фигурку — видеосообщение в форме.
+  ///
+  /// Устроена как голосовое и по той же причине: фигурка появляется в ленте
+  /// сразу и играет с диска, а файл уезжает очередью (операция `chatNote`).
+  /// Файлов там два — обложка и само видео, — и обложка идёт первой: она
+  /// весит десятки килобайт, поэтому у партнёра фигурка оживает раньше, чем
+  /// доедет ролик.
+  Future<bool> sendNote({
+    required String groupId,
+    required String senderName,
+    required NoteCapture capture,
+    required String shapeId,
+    String? replyToId,
+    String? replyToName,
+    String? replyToText,
+  }) async {
+    if (groupId.isEmpty || _uid.isEmpty) return false;
+    if (capture.duration < NoteRecorderService.minDuration) return false;
+
+    final stored = await _keepFile(capture.path, dir: 'note_outbox');
+    if (stored == null) return false;
+    final thumb = capture.thumbPath.isEmpty
+        ? ''
+        : (await _keepFile(capture.thumbPath, dir: 'note_outbox') ?? '');
+
+    final id = newPbId();
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    final ms = capture.duration.inMilliseconds;
+
+    await LocalStore.instance.upsertRaw('chat_messages', id, {
+      'id': id,
+      'group_id': groupId,
+      'user_uid': _uid,
+      'user_name': senderName,
+      'text': '',
+      'ts': ts,
+      'deleted': false,
+      'note_url': stored,
+      'note_ms': ms,
+      'note_shape': shapeId,
+      'note_thumb': thumb,
+      'reply_to_id': ?replyToId,
+      'reply_to_name': ?replyToName,
+      'reply_to_text': ?replyToText,
+    });
+
+    await OutboxService.instance.enqueue('chatNote', {
+      'groupId': groupId,
+      'id': id,
+      'path': stored,
+      'thumbPath': thumb,
+      'msg': {
+        'uid': _uid,
+        'name': senderName,
+        'text': '',
+        'ts': ts,
+        'noteUrl': stored,
+        'noteMs': ms,
+        'noteShape': shapeId,
+        'noteThumb': thumb,
+        'replyToId': replyToId,
+        'replyToName': replyToName,
+        'replyToText': replyToText,
+      },
+    });
+    return true;
+  }
+
+  /// Отправить придержанное «к утру» сообщение прямо сейчас. Срок ставим
+  /// «сейчас», а не ноль: сервер выпускает его с `ts = срок`, и с нулём оно
+  /// встало бы в начало переписки. Выпуск — в пределах двадцати секунд.
+  Future<void> sendNow(String messageId) async {
+    if (messageId.isEmpty) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    await LocalStore.instance.patchRecordFields('chat_messages', messageId, {
+      'deliver_at': 0,
+    });
+    await OutboxService.instance.enqueue('chatUpdate', {
+      'id': messageId,
+      'fields': {'deliver_at': now},
+    });
+  }
+
+  /// Отметить чужую фигурку просмотренной. Ставит СМОТРЯЩИЙ и на первом же
+  /// запуске: важно, что дошло до глаз, а не досмотрено ли до конца.
+  Future<void> markNoteSeen(String messageId) async {
+    if (messageId.isEmpty) return;
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    await LocalStore.instance.patchRecordFields('chat_messages', messageId, {
+      'note_seen_at': ts,
+    });
+    await OutboxService.instance.enqueue('chatUpdate', {
+      'id': messageId,
+      'fields': {'note_seen_at': ts},
+    });
+  }
+
+  /// Поставить сердечко на секунде просмотра. Отметки едут целым списком —
+  /// поле текстовое, и слияние двух правок на сервере всё равно невозможно.
+  Future<void> addNoteHeart(String messageId, List<double> seconds) async {
+    if (messageId.isEmpty) return;
+    final packed = ShapeNote.encodeHearts(seconds);
+    await LocalStore.instance.patchRecordFields('chat_messages', messageId, {
+      'note_hearts': packed,
+    });
+    await OutboxService.instance.enqueue('chatUpdate', {
+      'id': messageId,
+      'fields': {'note_hearts': packed},
+    });
+  }
+
+  /// Подпись фигурки в цитате ответа и в уведомлении: текста у неё нет.
+  static String noteQuote(ChatMsg msg, String label) {
+    final n = msg.note;
+    if (n == null) return label;
+    return '$label · ${ShapeNote.formatDuration(n.duration)}';
+  }
+
+  /// Отметить чужое голосовое прослушанным. Идёт через очередь, как и всё
+  /// остальное: отметка не должна теряться при плохой сети и не должна
+  /// заставлять ждать — пузырь гасит точку сразу.
+  Future<void> markVoiceHeard(String messageId) async {
+    if (messageId.isEmpty) return;
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    await LocalStore.instance.patchRecordFields('chat_messages', messageId, {
+      'voice_heard_at': ts,
+    });
+    await OutboxService.instance.enqueue('chatUpdate', {
+      'id': messageId,
+      'fields': {'voice_heard_at': ts},
+    });
+  }
+
+  /// Подпись голосового в цитате ответа и в списке связей: текста у него нет,
+  /// поэтому показываем длительность («Голосовое · 0:14»).
+  static String voiceQuote(ChatMsg msg, String label) {
+    final v = msg.voice;
+    if (v == null) return label;
+    return '$label · ${VoiceNote.formatDuration(v.duration)}';
+  }
+
+  /// Редактировать своё сообщение. null-значения оформления СТИРАЮТ поле:
+  /// face→'' и color/text_color/face_x/face_y→0 (ChatMsg.fromPb коэрсит ''/0 обратно в null),
+  /// чтобы можно было снять лицо/вернуть цвет темы.
+  Future<void> edit({
+    required String groupId,
+    required String messageId,
+    required String newText,
+    String? face,
+    int? color,
+    int? textColor,
+    double? faceX,
+    double? faceY,
+  }) async {
+    final trimmed = newText.trim();
+    if (messageId.isEmpty || trimmed.isEmpty) return;
+    final fields = <String, dynamic>{
+      'text': trimmed,
+      'edited_ts': DateTime.now().millisecondsSinceEpoch,
+      'face': face ?? '',
+      'color': color ?? 0,
+      'text_color': textColor ?? 0,
+      'face_x': faceX ?? 0,
+      'face_y': faceY ?? 0,
+    };
+    await _patchCachedMessage(messageId, fields); // оптимистично
+    await OutboxService.instance.enqueue('chatUpdate',
+        {'id': messageId, 'fields': fields});
+  }
+
+  /// Мягко удалить сообщение (томбстоун — партнёр видит «сообщение удалено»).
+  Future<void> delete({
+    required String groupId,
+    required String messageId,
+  }) async {
+    if (messageId.isEmpty) return;
+    final fields = <String, dynamic>{
+      'deleted': true,
+      'text': '',
+      'pin_id': '',
+      'pin_title': '',
+      'edited_ts': DateTime.now().millisecondsSinceEpoch,
+    };
+    await _patchCachedMessage(messageId, fields); // оптимистично
+    await OutboxService.instance.enqueue('chatUpdate',
+        {'id': messageId, 'fields': fields});
+  }
+
+  /// Оптимистично применить snake_case-поля к кэш-ряду сообщения.
+  Future<void> _patchCachedMessage(
+      String messageId, Map<String, dynamic> fields) async {
+    final rec = await LocalStore.instance.getRecord('chat_messages', messageId);
+    if (rec == null) return;
+    final row = Map<String, dynamic>.from(rec.data)..addAll(fields);
+    await LocalStore.instance.upsertRaw('chat_messages', messageId, row);
+  }
+
+  /// Поставить/снять свою реакцию на сообщение. [emoji] == null убирает её.
+  /// Один эмодзи на пользователя: новый перезаписывает прежний (RMW по json).
+  Future<void> setReaction({
+    required String groupId,
+    required String messageId,
+    required String? emoji,
+  }) async {
+    if (messageId.isEmpty || _uid.isEmpty) return;
+    // оптимистично: RMW reactions в кэш-ряду
+    final rec = await LocalStore.instance.getRecord('chat_messages', messageId);
+    if (rec != null) {
+      final row = Map<String, dynamic>.from(rec.data);
+      final cur = row['reactions'];
+      final r =
+          cur is Map ? Map<String, dynamic>.from(cur) : <String, dynamic>{};
+      if (emoji == null || emoji.isEmpty) {
+        r.remove(_uid);
+      } else {
+        r[_uid] = emoji;
+      }
+      row['reactions'] = r;
+      await LocalStore.instance.upsertRaw('chat_messages', messageId, row);
+    }
+    // в очередь (setChatReaction идемпотентен: ставит uid→emoji / снимает)
+    await OutboxService.instance.enqueue(
+        'chatSetReaction', {'id': messageId, 'uid': _uid, 'emoji': emoji});
+  }
+
+  // ── «Печатает…» (эфемерный презенс на PB heartbeat+TTL) ─────────────────────
+
+  /// Пометить «я печатаю» / снять.
+  ///
+  /// Уходит публикацией в канал пары и на диск не попадает: пока это была
+  /// запись в `chat_typing` раз в три секунды на каждого печатающего, она
+  /// стояла в общей очереди единственного писателя базы наравне с самими
+  /// сообщениями (разбор ночи 14 августа 2026).
+  Future<void> setTyping(String groupId, bool typing) async {
+    if (groupId.isEmpty || _uid.isEmpty) return;
+    final at = typing ? DateTime.now().millisecondsSinceEpoch : 0;
+    await CentrifugoService().publish(
+      'pair:$groupId',
+      {'t': 'typing', 'uid': _uid, 'at': at},
+    );
+  }
+
+  /// true — партнёр сейчас печатает (его отметка свежее восьми секунд).
+  ///
+  /// Слушаем и канал, и коллекцию: партнёр может сидеть на сборке постарше,
+  /// которая пишет отметку в базу. Пока такие сборки живы, «печатает» у них
+  /// работает по-прежнему.
+  Stream<bool> watchTyping(String groupId) {
+    if (groupId.isEmpty) return Stream.value(false);
+
+    late StreamController<bool> ctrl;
+    StreamSubscription<Map<String, int>>? dbSub;
+    RtUnsub? unsub;
+    Timer? ticker;
+    final marks = <String, int>{};
+    bool? last;
+
+    void emit() {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      var typing = false;
+      for (final entry in marks.entries) {
+        if (entry.key == _uid) continue; // свой маркер не считаем
+        if (now - entry.value < _typingFreshMs) {
+          typing = true;
+          break;
+        }
+      }
+      if (typing != last) {
+        last = typing;
+        if (!ctrl.isClosed) ctrl.add(typing);
+      }
+    }
+
+    ctrl = StreamController<bool>(
+      onListen: () async {
+        dbSub = _rt.watchTyping(groupId).listen((fromDb) {
+          fromDb.forEach((uid, at) {
+            final known = marks[uid] ?? 0;
+            if (at > known) marks[uid] = at;
+            if (at == 0) marks[uid] = 0;
+          });
+          emit();
+        }, onError: (_) {});
+
+        unsub = await CentrifugoService().subscribeRaw('pair:$groupId', (data) {
+          if (data['t'] != 'typing') return;
+          final uid = (data['uid'] ?? '').toString();
+          if (uid.isEmpty || uid == _uid) return;
+          final at = data['at'];
+          marks[uid] = at is num ? at.toInt() : 0;
+          emit();
+        });
+
+        // Отметка протухает молча, без нового события — гасим сами.
+        ticker = Timer.periodic(const Duration(seconds: 2), (_) => emit());
+        emit();
+      },
+      onCancel: () async {
+        await dbSub?.cancel();
+        await unsub?.call();
+        ticker?.cancel();
+      },
+    );
+    return ctrl.stream;
+  }
+
+  // ── Непрочитанные ──────────────────────────────────────────────────────────
+
+  String _lastReadKey(String groupId) => 'chat_last_read_$groupId';
+
+  // Кэш последнего опубликованного ts прочтения по группам — markRead зовётся
+  // на каждый кадр, поэтому пишем в сеть только при росте значения.
+  final Map<String, int> _syncedReadTs = {};
+
+  /// Отметить чат прочитанным: локально (ts последнего открытия) + публикуем
+  /// в PB `chat_reads`, чтобы партнёр увидел галочку.
+  Future<void> markRead(String groupId, int lastMessageTs) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_lastReadKey(groupId), lastMessageTs);
+
+    if (groupId.isEmpty || _uid.isEmpty || lastMessageTs <= 0) return;
+    if ((_syncedReadTs[groupId] ?? 0) >= lastMessageTs) return;
+    _syncedReadTs[groupId] = lastMessageTs;
+    final ok = await _data.chatRead(groupId, _uid, lastMessageTs);
+    if (!ok) {
+      _syncedReadTs.remove(groupId); // не вышло — позволим повторить позже
+    }
+  }
+
+  /// Поток статусов прочтения {uid: lastReadTs}. Для галочек «прочитано»:
+  /// своё сообщение прочитано, если его ts ≤ минимального ts среди остальных.
+  Stream<Map<String, int>> watchReads(String groupId) {
+    if (groupId.isEmpty) return const Stream.empty();
+    return _rt.watchChatReads(groupId);
+  }
+
+  Future<int> _lastRead(String groupId) async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_lastReadKey(groupId)) ?? 0;
+  }
+
+  /// ts последнего прочтения — публично, для разделителя «новые сообщения».
+  Future<int> lastReadTs(String groupId) => _lastRead(groupId);
+
+  // ── Фон чата (локальный, у каждого свой) ────────────────────────────────────
+
+  String _bgKey(String groupId) => 'chat_bg_$groupId';
+
+  /// Путь к локальному файлу фона чата (null — фон не задан).
+  ///
+  /// В настройках лежит имя файла, папка документов подставляется здесь: на
+  /// iPhone её адрес меняется при каждом обновлении, и записанный целиком путь
+  /// стирал купленный фон (см. `utils/documents_file.dart`).
+  Future<String?> backgroundPath(String groupId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final stored = prefs.getString(_bgKey(groupId));
+    if (stored == null) return null;
+    final dir = await getApplicationDocumentsDirectory();
+    return documentsFilePath(stored, dir.path);
+  }
+
+  Future<void> setBackgroundPath(String groupId, String path) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_bgKey(groupId), documentsFileKey(path));
+  }
+
+  Future<void> clearBackground(String groupId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_bgKey(groupId));
+  }
+
+  // ── Общий фон чата (Togetherly+) ────────────────────────────────────────
+  //
+  // Локальный фон видит только тот, кто его поставил, — за такое брать монеты
+  // странно. Общий лежит в группе: поставил один, видят оба.
+
+  /// Ссылка на общий фон. Пустая строка — общего фона нет.
+  Future<String> sharedBackground(String groupId) async {
+    if (groupId.isEmpty) return '';
+    try {
+      final rec = await PbDataService().loadGroupById(groupId);
+      return (rec?.data['chat_background'] ?? '').toString();
+    } catch (e) {
+      debugPrint('ChatService.sharedBackground failed: $e');
+      return '';
+    }
+  }
+
+  /// Ставит общий фон для пары. Пустая ссылка убирает его.
+  Future<bool> setSharedBackground(String groupId, String url) async {
+    if (groupId.isEmpty) return false;
+    try {
+      // Ответ записи и есть ответ: `updateGroupFields` глотает отказ и
+      // возвращает false, а прежний `return true` превращал его в «Фон
+      // поставлен — он теперь у обоих».
+      return await PbDataService().updateGroupFields(
+        groupId,
+        {'chat_background': url},
+      );
+    } catch (e) {
+      debugPrint('ChatService.setSharedBackground failed: $e');
+      return false;
+    }
+  }
+
+  // ── Позиция прокрутки (локально, чтобы вернуться ровно туда же) ──────────────
+
+  String _scrollKey(String groupId) => 'chat_scroll_$groupId';
+
+  /// Сохранить позицию прокрутки чата (px от верха) — при перезаходе вернём
+  /// человека ровно туда, где он остановился.
+  ///
+  /// Рядом кладём два признака: стоял ли он у низа и ts последнего сообщения
+  /// на тот момент. Без них пиксели врут: за время отсутствия приходят новые
+  /// сообщения, лента съезжает, и та же цифра указывает в середину старой
+  /// переписки (жалоба «чат открывается где-то вверху», 31 июля).
+  Future<void> saveScrollOffset(
+    String groupId,
+    double px, {
+    bool nearBottom = false,
+    int lastMessageTs = 0,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_scrollKey(groupId), px);
+      await prefs.setBool('${_scrollKey(groupId)}_bottom', nearBottom);
+      await prefs.setInt('${_scrollKey(groupId)}_ts', lastMessageTs);
+    } catch (_) {}
+  }
+
+  /// Сохранённая позиция прокрутки (null — не сохранена).
+  Future<double?> loadScrollOffset(String groupId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getDouble(_scrollKey(groupId));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Стоял ли человек у низа, когда выходил.
+  Future<bool> loadScrollNearBottom(String groupId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool('${_scrollKey(groupId)}_bottom') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Каким было последнее сообщение в момент выхода (0 — не знаем).
+  Future<int> loadScrollLastTs(String groupId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getInt('${_scrollKey(groupId)}_ts') ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  // ── Недавние цвета сообщений (до 5, глобально) ──────────────────────────────
+
+  static const String _kRecentColors = 'chat_recent_colors';
+
+  Future<List<int>> loadRecentColors() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return (prefs.getStringList(_kRecentColors) ?? const <String>[])
+          .map(int.tryParse)
+          .whereType<int>()
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> saveRecentColors(List<int> colors) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(
+          _kRecentColors, colors.map((c) => '$c').toList());
+    } catch (_) {}
+  }
+
+  // ── Оформление сообщений ─────────────────────────────────────────────────
+  //
+  // Мордочка, цвет пузыря, цвет текста и положение лица держались только в
+  // памяти экрана: вышел из чата — всё вернулось к умолчанию (жалоба от
+  // @Vidming). Теперь выбор переживает выход, и на каждую пару он свой:
+  // с разными людьми и оформление разное.
+
+  static String _styleKey(String groupId) =>
+      'chat_style_${groupId.isEmpty ? 'solo' : groupId}';
+
+  /// Сохранённое оформление: face, color, textColor, fx, fy. Пусто — ничего
+  /// не выбирали, экран возьмёт умолчание.
+  Future<Map<String, dynamic>> loadStyle(String groupId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_styleKey(groupId));
+      if (raw == null || raw.isEmpty) return const {};
+      final decoded = jsonDecode(raw);
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : const {};
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  Future<void> saveStyle(String groupId, Map<String, dynamic> style) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_styleKey(groupId), jsonEncode(style));
+    } catch (_) {}
+  }
+
+  /// Поток: есть ли непрочитанные сообщения от партнёра (для красной точки).
+  /// Достаточно новейшего сообщения → ленивый limit:1 (не тянем всю историю
+  /// ради одной точки); из общего кэша чата `recs.last` всё равно = последнее.
+  Stream<bool> watchHasUnread(String groupId) {
+    if (groupId.isEmpty) return Stream.value(false);
+    return _rt.watchMessages(groupId, limit: 1).asyncMap((recs) async {
+      if (recs.isEmpty) return false;
+      final last = ChatMsg.fromPb(recs.last); // watchMessages сортирует по ts ASC
+      if (last.uid == _uid) return false; // своё сообщение
+      if (last.deleted) return false;
+      final lastRead = await _lastRead(groupId);
+      return last.ts > lastRead;
+    });
+  }
+}

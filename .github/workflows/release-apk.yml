@@ -1,0 +1,716 @@
+name: Release → GitHub (APK+IPA) + Google Play + RuStore + iOS
+
+# ── Когда запускается сборка ──────────────────────────────────────────────
+#  1) Пуш тега вида v1.12.9  →  git tag v1.12.9 && git push origin v1.12.9
+#  2) Вручную: вкладка Actions → "Build APK → GitHub Release" → Run workflow
+#  Обычные коммиты в main сборку НЕ запускают.
+on:
+  # Только ручной запуск: Actions → «Release…» → Run workflow (ветка main).
+  # Тег-триггер убран намеренно — шаг публикации сам создаёт тег vX, а он
+  # повторно триггерил ЭТОТ ЖЕ workflow (лавина лишних прогонов; особенно при
+  # массовом создании релизов). Плюс на ручном запуске включается Google Play
+  # (на пуше тега публикация в Play пропускалась by design).
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Куда публиковать: all, либо через запятую github,play,rustore,ios'
+        required: false
+        default: 'all'
+      prerelease:
+        description: 'Тестовая сборка «на посмотреть»: релиз помечается pre-release и НЕ становится latest, автообновление у всех остаётся на стабильной версии'
+        type: boolean
+        required: false
+        default: false
+      draft:
+        description: 'Черновик: релиз виден только вам, файлы лежат, автообновление о нём не знает вовсе. Активной остаётся прежняя версия'
+        type: boolean
+        required: false
+        default: false
+      abi:
+        description: 'Какие APK класть в релиз. arm64 — только arm64-v8a (для тестовых сборок: 32-битные устройства их всё равно не ставят)'
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - arm64
+      ios_submit:
+        description: 'Отправлять iOS-сборку на ревью сразу. Выключите, чтобы билд лёг только в TestFlight — тот же самый потом уходит в App Store воркфлоу «iOS → App Store review», пересобирать не нужно'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read           # релиз публикуется в ДРУГОЙ репо через RELEASES_REPO_TOKEN,
+                           # GITHUB_TOKEN нужен только для checkout (read)
+
+jobs:
+  build-apk:
+    # Публикуем APK на GitHub, если выбран target github (или all).
+    if: ${{ inputs.targets == '' || contains(inputs.targets, 'all') || contains(inputs.targets, 'github') }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # нужна вся история + теги для генерации changelog
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter 3.47.6
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.6
+          channel: stable
+          cache: true
+
+      # Кэш pub-пакетов и Gradle-зависимостей/wrapper. На первом прогоне пусто,
+      # со второго — Android-зависимости и Gradle не качаются заново (сборка
+      # ускоряется в разы). Ключ инвалидируется при смене pubspec.lock или
+      # gradle-файлов; restore-keys позволяет переиспользовать частичный кэш.
+      - name: Cache pub & Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-flutterbuild-${{ hashFiles('pubspec.lock', 'android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-flutterbuild-
+
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > android/app/keystore.jks
+
+      - name: Write key.properties
+        env:
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cat > android/key.properties <<EOF
+          storeFile=keystore.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      # Пуши на Android идут через FCM, и плагин google-services требует этот
+      # файл на этапе сборки. В репозитории его нет (публичный, GPL-3.0),
+      # поэтому он приезжает секретом.
+      - name: Write google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Read version from pubspec
+        id: ver
+        run: |
+          LINE=$(grep '^version:' pubspec.yaml | awk '{print $2}')   # 1.12.8+76
+          NAME=${LINE%%+*}                                           # 1.12.8
+          CODE=${LINE##*+}                                           # 76
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v$NAME+$CODE" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Building $NAME (versionCode $CODE)"
+
+      - name: Build release APK
+        # --split-per-abi: отдельный APK на архитектуру (~45 МБ) вместо
+        # одного «толстого» universal (~109 МБ).
+        # --no-tree-shake-icons: значок таймера берётся по имени из базы, то есть
+        # IconData собирается на ходу. Flutter такое дерево иконок урезать не
+        # умеет и падает «Avoid non-constant invocations of IconData». Расплата —
+        # полный MaterialIcons в сборке, +1,5 МБ.
+        run: flutter build apk --release --split-per-abi --no-tree-shake-icons --dart-define=STORE=github
+
+      - name: Stage artifacts
+        id: stage
+        run: |
+          mkdir -p dist
+          BASE="togetherly-${{ steps.ver.outputs.name }}-${{ steps.ver.outputs.code }}"
+          APK_ARM64="${BASE}-arm64-v8a.apk"
+          APK_ARM="${BASE}-armeabi-v7a.apk"
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "dist/$APK_ARM64"
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk "dist/$APK_ARM"
+          # Список файлов релиза. При abi=arm64 32-битный APK собран, но в релиз
+          # не уезжает: на тестовую сборку его никто не ставит, а лишний файл
+          # только путает на странице релиза.
+          if [ "${{ inputs.abi }}" = "arm64" ]; then
+            printf 'dist/%s\ndist/version.json\n' "$APK_ARM64" > dist/files.txt
+          else
+            printf 'dist/%s\ndist/%s\ndist/version.json\n' "$APK_ARM64" "$APK_ARM" > dist/files.txt
+          fi
+          {
+            echo 'files<<EOF'
+            cat dist/files.txt
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          # version.json указывает на arm64-v8a (≈99% живых устройств) —
+          # именно его тянет авто-апдейтер. armeabi-v7a лежит для старых
+          # 32-битных устройств (скачивается вручную со страницы релиза); при
+          # abi=arm64 его в релизе нет, поэтому и ссылки на него нет.
+          if [ "${{ inputs.abi }}" = "arm64" ]; then APK_ARM=""; fi
+          # Заметки едут вместе с версией: попап обновления показывал текст,
+          # зашитый в УСТАНОВЛЕННУЮ сборку, и человек видел один и тот же
+          # список раз за разом («второй или третий раз вижу», 13.08.2026).
+          # Переменные оболочки в heredoc с одинарными кавычками НЕ
+          # подставляются — раньше в JSON так и уезжало «$APK_ARM64», и
+          # самообновление получало битую ссылку (поймано в ночь на 14 августа
+          # 2026 на релизе 1.28.1). Передаём их окружением и читаем в питоне.
+          export APK_ARM64 APK_ARM
+          python3 - <<'PY' > dist/version.json
+          import json, os, pathlib, sys
+
+          sys.path.insert(0, "tools")
+          from version_notes import notes_body
+
+          def notes(path):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  return ""
+              # Строку-заголовок («🫦 Togetherly • v1.27.0») в попапе не
+              # показываем, а первый АБЗАЦ обязан доехать: пока срезалась
+              # просто первая строка, релиз 1.31.4 начинался со второго
+              # предложения. Правило под тестами, tools/version_notes_test.py.
+              return notes_body(p.read_text(encoding="utf-8"))
+
+          print(json.dumps({
+              "versionCode": ${{ steps.ver.outputs.code }},
+              "versionName": "${{ steps.ver.outputs.name }}",
+              "apk": os.environ.get("APK_ARM64", ""),
+              "apkArm": os.environ.get("APK_ARM", ""),
+              "tag": "${{ steps.ver.outputs.tag }}",
+              "notes": notes("distribution/whatsnew/whatsnew-ru-RU"),
+              "notesEn": notes("distribution/whatsnew/whatsnew-en-US"),
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Generate changelog
+        run: |
+          # Тело релиза — РУЧНОЕ описание из distribution/whatsnew/whatsnew-ru-RU
+          # (тот же полный текст, что в попапе приложения и RuStore). Фолбэк на
+          # список коммитов, только если файла нет.
+          NOTES_FILE="distribution/whatsnew/whatsnew-ru-RU"
+          {
+            echo "## Togetherly ${{ steps.ver.outputs.name }} (build ${{ steps.ver.outputs.code }})"
+            echo ""
+            if [ -f "$NOTES_FILE" ]; then
+              cat "$NOTES_FILE"
+            else
+              PREV_TAG=$(git describe --tags --abbrev=0 "${{ steps.ver.outputs.tag }}^" 2>/dev/null || echo "")
+              if [ -n "$PREV_TAG" ]; then
+                git log --no-merges --pretty=format:'- %s' "$PREV_TAG"..HEAD
+              else
+                git log --no-merges --pretty=format:'- %s' -n 20
+              fi
+            fi
+          } > dist/notes.md
+          echo "---- generated notes ----"; cat dist/notes.md
+
+      - name: Publish to public releases repo
+        uses: softprops/action-gh-release@v2
+        with:
+          # Основной дом релизов и автообновления — публичный THET1ME-1/togetherly
+          # (там же исходники, открытый код). Приложение качает APK без токена.
+          repository: THET1ME-1/togetherly
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.name }} (build ${{ steps.ver.outputs.code }})
+          body_path: dist/notes.md
+          prerelease: ${{ inputs.prerelease }}
+          # Черновик не виден никому, кроме владельца, и не отдаётся API как
+          # релиз — автообновление о нём не узнает даже случайно.
+          draft: ${{ inputs.draft }}
+          # Pre-release не должен становиться latest: /releases/latest его
+          # пропускает, поэтому version.json у всех остаётся на стабильной
+          # версии и никто не обновляется на тестовую сборку.
+          make_latest: ${{ (inputs.prerelease || inputs.draft) && 'false' || 'true' }}
+          files: ${{ steps.stage.outputs.files }}
+
+  # ── Unsigned IPA в тот же релиз (сайдлоад через AltStore/Sideloadly) ────────
+  # Вызываем reusable-воркфлоу: в GitHub-релизе всегда лежат и APK, и IPA —
+  # руками второй прогон запускать не нужно.
+  attach-ipa:
+    # Только когда iOS просили: при targets=github это тестовая сборка на
+    # Android, и получасовой прогон на macOS ради IPA ей ни к чему.
+    if: ${{ inputs.targets == '' || contains(inputs.targets, 'all') || contains(inputs.targets, 'ios') }}
+    needs: build-apk
+    permissions:
+      contents: write
+    secrets: inherit
+    uses: ./.github/workflows/ios-unsigned-ipa.yml
+    with:
+      tag: ${{ needs.build-apk.outputs.tag }}
+      draft: ${{ inputs.draft }}
+      prerelease: ${{ inputs.prerelease }}
+
+  # ── Гейт: публикуем в Play только если задан секрет сервис-аккаунта ──────────
+  # Без PLAY_SERVICE_ACCOUNT_JSON job publish-play пропускается (не краснеет),
+  # пока ты не настроишь сервис-аккаунт и не добавишь секрет.
+  check-play:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - id: gate
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          TARGETS="${{ inputs.targets }}"; [ -z "$TARGETS" ] && TARGETS=all
+          case ",$TARGETS," in *,all,*|*,play,*) : ;; *)
+            echo "target=play не выбран — Play пропущен."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "Пуш тега → в Google Play публикуем ВРУЧНУЮ (AAB собирается локально). Job пропущен."
+            echo "Чтобы всё же выложить в Play из CI — запусти workflow вручную (Run workflow)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$PLAY_JSON" ]; then
+            echo "PLAY_SERVICE_ACCOUNT_JSON не задан — публикация в Play пропущена."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Сборка AAB и публикация в Google Play (production) ───────────────────────
+  publish-play:
+    needs: check-play
+    if: needs.check-play.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter 3.47.6
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.6
+          channel: stable
+          cache: true
+
+      - name: Cache pub & Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-flutterbuild-${{ hashFiles('pubspec.lock', 'android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-flutterbuild-
+
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > android/app/keystore.jks
+
+      - name: Write key.properties
+        env:
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cat > android/key.properties <<EOF
+          storeFile=keystore.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      # Пуши на Android идут через FCM, и плагин google-services требует этот
+      # файл на этапе сборки. В репозитории его нет (публичный, GPL-3.0),
+      # поэтому он приезжает секретом.
+      - name: Write google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Read version from pubspec
+        id: ver
+        run: |
+          LINE=$(grep '^version:' pubspec.yaml | awk '{print $2}')   # 1.12.9+77
+          echo "name=${LINE%%+*}" >> "$GITHUB_OUTPUT"
+          echo "code=${LINE##*+}" >> "$GITHUB_OUTPUT"
+
+      - name: Build AAB
+        # См. комментарий у сборки APK: динамический IconData ломает tree-shaking.
+        run: flutter build appbundle --release --no-tree-shake-icons
+
+      - name: Publish to Google Play (production)
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.togetherly.love
+          releaseFiles: build/app/outputs/bundle/release/app-release.aab
+          track: production
+          # Полный раскат сразу на 100% пользователей. При status: completed поле
+          # userFraction указывать НЕЛЬЗЯ (это взаимоисключающие режимы).
+          status: completed
+          # «Что нового» Google Play (≤500 символов на язык). Файлы named
+          # whatsnew-<lang>, напр. whatsnew-ru-RU. ОТДЕЛЬНАЯ папка от RuStore:
+          # у Play жёсткий лимит 500 символов, а RuStore/попап берут полный текст
+          # из distribution/whatsnew (без лимита).
+          whatsNewDirectory: distribution/whatsnew-play
+          releaseName: ${{ steps.ver.outputs.name }} (build ${{ steps.ver.outputs.code }})
+
+  # ── Гейт: публикуем в RuStore только если задан ключ API ────────────────────
+  # Без RUSTORE_KEY_ID job publish-rustore пропускается (не краснеет). Отдельная
+  # джоба от Play — сбой одного магазина не роняет другой.
+  check-rustore:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - id: gate
+        env:
+          KEY_ID: ${{ secrets.RUSTORE_KEY_ID }}
+        run: |
+          TARGETS="${{ inputs.targets }}"; [ -z "$TARGETS" ] && TARGETS=all
+          case ",$TARGETS," in *,all,*|*,rustore,*) : ;; *)
+            echo "target=rustore не выбран — RuStore пропущен."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          if [ -z "$KEY_ID" ]; then
+            echo "RUSTORE_KEY_ID не задан — публикация в RuStore пропущена."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Сборка STORE=rustore APK и публикация в RuStore ─────────────────────────
+  # Тот же тег v*, но отдельная сборка: RuStore требует флаг STORE=rustore
+  # (другой биллинг-SDK) и единый (universal) APK.
+  publish-rustore:
+    needs: check-rustore
+    if: needs.check-rustore.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter 3.47.6
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.6
+          channel: stable
+          cache: true
+
+      - name: Cache pub & Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-flutterbuild-${{ hashFiles('pubspec.lock', 'android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-flutterbuild-
+
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > android/app/keystore.jks
+
+      - name: Write key.properties
+        env:
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cat > android/key.properties <<EOF
+          storeFile=keystore.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      # Пуши на Android идут через FCM, и плагин google-services требует этот
+      # файл на этапе сборки. В репозитории его нет (публичный, GPL-3.0),
+      # поэтому он приезжает секретом.
+      - name: Write google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Read version from pubspec
+        id: ver
+        run: |
+          LINE=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          echo "name=${LINE%%+*}" >> "$GITHUB_OUTPUT"
+          echo "code=${LINE##*+}" >> "$GITHUB_OUTPUT"
+
+      - name: Build RuStore APK
+        run: flutter build apk --release --no-tree-shake-icons --dart-define=STORE=rustore
+
+      - name: Stage APK
+        id: stage
+        run: |
+          mkdir -p dist
+          OUT="dist/togetherly-rustore-${{ steps.ver.outputs.name }}-${{ steps.ver.outputs.code }}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "$OUT"
+          echo "apk=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: togetherly-rustore-apk
+          path: ${{ steps.stage.outputs.apk }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install upload deps
+        run: pip install --quiet requests cryptography
+
+      - name: Publish to RuStore
+        env:
+          RUSTORE_KEY_ID: ${{ secrets.RUSTORE_KEY_ID }}
+          RUSTORE_PRIVATE_KEY_PEM: ${{ secrets.RUSTORE_PRIVATE_KEY_PEM }}
+        run: |
+          # «Что нового» берём из ТОГО ЖЕ файла, что и Google Play
+          # (distribution/whatsnew/whatsnew-ru-RU) — описание пишется один раз.
+          # Фолбэк на версию, если файла нет.
+          NOTES_FILE="distribution/whatsnew/whatsnew-ru-RU"
+          if [ -f "$NOTES_FILE" ]; then
+            WHATSNEW=$(cat "$NOTES_FILE")
+          else
+            WHATSNEW="Togetherly ${{ steps.ver.outputs.name }} (build ${{ steps.ver.outputs.code }})"
+          fi
+          python tool/rustore_upload.py \
+            --package com.togetherly.love \
+            --aab "${{ steps.stage.outputs.apk }}" \
+            --whatsnew "$WHATSNEW"
+
+  # ── Гейт: iOS собираем, только если задан ключ App Store Connect API ────────
+  # Без APP_STORE_CONNECT_PRIVATE_KEY джоба пропускается (не краснеет).
+  check-ios:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - id: gate
+        env:
+          ASC_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          TARGETS="${{ inputs.targets }}"; [ -z "$TARGETS" ] && TARGETS=all
+          case ",$TARGETS," in *,all,*|*,ios,*) : ;; *)
+            echo "target=ios не выбран — iOS пропущен."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          if [ -z "$ASC_KEY" ]; then
+            echo "APP_STORE_CONNECT_PRIVATE_KEY не задан — сборка iOS пропущена."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── iOS: сборка, подпись и заливка в TestFlight (замена Codemagic) ──────────
+  # Раннер macOS: у публичных репозиториев стандартные раннеры бесплатны.
+  # Подпись делает codemagic-cli-tools (обычный pip-пакет: app-store-connect /
+  # keychain / xcode-project) — те же команды, что были в codemagic.yaml.
+  publish-ios:
+    needs: check-ios
+    if: needs.check-ios.outputs.enabled == 'true'
+    runs-on: macos-latest
+    outputs:
+      build_number: ${{ steps.ipa.outputs.build_number }}
+      version: ${{ steps.ipa.outputs.version }}
+    env:
+      # Эти три имени codemagic-cli-tools читает из окружения сам.
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+      APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      CERTIFICATE_PRIVATE_KEY: ${{ secrets.CERTIFICATE_PRIVATE_KEY }}
+      BUNDLE_ID: com.togetherly.love
+      # Числовой Apple ID приложения (App Store Connect → App Information).
+      APP_STORE_APP_ID: "6781019737"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        # connectivity_plus использует NWPath.isUltraConstrained — API из iOS 26
+        # SDK. На раннере может стоять несколько Xcode, и по умолчанию выбран не
+        # самый свежий → архив падает «has no member 'isUltraConstrained'».
+        # Берём максимальную установленную версию (у Codemagic было xcode: latest).
+        run: |
+          set -euo pipefail
+          echo "Установленные Xcode:"; ls -d /Applications/Xcode*.app
+          NEWEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -z "$NEWEST" ] && NEWEST=/Applications/Xcode.app
+          sudo xcode-select -s "$NEWEST"
+          echo "Выбран: $NEWEST"
+          xcodebuild -version
+          echo "SDK:"; xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: Set up Flutter 3.47.6
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.6
+          channel: stable
+          cache: true
+
+      - name: Install codemagic-cli-tools
+        # Даёт команды app-store-connect / keychain / xcode-project.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet codemagic-cli-tools \
+            || python3 -m pip install --quiet --break-system-packages codemagic-cli-tools
+          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+
+      - name: Flutter packages
+        run: |
+          # SPM конфликтует на tocropviewcontroller (image_cropper vs
+          # dkimagepickercontroller) — собираем через CocoaPods.
+          flutter config --no-enable-swift-package-manager
+          flutter pub get
+
+      - name: Pod install
+        run: find . -name "Podfile" -execdir pod install \;
+
+      - name: Set up code signing (manual, App Store)
+        # ПОСТОЯННЫЙ приватный ключ → один и тот же distribution-сертификат
+        # переиспользуется (не плодим новые, не упираемся в лимит Apple).
+        # fetch-signing-files создаёт/докачивает app_store-профили приложения И
+        # виджета; add-certificates кладёт серт+ключ в keychain; use-profiles
+        # переводит проект в manual-подпись (иначе архив уходит в Automatic и
+        # падает с «No Accounts» на безголовом Mac).
+        run: |
+          set -euo pipefail
+          keychain initialize
+          # Ключ лежит в секрете как base64 (однострочное поле) — раскодируем.
+          printf '%s' "$CERTIFICATE_PRIVATE_KEY" | openssl base64 -d -A > /tmp/cert_key.pem
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE \
+            --certificate-key @file:/tmp/cert_key.pem \
+            --create
+          app-store-connect fetch-signing-files "$BUNDLE_ID.TogetherlyWidget" \
+            --type IOS_APP_STORE \
+            --certificate-key @file:/tmp/cert_key.pem \
+            --create
+          keychain add-certificates
+          xcode-project use-profiles
+          rm -f /tmp/cert_key.pem
+
+      - name: Build IPA
+        id: ipa
+        run: |
+          set -euo pipefail
+          # Номер сборки берём ИЗ PUBSPEC — тот же, что у Android. Раньше тут
+          # стоял «последний из TestFlight + 1», и номера разъезжались: на
+          # Android 193, на iPhone 120. Одинаковый номер нужен, чтобы жалобу с
+          # телефона можно было привязать к сборке, не гадая, что за платформа.
+          # Apple повторный номер не принимает (409 «bundle version already
+          # used»), поэтому если в ASC уже есть номер больше — берём его +1.
+          LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APP_ID" 2>/dev/null || echo 0)
+          [ -z "$LATEST" ] && LATEST=0
+          PUBSPEC_BUILD=$(grep -m1 '^version:' pubspec.yaml | sed 's/.*+//')
+          NEW=$PUBSPEC_BUILD
+          if [ "$LATEST" -ge "$PUBSPEC_BUILD" ]; then
+            NEW=$((LATEST + 1))
+            echo "В ASC уже есть билд $LATEST — берём $NEW вместо $PUBSPEC_BUILD"
+          fi
+          echo "ASC latest build = $LATEST, pubspec = $PUBSPEC_BUILD → building with $NEW"
+          echo "build_number=$NEW" >> "$GITHUB_OUTPUT"
+          # Версия приложения — из pubspec, до знака «+».
+          VER=$(grep -m1 '^version:' pubspec.yaml | sed 's/version:[[:space:]]*//; s/+.*//')
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          # STORE=github обязателен: при умолчании (`play`) константы
+          # `coins_10/50/120/300` и `togetherly_plus` попадают в бинарник, хотя
+          # покупок на iOS нет вовсе. Ровно это и ищет App Review при отказе
+          # 2.1(b) «products could not be found in the submitted binary».
+          # Донаты флаг включает, но на iOS их гасит `!Platform.isIOS` (3.1.1).
+          flutter build ipa --release \
+            --no-tree-shake-icons \
+            --dart-define=STORE=github \
+            --build-number="$NEW" \
+            --export-options-plist="$HOME/export_options.plist"
+
+      - name: Права подписи в собранном приложении
+        # Ровно тот факт, которого не хватает: есть ли в ПОДПИСАННОМ бинарнике
+        # доступ к общему контейнеру. Возможность APP_GROUPS у идентификатора
+        # включена, но привязки к самой группе Apple по API не показывает, а без
+        # неё профиль контейнер не даёт: приложение пишет данные в никуда, и
+        # виджеты стоят пустыми при живом приложении (iPhone, сборки 200 и 201).
+        run: |
+          set +e
+          APP=$(find build/ios/archive -name "Runner.app" -maxdepth 4 | head -1)
+          [ -z "$APP" ] && APP=$(find build/ios -name "Runner.app" -maxdepth 5 | head -1)
+          echo "приложение: $APP"
+          echo "── приложение ──"
+          codesign -d --entitlements :- "$APP" 2>/dev/null | grep -A3 -i "application-groups" \
+            || echo "  ГРУППЫ НЕТ В ПРАВАХ"
+          for ext in "$APP"/PlugIns/*.appex; do
+            echo "── расширение $(basename "$ext") ──"
+            codesign -d --entitlements :- "$ext" 2>/dev/null | grep -A3 -i "application-groups" \
+              || echo "  ГРУППЫ НЕТ В ПРАВАХ"
+          done
+
+      - name: Upload to TestFlight
+        run: |
+          set -euo pipefail
+          app-store-connect publish --path "build/ios/ipa/*.ipa"
+
+      - name: Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: togetherly-ios-ipa
+          path: build/ios/ipa/*.ipa
+          if-no-files-found: ignore
+
+  # ── Отправка версии в App Store ────────────────────────────────────────────
+  # Загрузка в TestFlight ничего не выпускает: версию в App Store надо создать,
+  # привязать к ней билд и отправить на ревью. Делает это отдельный воркфлоу —
+  # его же можно запустить руками, когда билд уже залит (см. ios-submit.yml).
+  # Выключатель `ios_submit` оставляет билд в TestFlight: тот же самый билд
+  # потом уходит в App Store воркфлоу «iOS → App Store review» по номеру,
+  # пересобирать ничего не нужно.
+  submit-ios:
+    needs: publish-ios
+    # Сравниваем со строкой тоже: через `gh workflow run -f ios_submit=false`
+    # значение приезжает строкой, и голое `inputs.ios_submit` считает её за да.
+    if: ${{ needs.publish-ios.result == 'success' && inputs.ios_submit && inputs.ios_submit != 'false' }}
+    uses: ./.github/workflows/ios-submit.yml
+    with:
+      version: ${{ needs.publish-ios.outputs.version }}
+      build_number: ${{ needs.publish-ios.outputs.build_number }}
+    secrets: inherit

@@ -1,0 +1,310 @@
+import 'package:flutter/material.dart';
+import '../../services/locale_service.dart';
+import '../../theme/app_theme.dart';
+import '../../widgets/common/animations.dart';
+import '../../widgets/unfold/unfold_route.dart';
+
+/// Нижняя навигационная панель главного экрана.
+/// Сколько места снизу занимает панель без безопасного поля: круглая кнопка
+/// 56 и отступ 20. Над этой полосой держится маскот (TOG-15): под панелью его
+/// не взять, касание забирает она.
+const double kHomeBottomNavHeight = 76;
+
+/// Верх кнопки чата над нижним краем экрана без системного отступа: поле под
+/// панелью, круглая кнопка, зазор и сама кнопка чата. Плашка над панелью
+/// встаёт выше: иначе кнопка чата закрывает её правый край. У просмотра темы
+/// под ней прятался крестик, и вернуть свою тему было нечем (обращение 464).
+const double kHomeChatButtonTop = 20 + 56 + 12 + 44;
+
+class HomeBottomNav extends StatelessWidget {
+  final int selectedIndex;
+  final AppTheme theme;
+  final bool isPaired;
+  final ValueChanged<int> onTap;
+  /// Круглая боковая кнопка справа от навбара. Тап — [onCreatePin]; null прячет
+  /// кнопку. На главной морфится в стрелку → (открыть Ленту) либо плюс +
+  /// (создать пин) — управляется [sideIsArrow]. В Ленте всегда плюс.
+  final VoidCallback? onCreatePin;
+
+  /// true → иконка-стрелка → (открыть Ленту); false → плюс + (создать пин).
+  final bool sideIsArrow;
+
+  /// Удержание боковой кнопки — переключить стрелку ↔ плюс. null отключает.
+  final VoidCallback? onSideLongPress;
+
+  /// Ключ боковой кнопки — для позиционирования одноразовой подсказки.
+  final Key? sideButtonKey;
+
+  /// Быстрый вход в переписку — маленький значок на углу круглой кнопки.
+  /// null прячет его: у одиночки чата не существует.
+  final VoidCallback? onChat;
+
+  /// Ключ значка чата — по нему его находят тесты.
+  static const Key chatBadgeKey = Key('nav_chat_badge');
+
+  /// Ключ кнопки чата как источника перехода: чат вырастает из неё
+  /// (см. `UnfoldRoute`). Задаёт главный экран, он же по нему находит кнопку.
+  final GlobalKey<UnfoldSourceState>? chatSourceKey;
+
+  /// Вкладки «Виджеты» и «Смотрим»: с Togetherly+ их можно убрать из панели
+  /// (раскладка главной, `HomeLayout`).
+  final bool showWidgets;
+  final bool showWatch;
+
+  /// Номера вкладок слева направо: 0 главная, 1 виджеты, 4 «Смотрим»,
+  /// 2 «Связь», 3 профиль. С Плюсом порядок меняют в настройках.
+  final List<int> order;
+  static const List<int> defaultOrder = [0, 1, 4, 2, 3];
+
+  const HomeBottomNav({
+    super.key,
+    required this.selectedIndex,
+    required this.theme,
+    required this.isPaired,
+    required this.onTap,
+    this.showWidgets = true,
+    this.showWatch = true,
+    this.order = defaultOrder,
+    this.onCreatePin,
+    this.sideIsArrow = false,
+    this.onSideLongPress,
+    this.sideButtonKey,
+    this.onChat,
+    this.chatSourceKey,
+  });
+
+  static const String _homeIcon =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-6">\n  <path d="M11.47 3.841a.75.75 0 0 1 1.06 0l8.69 8.69a.75.75 0 1 0 1.06-1.061l-8.689-8.69a2.25 2.25 0 0 0-3.182 0l-8.69 8.69a.75.75 0 1 0 1.061 1.06l8.69-8.689Z" />\n  <path d="m12 5.432 8.159 8.159c.03.03.06.058.091.086v6.198c0 1.035-.84 1.875-1.875 1.875H15a.75.75 0 0 1-.75-.75v-4.5a.75.75 0 0 0-.75-.75h-3a.75.75 0 0 0-.75.75V21a.75.75 0 0 1-.75.75H5.625a1.875 1.875 0 0 1-1.875-1.875v-6.198a2.29 2.29 0 0 0 .091-.086L12 5.432Z" />\n</svg>';
+
+  static const String _widgetsIcon =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-6">\n  <path d="M5.566 4.657A4.505 4.505 0 0 1 6.75 4.5h10.5c.41 0 .806.055 1.183.157A3 3 0 0 0 15.75 3h-7.5a3 3 0 0 0-2.684 1.657ZM2.25 12a3 3 0 0 1 3-3h13.5a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3v-6ZM5.25 7.5c-.41 0-.806.055-1.184.157A3 3 0 0 1 6.75 6h10.5a3 3 0 0 1 2.683 1.657A4.505 4.505 0 0 0 18.75 7.5H5.25Z" />\n</svg>';
+
+  static const String _invitesIcon =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-6">\n  <path d="M4.913 2.658c2.075-.27 4.19-.408 6.337-.408 2.147 0 4.262.139 6.337.408 1.922.25 3.291 1.861 3.405 3.727a4.403 4.403 0 0 0-1.032-.211 50.89 50.89 0 0 0-8.42 0c-2.358.196-4.04 2.19-4.04 4.434v4.286a4.47 4.47 0 0 0 2.433 3.984L7.28 21.53A.75.75 0 0 1 6 21v-4.03a48.527 48.527 0 0 1-1.087-.128C2.905 16.58 1.5 14.833 1.5 12.862V6.638c0-1.97 1.405-3.718 3.413-3.979Z" />\n  <path d="M15.75 7.5c-1.376 0-2.739.057-4.086.169C10.124 7.797 9 9.103 9 10.609v4.285c0 1.507 1.128 2.814 2.67 2.94 1.243.102 2.5.157 3.768.165l2.782 2.781a.75.75 0 0 0 1.28-.53v-2.39l.33-.026c1.542-.125 2.67-1.433 2.67-2.94v-4.286c0-1.505-1.125-2.811-2.664-2.94A49.392 49.392 0 0 0 15.75 7.5Z" />\n</svg>';
+
+  static const String _watchIcon =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-6">\n  <path fill-rule="evenodd" d="M4.5 3.75A2.25 2.25 0 0 0 2.25 6v9A2.25 2.25 0 0 0 4.5 17.25h15A2.25 2.25 0 0 0 21.75 15V6a2.25 2.25 0 0 0-2.25-2.25h-15Zm5.03 3.47a.75.75 0 0 0-1.28.53v5.5a.75.75 0 0 0 1.14.64l4.5-2.75a.75.75 0 0 0 0-1.28l-4.5-2.75a.75.75 0 0 0-.36-.11Z" clip-rule="evenodd" />\n  <path d="M8.25 19.5h7.5a.75.75 0 0 1 0 1.5h-7.5a.75.75 0 0 1 0-1.5Z" />\n</svg>';
+
+  static const String _profileIcon =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-6">\n  <path fill-rule="evenodd" d="M18.685 19.097A9.723 9.723 0 0 0 21.75 12c0-5.385-4.365-9.75-9.75-9.75S2.25 6.615 2.25 12a9.723 9.723 0 0 0 3.065 7.097A9.716 9.716 0 0 0 12 21.75a9.716 9.716 0 0 0 6.685-2.653Zm-12.54-1.285A7.486 7.486 0 0 1 12 15a7.486 7.486 0 0 1 5.855 2.812A8.224 8.224 0 0 1 12 20.25a8.224 8.224 0 0 1-5.855-2.438ZM15.75 9a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" clip-rule="evenodd" />\n</svg>';
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleService.current;
+    // Подложка активного пункта и значок на ней — заранее подобранная пара
+    // темы (`navActiveBg` + `navActiveIcon`), её и берём. Ошибка была в том,
+    // что подложку рисовали цветом ЗНАЧКА с прозрачностью: в тёмной теме он
+    // тёмный, и панель превращалась в тёмное на тёмном.
+    final activeColor = theme.navActiveIcon;
+    final activeBg = theme.navActiveBg;
+    // Неактивный значок — приглушённый акцент, а не нейтральный серый: чёрные
+    // значки на светлой панели выглядели чужими.
+    final inactiveColor = Color.lerp(theme.primary, theme.cardSurface, 0.5)!;
+    final primary = theme.primary;
+
+    final bottomInset = MediaQuery.of(context).viewPadding.bottom;
+    // Узкий экран (320 точек и меньше) не вмещает панель из пяти пунктов
+    // вместе с круглой кнопкой: с прежними отступами она вылезала вправо на
+    // 40 пикселей. Ужимаем поля, а не значки — цель под палец трогать нельзя.
+    final narrow = MediaQuery.of(context).size.width <= 340;
+    final side = narrow ? 12.0 : 24.0;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(side, 0, side, 20 + bottomInset),
+      child: Row(
+        // По низу: кнопка чата растёт ВВЕРХ от круглой, а панель остаётся
+        // там же, где была.
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Expanded(
+            child: Container(
+        decoration: BoxDecoration(
+          color: theme.cardSurface,
+          borderRadius: BorderRadius.circular(100),
+        ),
+        child: Padding(
+            padding: EdgeInsets.symmetric(
+                horizontal: narrow ? 6 : 10, vertical: 10),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                // Порядок задаёт [order] (раскладка главной с Плюсом),
+                // спрятанные вкладки пропускаются.
+                for (final i in order)
+                  if ((i != 1 || showWidgets) && (i != 4 || showWatch))
+                    NavBarItem(
+                      svgIcon: switch (i) {
+                        0 => _homeIcon,
+                        1 => _widgetsIcon,
+                        4 => _watchIcon,
+                        2 => _invitesIcon,
+                        _ => _profileIcon,
+                      },
+                      index: i,
+                      label: switch (i) {
+                        0 => s.home,
+                        1 => s.widgets,
+                        4 => s.watchTogether,
+                        2 => s.connect,
+                        _ => s.profile,
+                      },
+                      isActive: selectedIndex == i,
+                      activeColor: activeColor,
+                      activeBg: activeBg,
+                      inactiveColor: inactiveColor,
+                      badgeColor: primary,
+                      showBadge: i == 2 && !isPaired,
+                      onTap: () => onTap(i),
+                    ),
+              ],
+            ),
+          ),
+            ),
+          ),
+          if (onCreatePin != null) ...[
+            SizedBox(width: narrow ? 8 : 12),
+            // Hero делает кнопку «непрерывной» при переходе главная↔Лента —
+            // круг остаётся на месте, пока экраны сменяются, а иконка
+            // оказывается уже «плюсом» в Ленте. Тег общий для обоих экранов.
+            // Кнопка чата стоит НАД круглой отдельной сущностью, столбиком.
+            // Не Positioned за границами: то, что вынесено за родителя,
+            // рисуется, но нажатий не ловит — проверено тестом.
+            // Обе живут вне общего Hero: круглая летит в Ленту сама,
+            // а чата там нет вовсе.
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (onChat != null) ...[
+                  UnfoldSource(
+                    key: chatSourceKey,
+                    fill: theme.fillColor,
+                    radius: 22,
+                    builder: (_, _) => _ChatBadgeButton(
+                      theme: theme,
+                      onTap: onChat!,
+                      label: s.chatTitle,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                Hero(
+                  tag: 'home_side_action_button',
+                  child: _CreatePinButton(
+                    buttonKey: sideButtonKey,
+                    color: theme.fillColor,
+                    isArrow: sideIsArrow,
+                    onTap: onCreatePin!,
+                    onLongPress: onSideLongPress,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Кнопка чата — отдельная, НАД круглой боковой.
+///
+/// С главной до переписки было два шага: вкладка «Связь», а уже оттуда кнопка
+/// чата. Эта ведёт прямо в чат. Стоит выше круглой столбиком, со своим
+/// зазором: не значок на чужой кнопке, а самостоятельное действие. Тени нет
+/// намеренно — глубину даёт тональная поверхность и кольцо.
+class _ChatBadgeButton extends StatelessWidget {
+  final AppTheme theme;
+  final VoidCallback onTap;
+  final String label;
+
+  const _ChatBadgeButton({
+    required this.theme,
+    required this.onTap,
+    required this.label,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: label,
+      child: Tooltip(
+        message: label,
+        child: Material(
+          key: HomeBottomNav.chatBadgeKey,
+          // Тот же цвет, что у круглой кнопки под ней, и белый значок:
+          // две окружности читаются как пара. Обводки нет намеренно.
+          color: theme.fillColor,
+          shape: const CircleBorder(),
+          child: InkWell(
+            onTap: onTap,
+            customBorder: const CircleBorder(),
+            child: const SizedBox(
+              width: 44,
+              height: 44,
+              child: Icon(
+                Icons.chat_bubble_rounded,
+                size: 20,
+                color: Colors.white,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Круглая боковая кнопка справа от навбара. Иконка плавно морфится между
+/// стрелкой → (открыть Ленту) и плюсом + (создать пин) через AnimatedSwitcher.
+class _CreatePinButton extends StatelessWidget {
+  final Color color;
+  final bool isArrow;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+  final Key? buttonKey;
+
+  const _CreatePinButton({
+    required this.color,
+    required this.isArrow,
+    required this.onTap,
+    this.onLongPress,
+    this.buttonKey,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      key: buttonKey,
+      color: color,
+      shape: const CircleBorder(),
+      elevation: 0,
+      child: InkWell(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 56,
+          height: 56,
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 280),
+            switchInCurve: Curves.easeOutBack,
+            switchOutCurve: Curves.easeIn,
+            transitionBuilder: (child, anim) => RotationTransition(
+              turns: Tween<double>(begin: 0.7, end: 1.0).animate(anim),
+              child: ScaleTransition(
+                scale: anim,
+                child: FadeTransition(opacity: anim, child: child),
+              ),
+            ),
+            child: Icon(
+              isArrow ? Icons.arrow_forward_rounded : Icons.add_rounded,
+              key: ValueKey<bool>(isArrow),
+              color: Colors.white,
+              size: 30,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

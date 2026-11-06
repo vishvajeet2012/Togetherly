@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Перенос горячей коллекции из SQLite PocketBase в Postgres (hotpath).
+
+Обобщение migrate_strokes.py: колонки и типы берутся из карты TABLES, ход по
+rowid, повтор безопасен (ON CONFLICT DO NOTHING), контрольная точка в
+/opt/hotpath/.{table}_rowid.
+
+    /opt/hotpath/venv/bin/python migrate_table.py chat_messages
+    /opt/hotpath/venv/bin/python migrate_table.py mood_entries --since-rowid N
+"""
+
+import argparse
+import asyncio
+import os
+import sqlite3
+import time
+
+import asyncpg
+
+SQLITE = os.environ.get("PB_DB", "/opt/pocketbase/pb_data/data.db")
+PG_DSN = os.environ["HOTPATH_PG_DSN"]
+BATCH = 20000
+
+# name -> (тип: text|num|bool|json|auto). Порядок колонок и типы должны
+# совпадать с COLLECTIONS в hotpath.py.
+TABLES = {
+    "chat_messages": {
+        "color": "num", "deleted": "bool", "edited_ts": "num", "face": "text",
+        "face_x": "num", "face_y": "num", "group_id": "text", "pin_id": "text",
+        "pin_thumb": "text", "pin_title": "text", "reactions": "json",
+        "reply_to_id": "text", "reply_to_name": "text", "reply_to_text": "text",
+        "text": "text", "ts": "num", "user_name": "text", "user_uid": "text",
+        "updated": "auto", "text_color": "num", "voice_url": "text",
+        "voice_ms": "num", "voice_peaks": "text", "voice_heard_at": "num",
+    },
+    "memories": {
+        "author_avatar": "text", "author_name": "text", "author_uid": "text",
+        "created_at": "text", "data": "json", "deleted": "bool",
+        "edited_at": "text", "group_id": "text", "is_pinned": "bool",
+        "type": "text", "updated": "auto", "tz": "text", "added_at": "text",
+    },
+    "widget_data": {
+        "avatar_url": "text", "data": "json", "display_name": "text",
+        "gender": "text", "group_id": "text", "message": "text",
+        "mood_emoji": "text", "mood_label": "text", "music_artist": "text",
+        "music_cover_url": "text", "music_title": "text", "music_url": "text",
+        "photo_for_partner_url": "text", "photo_for_partner_urls": "json",
+        "photo_grid_count": "num", "photo_grid_urls": "json",
+        "photo_url": "text", "status": "text", "updated_at": "text",
+        "user_uid": "text", "updated": "auto", "plus": "bool",
+    },
+    "user_presence": {"seen_at": "num", "user_uid": "text"},
+    "chat_typing": {"group_id": "text", "typing_at": "num", "user_uid": "text"},
+    "chat_reads": {
+        "group_id": "text", "last_read_ts": "num", "updated_at": "text",
+        "user_uid": "text", "updated": "auto",
+    },
+    "live_location": {"channel": "text", "data": "json", "user_uid": "text"},
+    "canvas_meta": {
+        "bg_color": "num", "canvas_id": "text", "canvas_rotation": "num",
+        "clear_version": "num", "group_id": "text", "updated_at": "text",
+        "coloring_id": "text", "coloring_mode": "text",
+        "coloring_done": "json", "coloring_swap": "bool",
+    },
+    "mood_entries": {
+        "group_id": "text", "image_path": "text", "label": "text",
+        "mood_id": "text", "timestamp": "text", "user_uid": "text",
+        "updated": "auto", "tz": "text",
+    },
+    "miss_you": {
+        "group_id": "text", "user_uid": "text", "count": "num",
+        "updated_at": "text", "last_vibe": "text", "last_vibe_text": "text",
+        "by_weekday": "json", "by_vibe": "json", "updated": "auto",
+    },
+    # Переезд 19.10.2026. Даты в карте — text: перенос кладёт строку как есть.
+    "love_tests": {
+        "group_id": "text", "user_uid": "text", "data": "json",
+        "total": "num", "updated": "auto",
+    },
+    "mascots": {
+        "group_id": "text", "mascot_id": "text", "name": "text",
+        "image_url": "text", "default_asset": "text", "created_by": "text",
+        "created_at": "text", "is_default": "bool", "record_streak": "num",
+        "updated": "auto",
+    },
+    # Переезд 19.10.2026, вторая волна. `created` переносится строкой как
+    # есть: у hotpath это autodate, который ставится только при создании.
+    "cycle_entries": {
+        "group_id": "text", "user_uid": "text", "day": "text",
+        "kind": "text", "flow": "text", "shared": "bool",
+        "created": "text", "updated": "auto",
+    },
+    "wishes": {
+        "group_id": "text", "author_uid": "text", "title": "text",
+        "note": "text", "category": "text", "symbol": "text",
+        "done": "bool", "done_at": "text", "done_by": "text",
+        "done_note": "text", "kind": "text", "price": "num",
+        "currency": "text", "url": "text", "image": "text", "shop": "text",
+        "created": "text", "updated": "auto",
+    },
+    "wish_categories": {
+        "group_id": "text", "author_uid": "text", "title": "text",
+        "symbol": "text", "note": "text", "created": "text", "updated": "auto",
+    },
+    # Запись пары. В отличие от прочих, строка на пару ОДНА и живёт правками,
+    # поэтому одного прохода по rowid тут мало — обязателен reconcile_table по
+    # колонке updated, иначе счётчики и карты участников приедут вчерашними.
+    "groups": {
+        "members": "json", "member_names": "json", "member_avatars": "json",
+        "member_birthdays": "json", "member_moods": "json",
+        "member_ailments": "json", "max_members": "num",
+        "relationship_type": "text", "custom_relationship_label": "text",
+        "custom_relationship_emoji": "text",
+        "custom_relationship_types": "json", "start_date": "text",
+        "anniversary_date": "text", "first_kiss_date": "text",
+        "current_status": "json", "custom_statuses": "json",
+        "memories_count": "num", "drawings_count": "num",
+        "messages_count": "num", "xp": "num", "streak_days": "num",
+        "streak_last_opened_date": "text", "streak_pending_date": "text",
+        "streak_pending_uid": "text", "daily_tasks": "json",
+        "active_mascot_id": "text", "mascot_position_x": "num",
+        "mascot_position_y": "num", "mascot_scale": "num", "mascots": "json",
+        "mascot_streaks": "json", "timers": "json", "active_session": "json",
+        "owned_features": "json", "waiting_mode": "bool",
+        "placeholder_name": "text", "placeholder_avatar": "text",
+        "return_date": "text", "claim_token": "text", "claim_uid": "text",
+        "claim_name": "text", "claim_at": "num", "disbanded": "bool",
+        "disbanded_at": "text", "created_at": "text", "updated": "auto",
+    },
+}
+
+
+def conv(kind: str, v):
+    if kind == "num":
+        return float(v or 0)
+    if kind == "bool":
+        return bool(v)
+    if kind == "json":
+        # У старых записей json-поле бывает пустой строкой (PocketBase так
+        # хранит незаполненное), а Postgres на такое отвечает «input string
+        # ended unexpectedly» и роняет весь перенос. Пусто — значит NULL.
+        if v is None:
+            return None
+        s = v if isinstance(v, str) else str(v)
+        return s if s.strip() else None
+    return str(v) if v is not None else ""
+
+
+async def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("table", choices=sorted(TABLES))
+    ap.add_argument("--since-rowid", type=int, default=0)
+    args = ap.parse_args()
+    table = args.table
+    cols = TABLES[table]
+    names = list(cols)
+    checkpoint = f"/opt/hotpath/.{table}_rowid"
+
+    lite = sqlite3.connect(f"file:{SQLITE}?mode=ro", uri=True, timeout=30)
+    lite.execute("PRAGMA busy_timeout=30000")
+    max_rowid = lite.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+
+    pg = await asyncpg.connect(PG_DSN)
+    stage_cols = ", ".join(
+        f"{n} {'text' if cols[n] in ('text', 'json', 'auto') else ('boolean' if cols[n] == 'bool' else 'double precision')}"
+        for n in names
+    )
+    await pg.execute(f"CREATE TEMP TABLE _stage (id text, {stage_cols})")
+    cast = ", ".join(f"{n}::jsonb" if cols[n] == "json" else n for n in names)
+
+    moved = 0
+    t0 = time.time()
+    cursor = args.since_rowid
+    sel = f"SELECT rowid, id, {', '.join(names)} FROM {table} WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?"
+    while True:
+        rows = lite.execute(sel, (cursor, max_rowid, BATCH)).fetchall()
+        if not rows:
+            break
+        cursor = rows[-1][0]
+        await pg.copy_records_to_table(
+            "_stage",
+            records=[
+                (r[1], *[conv(cols[n], r[i + 2]) for i, n in enumerate(names)])
+                for r in rows
+            ],
+        )
+        await pg.execute(
+            f"INSERT INTO {table} (id, {', '.join(names)}) "
+            f"SELECT id, {cast} FROM _stage ON CONFLICT (id) DO NOTHING"
+        )
+        await pg.execute("TRUNCATE _stage")
+        moved += len(rows)
+        print(f"  перенесено {moved} (rowid {cursor}/{max_rowid}), "
+              f"{moved / (time.time() - t0):.0f}/с", flush=True)
+
+    sq = lite.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    pgc = await pg.fetchval(f"SELECT COUNT(*) FROM {table}")
+    print(f"итого: SQLite {sq}, Postgres {pgc}, контрольная точка rowid={max_rowid}")
+    with open(checkpoint, "w") as f:
+        f.write(str(max_rowid))
+    await pg.close()
+    lite.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

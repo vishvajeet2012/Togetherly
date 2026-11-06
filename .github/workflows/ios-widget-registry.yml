@@ -1,0 +1,293 @@
+name: iOS → видит ли система наши виджеты
+
+# Зачем: виджетов Togetherly нет в галерее ни в одной версии, при том что в
+# собранном IPA расширение на месте, идентификатор — префикс приложения,
+# версии совпадают, entitlements и права App ID в порядке. Значит смотреть
+# надо не файлы, а решение самой iOS: она либо регистрирует расширение, либо
+# молча отвергает.
+#
+# Симулятор для этого годится: `pluginkit` показывает ЗАРЕГИСТРИРОВАННЫЕ
+# расширения, а системный лог — причину отказа. Устройства у нас нет, а
+# гадать по исходникам мы уже пробовали.
+#
+# Ничего не публикует и не подписывает.
+on:
+  workflow_dispatch:
+    inputs:
+      strip_lock:
+        description: 'Вырезать виджеты экрана блокировки (проверка подозреваемого)'
+        required: false
+        default: 'false'
+      ext_release:
+        description: 'Пересобрать расширение с -O, как в TestFlight'
+        required: false
+        default: 'false'
+      ref:
+        description: 'Коммит, на котором проверять (пусто — как в ветке)'
+        required: false
+        default: ''
+      plain:
+        description: 'Отключить стилевую конструкцию: image | block | container | all'
+        required: false
+        default: ''
+
+jobs:
+  registry:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Взять указанный коммит
+        if: ${{ inputs.ref != '' }}
+        # Сам воркфлоу остаётся из ветки (его берёт Actions до чекаута), а код
+        # приложения — из указанного коммита. Так две проверки отличаются
+        # только кодом: это и есть сравнение рабочей сборки со сломанной.
+        #
+        # Разборщики уносим в /tmp заранее: в старом коммите их ещё нет, и
+        # приговор молча не печатался — сравнение вышло односторонним.
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/verdict
+          cp tool/chrono_verdict.py tool/ips_report.py /tmp/verdict/
+          git checkout --detach "${{ inputs.ref }}"
+          git log -1 --format='проверяем: %h %s'
+
+      - name: Разборщики под рукой
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/verdict
+          [ -f /tmp/verdict/chrono_verdict.py ] || cp tool/chrono_verdict.py /tmp/verdict/
+          [ -f /tmp/verdict/ips_report.py ] || cp tool/ips_report.py /tmp/verdict/
+
+      - name: Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # Та же версия, что собирает релизы: на другой ломаются поды.
+          flutter-version: 3.47.6
+          channel: stable
+          cache: true
+
+      - name: Версии инструментов
+        run: |
+          flutter --version
+          xcodebuild -version
+          echo "— доступные симуляторы —"
+          xcrun simctl list devices available | head -30
+
+      - name: Зависимости
+        run: |
+          flutter pub get
+          # Поды ставит сама сборка: отдельный `pod install` идёт раньше, чем
+          # Flutter разложит симлинки плагинов, и не находит их подспеки.
+          pod repo update --silent || true
+
+      - name: Вырезать виджеты экрана блокировки
+        if: ${{ inputs.strip_lock == 'true' }}
+        run: |
+          set -euo pipefail
+          # Блок `lockWidgets` целиком состоит из `if #available(iOS 16.0, *)`,
+          # то есть тип свойства зависит от условной ветки. Подозрение: на нём
+          # ломается извлечение дескрипторов, и тогда галерея пуста не у трёх
+          # виджетов экрана блокировки, а у всех двадцати двух.
+          python3 tool/strip_lock_widgets.py
+          grep -n "lockWidgets" ios/TogetherlyWidget/TogetherlyWidgetBundle.swift \
+            || echo "в бандле его больше нет"
+
+      - name: Отключить стилевую конструкцию
+        if: ${{ inputs.plain != '' }}
+        # Деление пополам внутри коммита 3cbb20d3: правится реализация одного
+        # модификатора, вызовы в виджетах остаются. См. tool/plain_widget_style.py.
+        run: |
+          set -euxo pipefail
+          python3 tool/plain_widget_style.py "${{ inputs.plain }}"
+
+      - name: Сборка под симулятор
+        run: |
+          set -euo pipefail
+          # Debug: нам нужна регистрация расширения, а не скорость работы.
+          flutter build ios --simulator --debug --no-tree-shake-icons \
+            --dart-define=STORE=github
+          echo "— что внутри собранного .app —"
+          ls -la build/ios/iphonesimulator/Runner.app/PlugIns/ || echo "PlugIns НЕТ ВОВСЕ"
+
+      - name: Расширение с -O вместо debug
+        if: ${{ inputs.ext_release == 'true' }}
+        # Людям уезжает Release: `SWIFT_OPTIMIZATION_LEVEL = -O`, символы
+        # вырезаны, бинарь втрое меньше debug-овского. Прошлая проверка гоняла
+        # debug и потому объявила фикс рабочим, хотя на телефонах ничего не
+        # изменилось. Само приложение в Release для симулятора Flutter собрать
+        # не даёт (AOT-снапшота под симулятор нет), но расширение от Flutter не
+        # зависит: собираем ТОЛЬКО его и кладём в debug-овский .app.
+        run: |
+          set -euxo pipefail
+          xcodebuild build \
+            -project ios/Runner.xcodeproj \
+            -target TogetherlyWidgetExtension \
+            -configuration Release \
+            -sdk iphonesimulator \
+            CONFIGURATION_BUILD_DIR=/tmp/extrel \
+            CODE_SIGNING_ALLOWED=NO
+          APPEX=$(find /tmp/extrel -name "TogetherlyWidgetExtension.appex" -maxdepth 6 | head -1)
+          echo "собрано: $APPEX"
+          DEST=build/ios/iphonesimulator/Runner.app/PlugIns
+          rm -rf "$DEST/TogetherlyWidgetExtension.appex"
+          cp -R "$APPEX" "$DEST/"
+          echo "— размер бинаря (debug был бы ~2 МБ, release ~0,7 МБ) —"
+          ls -la "$DEST/TogetherlyWidgetExtension.appex/TogetherlyWidgetExtension"
+
+      - name: Поднять симулятор и поставить приложение
+        run: |
+          set -euo pipefail
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)['devices']
+          best=None
+          for runtime, devs in d.items():
+              if 'iOS' not in runtime: continue
+              for dev in devs:
+                  if 'iPhone' in dev['name']:
+                      best=(runtime, dev['udid'], dev['name'])
+          print(best[1] if best else '')
+          ")
+          echo "симулятор: $DEVICE"
+          xcrun simctl boot "$DEVICE" || true
+          xcrun simctl bootstatus "$DEVICE" -b || true
+          echo "DEVICE=$DEVICE" >> "$GITHUB_ENV"
+          xcrun simctl install "$DEVICE" build/ios/iphonesimulator/Runner.app
+          xcrun simctl launch "$DEVICE" com.togetherly.love || true
+          # Дать системе просканировать расширения: chronod делает это не сразу.
+          sleep 60
+          # И подтолкнуть: перезапуск менеджера виджетов заставляет его заново
+          # спросить у расширений, что они умеют.
+          xcrun simctl spawn "$DEVICE" launchctl kickstart -k system/com.apple.chronod || true
+          sleep 90
+
+      - name: Что знает chronod — менеджер виджетов
+        run: |
+          set +e
+          DATA="$HOME/Library/Developer/CoreSimulator/Devices/$DEVICE/data"
+          echo "=============================================================="
+          echo "БАЗА CHRONO (список известных системе виджетов)"
+          echo "=============================================================="
+          find "$DATA/Library" -iname "*hrono*" -maxdepth 3 2>/dev/null | head -20
+          echo "— настройки chronod целиком —"
+          plutil -p "$DATA/Library/Preferences/com.apple.chronod.plist" 2>/dev/null | head -80
+          echo
+          echo "— база chrono.sql: таблицы —"
+          sqlite3 "$DATA/Library/chronod/chrono.sql" ".tables" 2>&1 | head -20
+          echo "— что в ней про наши виджеты —"
+          for t in $(sqlite3 "$DATA/Library/chronod/chrono.sql" "select name from sqlite_master where type='table'" 2>/dev/null); do
+            n=$(sqlite3 "$DATA/Library/chronod/chrono.sql" "select count(*) from \"$t\"" 2>/dev/null)
+            echo "  таблица $t: $n строк"
+            sqlite3 "$DATA/Library/chronod/chrono.sql" "select * from \"$t\"" 2>/dev/null | grep -i togetherly | head -5
+          done
+          echo
+          echo "— поиск строки togetherly по контейнерам системы —"
+          grep -rl "TogetherlyWidget" "$DATA/Library" 2>/dev/null | head -10
+
+      - name: Что система знает о расширении
+        run: |
+          set +e
+          echo "=============================================================="
+          echo "ЗАРЕГИСТРИРОВАННЫЕ РАСШИРЕНИЯ (pluginkit)"
+          echo "=============================================================="
+          xcrun simctl spawn "$DEVICE" pluginkit -m -v -A -D 2>&1 | grep -i "togetherly" || echo "  НИ ОДНОГО расширения Togetherly не зарегистрировано"
+          echo
+          echo "— подробности нашего плагина —"
+          xcrun simctl spawn "$DEVICE" pluginkit -m -v -A -D -i com.togetherly.love.TogetherlyWidget 2>&1 | head -30
+          echo
+          echo "=============================================================="
+          echo "ЖУРНАЛ: что сказала система про наше расширение"
+          echo "=============================================================="
+          xcrun simctl spawn "$DEVICE" log show --last 8m --style compact \
+            --predicate 'process == "chronod" OR process == "pkd" OR process == "installd"' 2>&1 \
+            | grep -iE "togetherly|descriptor" | tail -60
+          echo
+          echo "— всё, что система сказала про наше расширение —"
+          xcrun simctl spawn "$DEVICE" log show --last 8m --style compact \
+            --predicate 'eventMessage CONTAINS "TogetherlyWidget"' 2>&1 | tail -40
+          echo
+          echo "=============================================================="
+          echo "СОДЕРЖИМОЕ УСТАНОВЛЕННОГО ПРИЛОЖЕНИЯ"
+          echo "=============================================================="
+          APP=$(xcrun simctl get_app_container "$DEVICE" com.togetherly.love 2>/dev/null)
+          echo "путь: $APP"
+          ls -la "$APP/PlugIns" 2>&1 || echo "  PlugIns нет"
+          for p in "$APP"/PlugIns/*.appex; do
+            echo "— $p"
+            plutil -p "$p/Info.plist" | grep -E "CFBundleIdentifier|CFBundleVersion|CFBundleShortVersion|NSExtensionPointIdentifier|MinimumOSVersion|UIDeviceFamily" || true
+          done
+
+      - name: Падало ли расширение на самом деле
+        # Прошлый счётчик крашей искал в журнале «exited with context» — а эта
+        # строка пишется и при НОРМАЛЬНОМ завершении расширения. Он краснел
+        # всегда, из-за чего стенд объявили негодным. Настоящее падение видно
+        # в отчёте .ips: симулятор кладёт их хосту в ~/Library/Logs.
+        run: |
+          set +e
+          echo "=============================================================="
+          echo "ОТЧЁТЫ О ПАДЕНИЯХ (.ips)"
+          echo "=============================================================="
+          FOUND=0
+          for d in "$HOME/Library/Logs/DiagnosticReports" \
+                   "$HOME/Library/Developer/CoreSimulator/Devices/$DEVICE/data/Library/Logs/DiagnosticReports"; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*Togetherly*; do
+              [ -e "$f" ] || continue
+              FOUND=$((FOUND + 1))
+              echo "--------------------------------------------------------------"
+              echo "файл: $f"
+              # Причина остановки и верхушка стека упавшего потока: в .ips
+              # Swift кладёт туда текст fatalError с файлом и строкой.
+              python3 /tmp/verdict/ips_report.py "$f"
+            done
+          done
+          [ "$FOUND" = 0 ] && echo "отчётов о падении расширения НЕТ"
+          echo
+          echo "— что Swift сказал перед смертью (Fatal error / precondition) —"
+          xcrun simctl spawn "$DEVICE" log show --last 12m --style compact 2>/dev/null \
+            | grep -iE "fatal error|precondition|Swift runtime failure|dyld|Symbol not found" \
+            | grep -iE "togetherly|widget" | tail -30 \
+            || echo "  ничего"
+
+      - name: Приговор
+        # Считаем ровно то, что видит человек в галерее: сколько наших `kind`
+        # система знает. Прошлый приговор искал в базе подстроку «togetherly»,
+        # которой в `kind` нет вовсе (`LoveWidgetProvider`, `MoodWidgetProvider`),
+        # и потому не отличал «22 из 22» от «ни одного».
+        run: |
+          set +e
+          DATA="$HOME/Library/Developer/CoreSimulator/Devices/$DEVICE/data"
+          # Полный журнал без обрезки — приговор читает его целиком.
+          xcrun simctl spawn "$DEVICE" log show --last 12m --style compact 2>/dev/null \
+            > /tmp/simlog.txt
+          python3 /tmp/verdict/chrono_verdict.py "$DATA" /tmp/simlog.txt
+          echo
+          echo "— ждёт повторного опроса (extensionsPendingDescriptorRefetch) —"
+          plutil -p "$DATA/Library/Preferences/com.apple.chronod.plist" 2>/dev/null \
+            | grep -A5 extensionsPendingDescriptorRefetch | head -12
+
+      - name: Сложить улики артефактом
+        if: always()
+        run: |
+          set +e
+          OUT=/tmp/uliki
+          mkdir -p "$OUT"
+          DATA="$HOME/Library/Developer/CoreSimulator/Devices/$DEVICE/data"
+          cp /tmp/simlog.txt "$OUT/" 2>/dev/null
+          cp "$DATA/Library/chronod/chrono.sql" "$OUT/" 2>/dev/null
+          cp "$HOME/Library/Logs/DiagnosticReports/"*Togetherly* "$OUT/" 2>/dev/null
+          cp "$DATA/Library/Logs/DiagnosticReports/"*Togetherly* "$OUT/" 2>/dev/null
+          ls -la "$OUT"
+
+      - name: Улики
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uliki-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/uliki
+          if-no-files-found: warn

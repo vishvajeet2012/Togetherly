@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Виджет «Кольцо года», 2×2 — раскладка «Отсчёт» (макет 14.09.2026).
+
+  Кольцо с числом дней и меткой сегодняшнего дня, под ним сколько осталось до
+  годовщины. Фон и кольцо — картинки (`WidgetImages`), текст поверх. Размер
+  кольца задаёт картинка с проставленной плотностью, отступы — код.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/tg_shape_32"
+    android:clipToOutline="true">
+
+    <ImageView
+        android:id="@+id/bg"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="fitXY"
+        android:contentDescription="@null" />
+
+    <TextView
+        android:id="@+id/empty_label"
+        android:textStyle="bold"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:paddingLeft="16dp"
+        android:paddingRight="16dp"
+        android:textSize="12dp"
+        android:fontFamily="@font/onest_extrabold"
+        android:includeFontPadding="false"
+        android:visibility="gone"
+        android:text="@string/tg_widget_no_start_date" />
+
+    <LinearLayout
+        android:id="@+id/content"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center">
+
+        <FrameLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content">
+
+            <ImageView
+                android:id="@+id/ring"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="@null" />
+
+            <!-- wrap_content и layout_gravity, а не match_parent: FrameLayout
+                 перемеряет match_parent-детей под свой размер, только когда
+                 их больше одного, и единственная подложка сжималась до
+                 текста в левом верхнем углу кольца (эмулятор, 14.09.2026). -->
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
+
+                <TextView
+                    android:id="@+id/ring_days"
+                    android:textStyle="bold"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textSize="34dp"
+                    android:fontFamily="@font/onest_extrabold"
+                    android:letterSpacing="-0.03"
+                    android:includeFontPadding="false"
+                    android:maxLines="1"
+                    android:text="—" />
+
+                <TextView
+                    android:id="@+id/ring_days_word"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingTop="3dp"
+                    android:textSize="11dp"
+                    android:fontFamily="@font/onest_bold"
+                    android:includeFontPadding="false"
+                    android:maxLines="1"
+                    android:text=" " />
+            </LinearLayout>
+        </FrameLayout>
+
+        <TextView
+            android:id="@+id/next_label"
+            android:textStyle="bold"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingTop="9dp"
+            android:textSize="11.5dp"
+            android:fontFamily="@font/onest_extrabold"
+            android:includeFontPadding="false"
+            android:maxLines="1"
+            android:text=" " />
+    </LinearLayout>
+</FrameLayout>
