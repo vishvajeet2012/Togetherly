@@ -6,6 +6,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.provider.Settings
+import androidx.core.content.FileProvider
+import java.io.File
 import android.util.Log
 import android.os.Build
 import android.os.Bundle
@@ -393,6 +396,7 @@ class MainActivity : FlutterActivity() {
                 "launchPackage" -> result.success(
                     launchPackage(call.argument<String>("package") ?: "com.togetherly.money")
                 )
+                "installApk" -> result.success(installDownloadedApk(call.argument<String>("path")))
                 else -> result.notImplemented()
             }
         }
@@ -459,6 +463,38 @@ class MainActivity : FlutterActivity() {
 
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    /// Downloaded update APK. Opens the system installer, or the permission
+    /// screen the first time Android blocks installs from this app.
+    private fun installDownloadedApk(path: String?): String {
+        if (path.isNullOrBlank()) return "failed"
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                !packageManager.canRequestPackageInstalls()
+            ) {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:$packageName"),
+                    ),
+                )
+                return "need_permission"
+            }
+            val file = File(path)
+            if (!file.exists()) return "failed"
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            "opened"
+        } catch (e: Exception) {
+            Log.w("Togetherly", "installApk failed", e)
+            "failed"
         }
     }
 

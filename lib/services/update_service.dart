@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io' show Platform;
+import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
@@ -7,16 +7,9 @@ import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'package:path_provider/path_provider.dart';
 
-import '../utils/safe_launch.dart';
 import 'locale_service.dart';
-
-void _openUpdateFromNotification(NotificationResponse response) {
-  final url = response.payload;
-  if (url == null || url.isEmpty) return;
-  safeLaunchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
-}
 
 /// Куда идти за обновлением — и идти ли вообще.
 enum UpdatePath {
@@ -292,13 +285,12 @@ class UpdateService {
       settings: const InitializationSettings(
         android: AndroidInitializationSettings('@drawable/ic_notification'),
       ),
-      onDidReceiveNotificationResponse: _openUpdateFromNotification,
     );
     final version = upd.versionName.isEmpty ? '' : ' ${upd.versionName}';
     await plugin.show(
       id: 91001,
       title: 'Update available',
-      body: 'Togetherly$version is ready. Tap to install.',
+      body: 'Togetherly$version is ready. Open the app and tap Update.',
       notificationDetails: const NotificationDetails(
         android: AndroidNotificationDetails(
           'app_updates',
@@ -311,6 +303,43 @@ class UpdateService {
       ),
       payload: upd.apkUrl,
     );
+  }
+
+  /// Downloads the APK inside the app, then opens Android's install screen.
+  ///
+  /// Returns `opened`, `need_permission`, or `failed`.
+  static Future<String> downloadAndInstall(
+    GithubUpdate upd, {
+    void Function(double progress)? onProgress,
+  }) async {
+    if (!Platform.isAndroid) return 'failed';
+    final client = http.Client();
+    try {
+      final request = http.Request('GET', Uri.parse(upd.apkUrl));
+      final response = await client.send(request).timeout(const Duration(minutes: 5));
+      if (response.statusCode != 200) return 'failed';
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/togetherly-update.apk');
+      if (await file.exists()) await file.delete();
+      final total = response.contentLength ?? 0;
+      var received = 0;
+      final sink = file.openWrite();
+      await for (final chunk in response.stream) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (total > 0) onProgress?.call(received / total);
+      }
+      await sink.close();
+      final status = await _installChannel.invokeMethod<String>('installApk', {
+        'path': file.path,
+      });
+      return status ?? 'failed';
+    } catch (e) {
+      debugPrint('UpdateService.downloadAndInstall failed: $e');
+      return 'failed';
+    } finally {
+      client.close();
+    }
   }
 
   /// Выбирает имя APK под архитектуру устройства.

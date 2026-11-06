@@ -4328,6 +4328,9 @@ class _HomeScreenState extends State<HomeScreen> {
   /// GitHub-репо (браузер докачивает файл и вызывает системный установщик).
   void _showGithubUpdateSheet(GithubUpdate upd) {
     final p = primary;
+    var busy = false;
+    var progress = 0.0;
+    String? problem;
     // Без isScrollControlled Flutter режет лист по 9/16 высоты экрана, и с
     // длинными заметками к версии кнопка «Обновить» уезжала под системную
     // панель — нажать её было нельзя (обращение 236, 05.10.2026).
@@ -4425,30 +4428,64 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ],
             const SizedBox(height: 24),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton.icon(
-                onPressed: () async {
-                  Navigator.pop(ctx);
-                  final uri = Uri.parse(upd.apkUrl);
-                  try {
-                    await safeLaunchUrl(uri, mode: LaunchMode.externalApplication);
-                  } catch (e) {
-                    debugPrint('GitHub update launch failed: $e');
-                  }
-                },
-                icon: const Icon(Icons.download_rounded),
-                label: Text(LocaleService.current.updateButton),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: p,
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  elevation: 0,
-                ),
-              ),
+            StatefulBuilder(
+              builder: (context, setLocal) {
+                final label = !busy
+                    ? LocaleService.current.updateButton
+                    : 'Downloading ${(progress * 100).round()}%';
+                return Column(
+                  children: [
+                    if (problem != null) ...[
+                      Text(
+                        problem!,
+                        style: TextStyle(fontSize: 13, color: _t.textSecondary),
+                      ),
+                      const SizedBox(height: 10),
+                    ],
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: ElevatedButton.icon(
+                        onPressed: busy
+                            ? null
+                            : () async {
+                                busy = true;
+                                problem = null;
+                                progress = 0;
+                                setLocal(() {});
+                                final status = await UpdateService.downloadAndInstall(
+                                  upd,
+                                  onProgress: (value) {
+                                    progress = value;
+                                    setLocal(() {});
+                                  },
+                                );
+                                if (!context.mounted) return;
+                                if (status == 'opened') {
+                                  Navigator.pop(ctx);
+                                  return;
+                                }
+                                busy = false;
+                                problem = status == 'need_permission'
+                                    ? 'Allow this app to install updates, then tap Update again.'
+                                    : 'Download failed. Tap Update to try again.';
+                                setLocal(() {});
+                              },
+                        icon: const Icon(Icons.download_rounded),
+                        label: Text(label),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: p,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          elevation: 0,
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
             const SizedBox(height: 10),
             SizedBox(
