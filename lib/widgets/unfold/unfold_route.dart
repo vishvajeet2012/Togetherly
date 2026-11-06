@@ -1100,11 +1100,17 @@ class _UnfoldTransitionState extends State<_UnfoldTransition>
 
   @override
   bool handleStartBackGesture(PredictiveBackEvent backEvent) {
-    // The nav-bar back button is not a swipe. With predictive back enabled,
-    // ignoring it leaves the screen stuck, so close the route instead.
-    if (backEvent.isButtonEvent) {
-      _buttonBack = _route.route.isCurrent;
-      return _buttonBack;
+    // A nav-bar press is not a finger drag. Leaving it as a drag holds
+    // the navigator's gesture lock, so the screen never closes and no
+    // later tap reaches the page.
+    final button = backEvent.isButtonEvent || backEvent.touchOffset == null;
+    if (button) {
+      if (!_route.route.isCurrent) return false;
+      _buttonBack = true;
+      final navigator = _route.route.navigator;
+      if (navigator != null) navigator.pop();
+      _releaseGesture();
+      return true;
     }
     _buttonBack = false;
     _backStart = backEvent.touchOffset;
@@ -1255,6 +1261,11 @@ class _UnfoldTransitionState extends State<_UnfoldTransition>
     final full = _fullRect;
     final scale = full.width > 0 ? frame.rect.width / full.width : 1.0;
     final resting = route.phase == _Phase.open;
+    if (resting && _gestureOn != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _route.phase == _Phase.open) _releaseGesture();
+      });
+    }
     final source = route.sourceRect;
     final ghost = route.ghost;
     // Летящие стартуют ровно со своих мест и не выходят за то, докуда успели
