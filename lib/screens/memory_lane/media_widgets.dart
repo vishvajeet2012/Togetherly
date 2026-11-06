@@ -487,15 +487,7 @@ class _YouTubeInlineCardState extends State<_YouTubeInlineCard> {
           safeLaunchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
         }
       },
-      // Совместный просмотр: комната пары, ролик включается у обоих.
-      onWatchTogether: widget.pairId.isNotEmpty && url.isNotEmpty
-          ? () => TogetherLauncher.hostVideo(
-                context,
-                pairId: widget.pairId,
-                partnerUid: widget.partnerUid,
-                videoUrl: url,
-              )
-          : null,
+      onWatchTogether: null,
     );
   }
 }

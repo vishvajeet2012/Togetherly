@@ -75,7 +75,6 @@ import '../services/capsule_notification_service.dart';
 import '../widgets/sealed_capsule_card.dart';
 import 'time_capsule_screen.dart';
 import '../services/pocketbase_service.dart';
-import 'together/together_launcher.dart';
 import '../services/home_widget_service.dart';
 import '../services/rate_limiter_service.dart';
 import '../services/locale_service.dart';

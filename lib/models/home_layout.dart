@@ -103,7 +103,8 @@ class HomeLayout {
       [for (final b in order) if (!hiddenBlocks.contains(b)) b];
 
   bool showsBlock(HomeBlock b) => !hiddenBlocks.contains(b);
-  bool showsTab(HomeTab t) => !hiddenTabs.contains(t);
+  bool showsTab(HomeTab t) =>
+      t != HomeTab.watch && !hiddenTabs.contains(t);
   bool showsAction(HomeAction a) => !hiddenActions.contains(a);
 
   HomeLayout withBlock(HomeBlock b, {required bool shown}) => _copy(
