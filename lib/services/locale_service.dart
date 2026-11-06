@@ -82,8 +82,14 @@ class LocaleService extends ChangeNotifier {
 
   /// Что показывать в `MaterialApp.supportedLocales`: без этого системные части
   /// (выбор даты, меню копирования) остаются английскими при любом переводе.
+  /// Russian is not offered. This project is served from vishvajeetshukla.in.
+  static List<AppLanguage> get selectable => [
+    for (final l in AppLanguage.values)
+      if (l != AppLanguage.ru) l,
+  ];
+
   static List<ui.Locale> get supportedLocales => [
-    for (final l in AppLanguage.values) l.locale,
+    for (final l in selectable) l.locale,
   ];
 
   static const Map<AppLanguage, AppStrings> _byLanguage = {
@@ -105,12 +111,8 @@ class LocaleService extends ChangeNotifier {
   /// австрийская `de-AT` приходят разными кодами, а язык у них один.
   static AppLanguage detect(ui.Locale locale) {
     final byLang = AppLanguage.byCode(locale.languageCode.toLowerCase());
-    if (byLang != null) return byLang;
+    if (byLang != null && byLang != AppLanguage.ru) return byLang;
     const byCountry = <String, AppLanguage>{
-      'RU': AppLanguage.ru,
-      'BY': AppLanguage.ru,
-      'KZ': AppLanguage.ru,
-      'KG': AppLanguage.ru,
       // Украина по стране — украинский (TOG-20). Русская или английская
       // система в Украине остаётся своей: язык системы выбран человеком.
       'UA': AppLanguage.uk,
@@ -158,6 +160,7 @@ class LocaleService extends ChangeNotifier {
       if (saved != null) {
         // Прежние сборки писали сюда 'ru' или 'en', новые — любой из семи кодов.
         _language = AppLanguage.byCode(saved) ?? AppLanguage.en;
+        if (_language == AppLanguage.ru) _language = AppLanguage.en;
       } else {
         _language = detect(ui.PlatformDispatcher.instance.locale);
         // Персистим определённый по локали язык, чтобы фоновые изоляты
@@ -166,6 +169,9 @@ class LocaleService extends ChangeNotifier {
         // английскими метками. PlatformDispatcher.locale в headless-изоляте
         // ненадёжен, prefs шарятся между изолятами и надёжны.
         await prefs.setString('app_language', _language.code);
+      }
+      if (saved == 'ru') {
+        await prefs.setString('app_language', AppLanguage.en.code);
       }
     } catch (_) {
       _language = AppLanguage.en;
@@ -176,6 +182,7 @@ class LocaleService extends ChangeNotifier {
 
   /// Change language and persist.
   Future<void> setLanguage(AppLanguage lang) async {
+    if (lang == AppLanguage.ru) lang = AppLanguage.en;
     if (_language == lang) return;
     _language = lang;
     try {

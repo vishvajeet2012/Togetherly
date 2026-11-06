@@ -46,9 +46,8 @@ class DaysTogetherNotificationService {
   /// годятся: на iOS это не тихая строчка в шторке, а баннер на экране.
   static const int _iosHour = 9;
   static const String _channelId = 'days_together_v1';
-  static const String _channelName = 'Дни вместе';
-  static const String _channelDesc =
-      'Постоянный счётчик дней, проведённых вместе';
+  static const String _channelName = 'Days together';
+  static const String _channelDesc = 'Ongoing count of days spent together';
 
   static const String _keyEnabled = 'days_together_notif_enabled';
   static const String _keyStartMs = 'days_together_start_ms';

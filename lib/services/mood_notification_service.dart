@@ -19,7 +19,7 @@ class MoodNotificationService {
 
   static const int _kNotificationId = 8888;
   static const String _kChannelId = 'mood_lock_screen_v3';
-  static const String _kChannelName = 'Настроение';
+  static const String _kChannelName = 'Mood';
 
   // ─────────────────────────────────────────────────────────────────────────
   //  INIT
@@ -53,7 +53,7 @@ class MoodNotificationService {
       const channel = AndroidNotificationChannel(
         _kChannelId,
         _kChannelName,
-        description: 'Настроение на экране блокировки',
+        description: 'Mood on the lock screen',
         importance: Importance.high,
         playSound: false,
         enableVibration: false,
@@ -100,7 +100,7 @@ class MoodNotificationService {
     final androidDetails = AndroidNotificationDetails(
       _kChannelId,
       _kChannelName,
-      channelDescription: 'Настроение на экране блокировки',
+      channelDescription: 'Mood on the lock screen',
       importance: Importance.high,
       priority: Priority.high,
       ongoing: true,
@@ -147,10 +147,10 @@ class MoodNotificationService {
   // ─────────────────────────────────────────────────────────────────────────
 
   String _buildTitle(String name, String mood) {
-    if (mood.isEmpty) return '😶 Настроение не задано';
+    if (mood.isEmpty) return '😶 Mood not set';
     final emoji = _moodToEmoji(mood);
     if (name.isNotEmpty) return '$emoji $name: $mood';
-    return '$emoji Моё настроение: $mood';
+    return '$emoji My mood: $mood';
   }
 
   String _buildBody(String partnerName, String partnerMood) {

@@ -24,7 +24,7 @@ class InviteReminderService {
 
   static const int _notificationId = 9993;
   static const String _channelId = 'invite_reminder';
-  static const String _channelName = 'Приглашение';
+  static const String _channelName = 'Invitation';
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -87,7 +87,7 @@ class InviteReminderService {
           android: AndroidNotificationDetails(
             _channelId,
             _channelName,
-            channelDescription: 'Напоминание позвать партнёра, пока пары нет',
+            channelDescription: 'Reminder to invite a partner while you are not paired',
             importance: Importance.defaultImportance,
             priority: Priority.defaultPriority,
             icon: '@drawable/ic_notification',

@@ -115,8 +115,8 @@ class _InvitePartnerScreenState extends State<InvitePartnerScreen> {
     // открывается (та самая причина реджекта 2.1(a)).
     final origin = shareOriginFromContext(context);
     await Share.share(
-      _s.shareInviteText(code, _pair.inviteLink),
-      subject: _s.loveAppInvitation,
+      'Join me on Togetherly! Use code: $code\n\nOr open: ${_pair.inviteLink}',
+      subject: 'Togetherly Invitation',
       sharePositionOrigin: origin,
     );
   }

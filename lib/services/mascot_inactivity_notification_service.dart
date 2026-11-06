@@ -14,7 +14,7 @@ class MascotInactivityNotificationService {
 
   static const int _notificationId = 9991;
   static const String _channelId = 'mascot_miss_you';
-  static const String _channelName = 'Маскот';
+  static const String _channelName = 'Mascot';
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -111,7 +111,7 @@ class MascotInactivityNotificationService {
             _channelId,
             _channelName,
             channelDescription:
-                'Напоминание, если вы давно не открывали приложение',
+                'Reminder if you have not opened the app for a while',
             importance: Importance.high,
             priority: Priority.high,
             icon: '@drawable/ic_notification',

@@ -1340,8 +1340,8 @@ class _ConnectPartnerScreenState extends State<ConnectPartnerScreen>
     if (code.isEmpty) return;
     final origin = shareOriginFromContext(context);
     await Share.share(
-      LocaleService.current.shareInviteText(code, pair.inviteLink),
-      subject: LocaleService.current.loveAppInvitation,
+      'Join me on Togetherly! Use code: $code\n\nOr open: ${pair.inviteLink}',
+      subject: 'Togetherly Invitation',
       sharePositionOrigin: origin,
     );
   }

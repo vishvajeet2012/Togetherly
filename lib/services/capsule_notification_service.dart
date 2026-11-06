@@ -21,7 +21,7 @@ class CapsuleNotificationService {
       CapsuleNotificationService._();
 
   static const String _channelId = 'time_capsule';
-  static const String _channelName = 'Капсула времени';
+  static const String _channelName = 'Time capsule';
 
   /// Ключ, в котором ждёт капсула, к которой человек шёл из уведомления.
   /// Лента откроет её сама при первом показе.
@@ -130,7 +130,7 @@ class CapsuleNotificationService {
           android: AndroidNotificationDetails(
             _channelId,
             _channelName,
-            channelDescription: 'Напоминание об открытии капсулы времени',
+            channelDescription: 'Reminder to open a time capsule',
             importance: Importance.high,
             priority: Priority.high,
             icon: '@drawable/ic_notification',

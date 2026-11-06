@@ -4320,11 +4320,8 @@ class _ProfileScreenState extends State<ProfileScreen>
           // сам, без правки экрана. Название пишется на своём языке — тот, кто
           // выбирает португальский, русского слова «Португальский» не знает.
           child: SettingsGroup([
-            for (final lang in AppLanguage.values) ...[
-              // Разделитель между строками, а не условие на саму строку:
-              // раньше за ним пряталась первая строка списка, то есть
-              // русский, и выбрать его было нельзя вовсе.
-              if (lang != AppLanguage.values.first) const SettingsDivider(),
+            for (final lang in LocaleService.selectable) ...[
+              if (lang != LocaleService.selectable.first) const SettingsDivider(),
               _languageRow(ctx, lang: lang),
             ],
           ]),

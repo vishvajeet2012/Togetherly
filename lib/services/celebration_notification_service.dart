@@ -25,7 +25,7 @@ class CelebrationNotificationService {
   static const int _idBirthdayDay = 9004;
 
   static const String _channelId = 'celebrations_v1';
-  static const String _channelName = 'Праздники';
+  static const String _channelName = 'Celebrations';
 
   // Ключи SharedPreferences для хранения дат между сессиями.
   static const String _keyAnniversaryMs = 'celebration_anniversary_ms';
@@ -253,7 +253,7 @@ class CelebrationNotificationService {
           android: AndroidNotificationDetails(
             _channelId,
             _channelName,
-            channelDescription: 'Напоминания о годовщинах и днях рождения',
+            channelDescription: 'Reminders for anniversaries and birthdays',
             importance: Importance.high,
             priority: Priority.high,
             icon: '@drawable/ic_notification',

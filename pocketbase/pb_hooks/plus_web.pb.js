@@ -16,51 +16,19 @@
 routerAdd("GET", "/plus", (e) => {
   const HTML = "text/html; charset=utf-8";
   const page =
-    '<!doctype html><html lang="ru"><head><meta charset="utf-8">' +
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<meta name="robots" content="noindex">' +
-    "<title>Активация Togetherly+</title><style>" +
-    ":root{color-scheme:light dark}" +
+    "<title>Togetherly+</title><style>" +
     "body{margin:0;min-height:100vh;display:grid;place-items:center;" +
-    "font:16px/1.5 system-ui,sans-serif;background:#F6EFFB;color:#1D1B20}" +
-    "@media(prefers-color-scheme:dark){body{background:#141218;color:#E6E0E9}" +
-    ".card{background:#1D1B20}}" +
+    "font:16px/1.5 system-ui,sans-serif;background:#F6EFFB;color:#1D1B20;text-align:center}" +
     ".card{background:#fff;border-radius:28px;padding:32px;max-width:420px;" +
-    "width:calc(100% - 32px);box-shadow:0 8px 40px rgba(110,79,192,.12)}" +
-    "h1{font-size:24px;margin:0 0 8px}p{margin:0 0 20px;opacity:.75}" +
-    "label{display:block;font-size:13px;font-weight:600;margin:0 0 6px}" +
-    "input{width:100%;box-sizing:border-box;padding:14px 16px;font-size:16px;" +
-    "border:1.5px solid #CAC4D0;border-radius:16px;margin:0 0 16px;" +
-    "background:transparent;color:inherit}" +
-    "button{width:100%;padding:16px;font-size:16px;font-weight:600;color:#fff;" +
-    "background:#6E4FC0;border:0;border-radius:999px;cursor:pointer}" +
-    "button:disabled{opacity:.5;cursor:default}" +
-    "#msg{margin:16px 0 0;font-size:15px;min-height:24px}" +
-    ".ok{color:#2E7D32}.err{color:#B3261E}" +
+    "width:calc(100% - 32px)}" +
+    "h1{font-size:24px;margin:0 0 8px}p{margin:0;opacity:.75}" +
     "</style></head><body><div class=card>" +
-    "<h1>Активация Togetherly+</h1>" +
-    "<p>Код пришёл после оплаты. Почту укажите ту, с которой вы входите в приложение.</p>" +
-    '<label for=code>Код</label><input id=code placeholder="TG-XXXX-XXXX" autocomplete=off>' +
-    '<label for=email>Почта аккаунта</label><input id=email type=email placeholder="you@example.com" autocomplete=email>' +
-    "<button id=go>Активировать</button><p id=msg></p>" +
-    "</div><script>" +
-    "var go=document.getElementById('go'),msg=document.getElementById('msg');" +
-    "go.onclick=function(){" +
-    "var c=document.getElementById('code').value.trim();" +
-    "var m=document.getElementById('email').value.trim();" +
-    "if(!c||!m){msg.className='err';msg.textContent='Заполните оба поля';return}" +
-    "go.disabled=true;msg.className='';msg.textContent='Проверяем…';" +
-    "fetch('/api/plus/activate',{method:'POST'," +
-    "headers:{'Content-Type':'application/json'}," +
-    "body:JSON.stringify({code:c,email:m})})" +
-    ".then(function(r){return r.json()})" +
-    ".then(function(d){go.disabled=false;" +
-    "if(d&&d.ok){msg.className='ok';" +
-    "msg.textContent='Готово. Откройте приложение — всё уже работает.'}" +
-    "else{msg.className='err';msg.textContent=(d&&d.error)||'Не получилось'}})" +
-    ".catch(function(){go.disabled=false;msg.className='err';" +
-    "msg.textContent='Сеть недоступна, попробуйте ещё раз'})};" +
-    "</script></body></html>";
+    "<h1>Togetherly+ is on</h1>" +
+    "<p>Every account includes Plus. Go back to the app.</p>" +
+    "</div></body></html>";
   return e.blob(200, HTML, page);
 });
 

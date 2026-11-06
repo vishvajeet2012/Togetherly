@@ -245,11 +245,11 @@ class _TipsCardState extends State<TipsCard> {
       };
 
   String _labelFor(String action) => switch (action) {
-        'chat' => 'Написать',
-        'memory' => 'Добавить',
-        'gift' => 'Подарки',
-        'miss' => 'Отправить',
-        'mood' => 'Настроение',
-        _ => 'Открыть',
+        'chat' => 'Write',
+        'memory' => 'Add',
+        'gift' => 'Gifts',
+        'miss' => 'Send',
+        'mood' => 'Mood',
+        _ => 'Open',
       };
 }

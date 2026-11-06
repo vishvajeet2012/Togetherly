@@ -50,10 +50,10 @@ class PushBackgroundService {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'partner_push_service',
-        channelName: 'Связь с сервером',
+        channelName: 'Server connection',
         channelDescription:
-            'Держит соединение, чтобы доставлять сообщения, настроение и '
-            '«скучаю» от партнёра, пока приложение свёрнуто.',
+            'Keeps the connection open so messages, moods, and miss-you '
+            'from your partner arrive while the app is in the background.',
         // Каналу/баннеру по умолчанию LOW importance + без вибрации/бейджа —
         // постоянное уведомление сервиса не мозолит глаза.
         onlyAlertOnce: true,
@@ -163,8 +163,8 @@ class PushBackgroundService {
         await FlutterForegroundTask.startService(
           serviceId: 4711,
           serviceTypes: const [ForegroundServiceTypes.dataSync],
-          notificationTitle: 'Togetherly на связи',
-          notificationText: 'Получаем уведомления от партнёра',
+          notificationTitle: 'Togetherly is connected',
+          notificationText: 'Receiving notifications from your partner',
           // Иконка-сердечко (та же, что у локальных уведомлений) — без неё
           // сервис ставит дефолт/чёрный квадрат в шторке.
           notificationIcon: const NotificationIcon(
