@@ -1,0 +1,39 @@
+services:
+  pocketbase:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - pb_data:/pb/pb_data
+      - ./pb_hooks:/pb/pb_hooks
+      - ./pb_public:/pb/pb_public
+
+  fcm:
+    build:
+      context: .
+      dockerfile: Dockerfile.fcm
+    restart: unless-stopped
+    network_mode: "service:pocketbase"
+    depends_on:
+      - pocketbase
+    volumes:
+      - ./keys/fcm-service-account.json:/opt/pocketbase/keys/fcm-service-account.json:ro
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - pocketbase
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pb_data:
+  caddy_data:
+  caddy_config:

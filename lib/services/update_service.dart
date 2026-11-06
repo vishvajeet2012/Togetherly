@@ -123,7 +123,7 @@ class UpdateService {
   UpdateService._();
 
   /// Публичный репо с релизами (отдельный от приватных исходников).
-  static const String _repo = 'THET1ME-1/togetherly';
+  static const String _repo = 'vishvajeet2012/Togetherly';
 
   /// Стабильная ссылка на манифест последней версии (редиректит на ассет).
   static const String _versionJsonUrl =

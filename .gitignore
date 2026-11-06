@@ -57,6 +57,9 @@ ios/certs/*.pem
 ios/Runner/GoogleService-Info.plist
 android/app/google-services.json
 
+# Server-only secrets for the EC2 deploy. Never commit.
+deploy/keys/
+
 # Firebase Admin SDK private key — никогда не коммитить
 scripts/serviceAccountKey.json
 scripts/togetherly-d4856-firebase-adminsdk-*.json

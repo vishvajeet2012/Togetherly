@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:flutter/services.dart';
@@ -585,17 +584,6 @@ class _LoginScreenState extends State<LoginScreen> {
                         _primaryButton(
                           label: s.login,
                           onTap: _isLoading ? null : _signInWithEmail,
-                        ),
-                        const SizedBox(height: 26),
-                        AuthSocialRow(
-                          label: s.signInWith,
-                          onGoogle:
-                              _isLoading ? null : () => _oauthSignIn('google'),
-                          onYandex:
-                              _isLoading ? null : () => _oauthSignIn('yandex'),
-                          onApple: Platform.isIOS
-                              ? (_isLoading ? null : () => _oauthSignIn('apple'))
-                              : null,
                         ),
                         const SizedBox(height: 28),
                         // Don't have an account? Sign up

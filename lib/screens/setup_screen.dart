@@ -909,17 +909,6 @@ class _SetupScreenState extends State<SetupScreen>
                   _termsCheckbox(s),
                   const SizedBox(height: 24),
                   _signUpButton(s),
-                  const SizedBox(height: 26),
-                  AuthSocialRow(
-                    label: s.signUpWith,
-                    onGoogle:
-                        _isLoading ? null : () => _oauthSignIn('google'),
-                    onYandex:
-                        _isLoading ? null : () => _oauthSignIn('yandex'),
-                    onApple: Platform.isIOS
-                        ? (_isLoading ? null : () => _oauthSignIn('apple'))
-                        : null,
-                  ),
                   const SizedBox(height: 28),
                   // Already have an account? Sign In
                   Row(

@@ -401,7 +401,10 @@ class _Tiles extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final providers = methods.tiles(ios: ios);
+    final providers = methods
+        .tiles(ios: ios)
+        .where((p) => p != 'google' && p != 'apple' && p != 'yandex')
+        .toList();
     final password = _Tile(
       on: methods.password,
       logo: Icon(Icons.password_rounded, color: cs.primary),

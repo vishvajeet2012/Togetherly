@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir "PyJWT[crypto]"
+
+COPY fcm_relay.py /opt/fcm/fcm_relay.py
+
+ENV FCM_KEY=/opt/pocketbase/keys/fcm-service-account.json
+ENV FCM_RELAY_PORT=8100
+
+CMD ["python", "-u", "/opt/fcm/fcm_relay.py"]

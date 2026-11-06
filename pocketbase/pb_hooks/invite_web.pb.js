@@ -31,7 +31,7 @@ routerAdd("GET", "/invite/", (e) => {
   const PLAY_URL =
     "https://play.google.com/store/apps/details?id=com.togetherly.love";
   const RUSTORE_URL = "https://www.rustore.ru/catalog/app/com.togetherly.love";
-  const APK_URL = "https://github.com/THET1ME-1/Togetherly/releases/latest";
+  const APK_URL = "https://github.com/vishvajeet2012/Togetherly/releases/latest";
   const HTML = "text/html; charset=utf-8";
   const html = [
     '<!doctype html><html lang="ru"><head><meta charset="utf-8">',
@@ -65,7 +65,7 @@ routerAdd("GET", "/invite", (e) => {
   const PLAY_URL =
     "https://play.google.com/store/apps/details?id=com.togetherly.love";
   const RUSTORE_URL = "https://www.rustore.ru/catalog/app/com.togetherly.love";
-  const APK_URL = "https://github.com/THET1ME-1/Togetherly/releases/latest";
+  const APK_URL = "https://github.com/vishvajeet2012/Togetherly/releases/latest";
   const HTML = "text/html; charset=utf-8";
   const html = [
     '<!doctype html><html lang="ru"><head><meta charset="utf-8">',
@@ -104,7 +104,7 @@ routerAdd("GET", "/invite/{code}", (e) => {
   const PLAY_URL =
     "https://play.google.com/store/apps/details?id=com.togetherly.love";
   const RUSTORE_URL = "https://www.rustore.ru/catalog/app/com.togetherly.love";
-  const APK_URL = "https://github.com/THET1ME-1/Togetherly/releases/latest";
+  const APK_URL = "https://github.com/vishvajeet2012/Togetherly/releases/latest";
   // Санитизация: только буквы/цифры, максимум 12 символов — иначе это не наш
   // код (и защита от reflected-XSS при вставке в HTML/URL).
   // Path-параметр берём из url.path (pathValue роутером этой сборки PB не
