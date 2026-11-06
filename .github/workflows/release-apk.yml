@@ -15,7 +15,7 @@ on:
       targets:
         description: 'Куда публиковать: all, либо через запятую github,play,rustore,ios'
         required: false
-        default: 'all'
+        default: 'github'
       prerelease:
         description: 'Тестовая сборка «на посмотреть»: релиз помечается pre-release и НЕ становится latest, автообновление у всех остаётся на стабильной версии'
         type: boolean
@@ -254,9 +254,8 @@ jobs:
   # Вызываем reusable-воркфлоу: в GitHub-релизе всегда лежат и APK, и IPA —
   # руками второй прогон запускать не нужно.
   attach-ipa:
-    # Только когда iOS просили: при targets=github это тестовая сборка на
-    # Android, и получасовой прогон на macOS ради IPA ей ни к чему.
-    if: ${{ inputs.targets == '' || contains(inputs.targets, 'all') || contains(inputs.targets, 'ios') }}
+    # iOS IPA is off for this deploy.
+    if: false
     needs: build-apk
     permissions:
       contents: write
@@ -271,6 +270,7 @@ jobs:
   # Без PLAY_SERVICE_ACCOUNT_JSON job publish-play пропускается (не краснеет),
   # пока ты не настроишь сервис-аккаунт и не добавишь секрет.
   check-play:
+    if: false
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}
@@ -390,6 +390,7 @@ jobs:
   # Без RUSTORE_KEY_ID job publish-rustore пропускается (не краснеет). Отдельная
   # джоба от Play — сбой одного магазина не роняет другой.
   check-rustore:
+    if: false
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}
@@ -529,6 +530,7 @@ jobs:
   # ── Гейт: iOS собираем, только если задан ключ App Store Connect API ────────
   # Без APP_STORE_CONNECT_PRIVATE_KEY джоба пропускается (не краснеет).
   check-ios:
+    if: false
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}
