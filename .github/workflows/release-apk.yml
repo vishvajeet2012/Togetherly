@@ -148,7 +148,7 @@ jobs:
         # IconData собирается на ходу. Flutter такое дерево иконок урезать не
         # умеет и падает «Avoid non-constant invocations of IconData». Расплата —
         # полный MaterialIcons в сборке, +1,5 МБ.
-        run: flutter build apk --release --split-per-abi --no-tree-shake-icons --dart-define=STORE=github --dart-define=PB_URL=https://togerther-api.vishvajeetshukla.in
+        run: flutter build apk --release --split-per-abi --no-tree-shake-icons --dart-define=STORE=github --dart-define=PB_URL=https://togerther-api.vishvajeetshukla.in --dart-define=CENTRIFUGO_WS=wss://togerther-api.vishvajeetshukla.in/connection/websocket
 
       - name: Stage artifacts
         id: stage
