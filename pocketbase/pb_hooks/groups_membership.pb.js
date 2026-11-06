@@ -22,16 +22,19 @@
 // не виден), в конце каждого — e.next().
 
 onRecordAfterCreateSuccess((e) => {
-  // копия resync-логики в каждом хендлере — JSVM-изоляция
   const uids = e.record.getStringSlice("members") || [];
-  for (const uid of uids) {
+  for (let i = 0; i < uids.length; i++) {
+    const uid = uids[i];
     if (!uid) continue;
     try {
-      $app.db().newQuery(
-        "UPDATE users SET group_ids = COALESCE((SELECT json_group_array(g.id) FROM groups g WHERE EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(g.members) THEN g.members ELSE '[]' END) je WHERE je.value = {:uid})), '[]') WHERE id = {:uid}"
-      ).bind({ uid: uid }).execute();
+      const found = $app.findRecordsByFilter("groups", "members ~ {:u}", "", 50, 0, { u: uid });
+      const ids = [];
+      for (let j = 0; j < found.length; j++) ids.push(found[j].id);
+      const user = $app.findRecordById("users", uid);
+      user.set("group_ids", ids);
+      $app.save(user);
     } catch (err) {
-      console.log("groups_membership create resync failed", uid, err);
+      console.log("groups_membership create resync failed", uid, String(err));
     }
   }
   e.next();
@@ -53,13 +56,17 @@ onRecordAfterUpdateSuccess((e) => {
   for (const u of cur.concat(old)) {
     if (u && !seen[u]) { seen[u] = true; uids.push(u); }
   }
-  for (const uid of uids) {
+  for (let i = 0; i < uids.length; i++) {
+    const uid = uids[i];
     try {
-      $app.db().newQuery(
-        "UPDATE users SET group_ids = COALESCE((SELECT json_group_array(g.id) FROM groups g WHERE EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(g.members) THEN g.members ELSE '[]' END) je WHERE je.value = {:uid})), '[]') WHERE id = {:uid}"
-      ).bind({ uid: uid }).execute();
+      const found = $app.findRecordsByFilter("groups", "members ~ {:u}", "", 50, 0, { u: uid });
+      const ids = [];
+      for (let j = 0; j < found.length; j++) ids.push(found[j].id);
+      const user = $app.findRecordById("users", uid);
+      user.set("group_ids", ids);
+      $app.save(user);
     } catch (err) {
-      console.log("groups_membership update resync failed", uid, err);
+      console.log("groups_membership update resync failed", uid, String(err));
     }
   }
   e.next();
@@ -67,14 +74,18 @@ onRecordAfterUpdateSuccess((e) => {
 
 onRecordAfterDeleteSuccess((e) => {
   const uids = e.record.getStringSlice("members") || [];
-  for (const uid of uids) {
+  for (let i = 0; i < uids.length; i++) {
+    const uid = uids[i];
     if (!uid) continue;
     try {
-      $app.db().newQuery(
-        "UPDATE users SET group_ids = COALESCE((SELECT json_group_array(g.id) FROM groups g WHERE EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(g.members) THEN g.members ELSE '[]' END) je WHERE je.value = {:uid})), '[]') WHERE id = {:uid}"
-      ).bind({ uid: uid }).execute();
+      const found = $app.findRecordsByFilter("groups", "members ~ {:u}", "", 50, 0, { u: uid });
+      const ids = [];
+      for (let j = 0; j < found.length; j++) ids.push(found[j].id);
+      const user = $app.findRecordById("users", uid);
+      user.set("group_ids", ids);
+      $app.save(user);
     } catch (err) {
-      console.log("groups_membership delete resync failed", uid, err);
+      console.log("groups_membership delete resync failed", uid, String(err));
     }
   }
   e.next();
