@@ -11,7 +11,6 @@ import '../dict_strings.dart' show ruEn;
 import '../models/cloud_mascot.dart';
 import '../models/mascot.dart';
 import 'mascot/cloud_mascot_view.dart';
-import '../screens/tu_wardrobe_screen.dart';
 import '../screens/home/home_bottom_nav.dart' show kHomeBottomNavHeight;
 import '../utils/mascot_bounds.dart';
 import '../services/locale_service.dart';
@@ -284,7 +283,7 @@ class _ActiveMascotWidgetState extends State<ActiveMascotWidget>
 
   /// Лист уже открыт — второй раз не открываем (тап может прийти и с арены
   /// жестов, и из нашей проверки в конце жеста).
-  bool _menuOpen = false;
+
 
   /// Насколько палец может уехать, чтобы жест всё ещё считался тапом.
   /// Правило целиком — в `mascotGestureIsTap` (под тестами).
@@ -500,7 +499,6 @@ class _ActiveMascotWidgetState extends State<ActiveMascotWidget>
   void _tapped() {
     if (!_isCloud) {
       _setAnim(MascotAnimState.live);
-      _onTap();
       return;
     }
     _menuTimer?.cancel();
@@ -524,7 +522,7 @@ class _ActiveMascotWidgetState extends State<ActiveMascotWidget>
     if (!mounted) return;
     switch (_combo.settle()) {
       case MascotTapEnd.menu:
-        _onTap();
+        break;
       case MascotTapEnd.flip:
         _setAnim(MascotAnimState.grow);
       case MascotTapEnd.deflate:
@@ -532,143 +530,6 @@ class _ActiveMascotWidgetState extends State<ActiveMascotWidget>
       case MascotTapEnd.none:
         break;
     }
-  }
-
-  void _onTap() {
-    if (_menuOpen || !mounted) return;
-    _menuOpen = true;
-    // Облачко отвечает на касание само, меню выезжает под ним.
-    if (_isCloud) _setAnim(MascotAnimState.drop);
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: widget.theme.cardSurface,
-      useSafeArea: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: StatefulBuilder(
-          builder: (ctx, setSheetState) => Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 8),
-            Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(
-                color: widget.theme.divider,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const SizedBox(height: 16),
-            // Размер: щипок двумя пальцами по маскоту работал и раньше, но о нём
-            // никто не догадывался. Ползунок делает ту же настройку явной, а
-            // масштаб уезжает партнёру тем же путём (`mascot_scale` группы).
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
-              child: Row(
-                children: [
-                  Icon(Icons.photo_size_select_small_rounded,
-                      size: 18, color: widget.theme.textMuted),
-                  Expanded(
-                    child: Slider(
-                      value: _scale.clamp(_kMinScale, _kMaxScale),
-                      min: _kMinScale,
-                      max: _kMaxScale,
-                      // Шаг заметен глазу и не даёт промахнуться пальцем мимо
-                      // «того же самого» размера.
-                      divisions: 16,
-                      label: '${(_scale * 100).round()}%',
-                      onChanged: (v) {
-                        setSheetState(() {});
-                        setState(() => _scale = v);
-                      },
-                      onChangeEnd: (_) {
-                        HapticFeedback.selectionClick();
-                        _scheduleSync();
-                      },
-                    ),
-                  ),
-                  Icon(Icons.photo_size_select_large_rounded,
-                      size: 22, color: widget.theme.textMuted),
-                ],
-              ),
-            ),
-            // Облачко в цвете настроения: партнёра или своём.
-            if (_isCloud)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        ruEn('Цвет настроения', 'Mood colour'),
-                        style: TextStyle(color: widget.theme.textPrimary, fontSize: 15),
-                      ),
-                    ),
-                    SegmentedButton<bool>(
-                      showSelectedIcon: false,
-                      segments: [
-                        ButtonSegment(value: false, label: Text(ruEn('Партнёра', 'Partner'))),
-                        ButtonSegment(value: true, label: Text(ruEn('Моё', 'Mine'))),
-                      ],
-                      selected: {_cloudMine},
-                      onSelectionChanged: (v) async {
-                        setSheetState(() {});
-                        setState(() => _cloudMine = v.first);
-                        final prefs = await SharedPreferences.getInstance();
-                        await prefs.setBool(_kCloudMineKey, v.first);
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            // Гардероб Ту — первым пунктом: нажал на Ту и переодел.
-            if (_isCloud)
-              ListTile(
-                leading: Icon(Icons.checkroom_outlined, color: widget.theme.primary),
-                title: Text(ruEn('Гардероб', 'Wardrobe')),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  Navigator.of(context).push(MaterialPageRoute(
-                    builder: (_) => const TuWardrobeScreen(),
-                    settings: const RouteSettings(name: '/tu_wardrobe'),
-                  ));
-                },
-              ),
-            ListTile(
-              leading: Icon(
-                Icons.photo_library_outlined,
-                color: widget.theme.primary,
-              ),
-              title: Text(LocaleService.current.goToGallery),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                widget.onOpenGallery();
-              },
-            ),
-            ListTile(
-              leading: Icon(
-                Icons.visibility_off_outlined,
-                color: widget.theme.textMuted,
-              ),
-              title: Text(LocaleService.current.hide),
-              onTap: () async {
-                Navigator.of(ctx).pop();
-                setState(() => _hidden = true);
-                mascotHiddenNotifier.value = true;
-                final prefs = await SharedPreferences.getInstance();
-                await prefs.setBool(_kHiddenKey, true);
-              },
-            ),
-            const SizedBox(height: 8),
-          ],
-          ),
-        ),
-      ),
-    ).whenComplete(() {
-      if (mounted) _menuOpen = false;
-    });
   }
 
   // ── Build ─────────────────────────────────────────────────────────────────
